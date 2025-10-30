@@ -28,13 +28,11 @@ mqtt_password: ""
 # ========== 交易配置 ==========
 default_trade_amount: 0.001  # BUY: quote amount, SELL: base amount
 default_quote_token: WBNB
-slippage: 0.02               # 2% 滑点
-gas_buffer: 1.15             # 15% gas buffer
+slippage: 0.02               # 2% 滑点（保留参数，但 Gateway 已自动处理）
+gas_buffer: 1.15             # 15% gas buffer（保留参数，但不再用于价格调整）
 
-# 总调整 = (1 + slippage) * gas_buffer - 1
-#        = (1 + 0.02) * 1.15 - 1
-#        = 0.173
-#        = 17.3% ✅
+# 注意：Gateway 的 get_quote_price() 返回的价格已经考虑了滑点
+# 我们不需要再手动调整价格
 
 # ========== 手动止盈止损配置 ==========
 enable_manual_tp_sl: true    # 启用手动止盈止损监控

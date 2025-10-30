@@ -149,6 +149,13 @@ class NewsSnipingV2Hybrid(StrategyV2Base):
         self.config = config
         self.connector = self.connectors[self.config.connector]
 
+        # ========== 抑制 Binance Oracle 警告 ==========
+        # 对于链上代币，Binance 没有汇率，会产生大量警告
+        # 我们禁用 performance tracker 的这些警告
+        import logging
+        performance_logger = logging.getLogger("hummingbot.client.performance")
+        performance_logger.setLevel(logging.ERROR)  # 只显示 ERROR 及以上级别
+
         # 事件循环引用
         self._event_loop = asyncio.get_event_loop()
 
@@ -381,6 +388,7 @@ class NewsSnipingV2Hybrid(StrategyV2Base):
             base_amount = self.connector.quantize_order_amount(trading_pair, base_amount)
 
             # 获取精确报价
+            # Gateway 返回的价格已经是预期成交价，不需要手动调整
             entry_price = await self.connector.get_quote_price(
                 trading_pair=trading_pair,
                 is_buy=is_buy,
@@ -391,13 +399,7 @@ class NewsSnipingV2Hybrid(StrategyV2Base):
                 self.logger().error(f"❌ 无法获取 {trading_pair} 精确报价")
                 return
 
-            # 调整价格（滑点 + gas buffer）
-            if is_buy:
-                entry_price = entry_price / ((Decimal("1") + slippage) * self.config.gas_buffer)
-            else:
-                entry_price = entry_price * ((Decimal("1") + slippage) * self.config.gas_buffer)
-
-            # 量化价格
+            # 量化价格（用于限价保护）
             entry_price = self.connector.quantize_order_price(trading_pair, entry_price)
 
             # ========== 手动下单（替代 PositionExecutor）==========
@@ -557,7 +559,7 @@ class NewsSnipingV2Hybrid(StrategyV2Base):
                             break
 
                     # 获取当前价格（用于 PnL 计算）
-                    # 重要：需要获取与入场时相同方向的价格进行比较
+                    # 重要：需要获取与入场时相同方向和数量的价格进行比较
                     current_price = await self.connector.get_quote_price(
                         trading_pair=trading_pair,
                         is_buy=is_buy,  # 与入场方向一致！
@@ -649,6 +651,7 @@ class NewsSnipingV2Hybrid(StrategyV2Base):
             )
 
             # 获取平仓价格
+            # Gateway 返回的已经是预期成交价，不需要手动调整
             close_price = await self.connector.get_quote_price(
                 trading_pair=trading_pair,
                 is_buy=not is_buy,
@@ -658,14 +661,6 @@ class NewsSnipingV2Hybrid(StrategyV2Base):
             if not close_price or close_price <= 0:
                 self.logger().error(f"❌ 无法获取平仓价格")
                 return
-
-            # 应用滑点
-            if not is_buy:
-                # 原买入，现卖出
-                close_price = close_price / (Decimal("1") + self.config.slippage)
-            else:
-                # 原卖出，现买入
-                close_price = close_price * (Decimal("1") + self.config.slippage)
 
             close_price = self.connector.quantize_order_price(trading_pair, close_price)
 
