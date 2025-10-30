@@ -1,0 +1,79 @@
+# V2 Hybrid 新闻狙击策略 - 配置文件
+#
+# 架构说明：
+# - ✅ 使用 V2 StrategyV2Base 框架
+# - ❌ 不使用 PositionExecutor（手动管理订单）
+# - ✅ 手动实现止盈止损逻辑
+# - ✅ Gateway DEX 兼容
+#
+# 使用方法：
+# start --script v2_news_sniping_hybrid
+
+# ========== V2 必需配置 ==========
+markets: {}  # 自动生成
+candles_config: []  # 不使用蜡烛数据
+controllers_config: []  # 不使用 controller
+
+# ========== 连接器配置 ==========
+connector: pancakeswap/router
+trading_pair: WBNB-USDT
+
+# ========== MQTT 配置 ==========
+mqtt_broker: localhost
+mqtt_port: 1883
+mqtt_topic: trading/bsc/snipe
+mqtt_username: ""
+mqtt_password: ""
+
+# ========== 交易配置 ==========
+default_trade_amount: 0.001  # BUY: quote amount, SELL: base amount
+default_quote_token: WBNB
+slippage: 0.02               # 2% 滑点
+gas_buffer: 1.15             # 15% gas buffer
+
+# 总调整 = (1 + slippage) * gas_buffer - 1
+#        = (1 + 0.02) * 1.15 - 1
+#        = 0.173
+#        = 17.3% ✅
+
+# ========== 手动止盈止损配置 ==========
+enable_manual_tp_sl: true    # 启用手动止盈止损监控
+stop_loss_pct: 0.10          # 10% 止损
+take_profit_pct: 0.05        # 5% 止盈
+time_limit_seconds: 300      # 5分钟超时平仓 (0=禁用)
+
+# ========== Redis 去重配置 ==========
+enable_signal_deduplication: true
+redis_host: localhost
+redis_port: 6379
+signal_dedup_window_seconds: 60  # 60秒去重窗口
+
+# ========== 预设配置模板 ==========
+
+# --- 当前配置: 新闻狙击（推荐）---
+slippage: 0.05
+gas_buffer: 1.2          # 总调整 17.3%
+stop_loss_pct: 0.5
+take_profit_pct: 1
+time_limit_seconds: 900
+
+# --- 模板 1: 高波动新币 ---
+# slippage: 0.05
+# gas_buffer: 1.20           # 总调整 26%
+# stop_loss_pct: 0.20
+# take_profit_pct: 0.50
+# time_limit_seconds: 180
+
+# --- 模板 2: 稳定币套利 ---
+# slippage: 0.005
+# gas_buffer: 1.05           # 总调整 5.5%
+# stop_loss_pct: 0.01
+# take_profit_pct: 0.005
+# time_limit_seconds: 600
+
+# --- 模板 3: 保守长期 ---
+# slippage: 0.01
+# gas_buffer: 1.10           # 总调整 11.1%
+# stop_loss_pct: 0.05
+# take_profit_pct: 0.15
+# time_limit_seconds: 0      # 无时间限制
