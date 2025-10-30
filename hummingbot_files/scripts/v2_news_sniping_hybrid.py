@@ -149,13 +149,6 @@ class NewsSnipingV2Hybrid(StrategyV2Base):
         self.config = config
         self.connector = self.connectors[self.config.connector]
 
-        # ========== 抑制 Binance Oracle 警告 ==========
-        # 对于链上代币，Binance 没有汇率，会产生大量警告
-        # 我们禁用 performance tracker 的这些警告
-        import logging
-        performance_logger = logging.getLogger("hummingbot.client.performance")
-        performance_logger.setLevel(logging.ERROR)  # 只显示 ERROR 及以上级别
-
         # 事件循环引用
         self._event_loop = asyncio.get_event_loop()
 
