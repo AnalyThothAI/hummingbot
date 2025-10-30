@@ -473,9 +473,12 @@ class NewsSnipingV2Hybrid(StrategyV2Base):
             )
 
             # 移到 active_positions
+            # 注意：使用我们计算的 entry_price，而不是 event.price
+            # 因为 event.price 可能是实际成交价，与我们的计算逻辑不一致
             self.active_positions[order_id] = {
                 **order_info,
-                "fill_price": event.price,
+                "fill_price": order_info["entry_price"],  # 使用计算的入场价
+                "actual_fill_price": event.price,  # 保存实际成交价用于记录
                 "fill_amount": event.amount,
                 "fill_timestamp": time.time(),
             }
