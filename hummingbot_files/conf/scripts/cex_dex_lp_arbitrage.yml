@@ -1,0 +1,126 @@
+# ========================================
+# CEX-DEX LP 套利策略配置
+# ========================================
+#
+# 策略原理:
+# - 在 DEX 上被动做 LP Maker
+# - 在 CEX 上主动做 Taker 对冲
+# - 赚取价差 + LP 手续费
+#
+# 使用方法:
+# start --script cex_dex_lp_arbitrage
+#
+# ========================================
+
+# ========== 交易所配置 ==========
+
+# CEX 交易所（用于对冲）
+cex_exchange: binance_perpetual_testnet
+
+# DEX 交易所（用于 LP）
+# 格式: name/type
+# 示例: uniswap/clmm, pancakeswap/amm, raydium/clmm
+dex_exchange: pancakeswap/clmm
+
+# 交易对
+# 注意: CEX 和 DEX 必须支持相同的交易对
+# DEX 可能使用 WETH 而不是 ETH
+trading_pair: CAKE-USDT
+
+# ========== LP 配置 ==========
+
+# LP 单边 Token 数量
+# 卖方: 放入 Base Token (WETH)
+# 买方: 放入 Quote Token (USDC)
+lp_token_amount: 0.1
+
+# LP 价格区间宽度（百分比）
+# 0.01 = 1%
+# 区间越窄，越快成交，但价格优势越小
+lp_spread_pct: 0.01
+
+# LP 最长持有时间（秒）
+# 超时后强制关闭，防止资金长时间占用
+lp_timeout_seconds: 300
+
+# ========== 盈利目标 ==========
+
+# 目标利润率（百分比）
+# 0.02 = 2%
+# 只有预期利润 > 此值时才开仓
+target_profitability: 0.02
+
+# 最低利润率（止损线）
+# 0.005 = 0.5%
+# 持仓中如果预期利润 < 此值，触发止损
+min_profitability: 0.005
+
+# ========== 费用估算 ==========
+
+# CEX Taker 手续费率
+# Binance: 0.001 (0.1%)
+# OKX: 0.001 (0.1%)
+cex_taker_fee_pct: 0.001
+
+# DEX LP 手续费率（这是我们能赚的）
+# Uniswap V3: 0.003 (0.3%) 或 0.005 (0.5%)
+# PancakeSwap: 0.0025 (0.25%)
+dex_lp_fee_pct: 0.003
+
+# 预估 Gas 成本（Quote Token 单位）
+# Ethereum Mainnet: 5-20 USDC
+# Polygon: 0.1-1 USDC
+# BSC: 0.5-2 USDC
+# Arbitrum: 0.5-2 USDC
+gas_cost_quote: 5
+
+# ========== 策略配置 ==========
+
+# 启用卖方套利
+# 卖方: DEX LP 卖出 Base，CEX 买入 Base
+# 条件: DEX 价格 > CEX 价格 + 费用 + 目标利润
+enable_sell_side: true
+
+# 启用买方套利
+# 买方: DEX LP 买入 Base，CEX 卖出 Base
+# 条件: CEX 价格 > DEX 价格 + 费用 + 目标利润
+enable_buy_side: false
+
+# 检查间隔（秒）
+# 每隔多久检查一次市场机会
+check_interval_seconds: 10
+
+# ========================================
+# 预设配置模板
+# ========================================
+
+# --- 当前配置: Mainnet 保守 ---
+# 适用: Ethereum Mainnet, 大额交易
+# Gas 高，需要更高利润才划算
+
+# --- 模板 1: Layer 2 激进 ---
+# 适用: Polygon, Arbitrum, BSC
+# Gas 低，可以降低利润目标
+
+# target_profitability: 0.01  # 1%
+# min_profitability: 0.003    # 0.3%
+# gas_cost_quote: 1           # 1 USDC
+# lp_timeout_seconds: 180     # 3 分钟
+
+# --- 模板 2: 稳定币套利 ---
+# 适用: USDC-USDT 等稳定币对
+# 价差小但稳定
+
+# target_profitability: 0.005  # 0.5%
+# min_profitability: 0.001     # 0.1%
+# lp_spread_pct: 0.005         # 0.5% 区间
+# lp_timeout_seconds: 600      # 10 分钟
+
+# --- 模板 3: 高波动新币 ---
+# 适用: 新上市的币种
+# 价差大，但风险高
+
+# target_profitability: 0.03   # 3%
+# min_profitability: 0.01      # 1%
+# lp_spread_pct: 0.02          # 2% 区间
+# lp_timeout_seconds: 120      # 2 分钟

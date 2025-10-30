@@ -51,9 +51,9 @@ signal_dedup_window_seconds: 60  # 60秒去重窗口
 # --- 当前配置: 新闻狙击（推荐）---
 slippage: 0.05
 gas_buffer: 1.2          # 总调整 17.3%
-stop_loss_pct: 0.5
-take_profit_pct: 1
-time_limit_seconds: 900
+stop_loss_pct: 0.01
+take_profit_pct: 0.1
+time_limit_seconds: 9900
 
 # --- 模板 1: 高波动新币 ---
 # slippage: 0.05
