@@ -96,3 +96,27 @@ coverage.xml
 .env
 
 **/.claude/settings.local.json
+
+# 敏感信息
+.env
+
+# 数据目录
+redis_data/
+emqx_data/
+emqx_log/
+hummingbot_files/logs
+gateway_files/
+shared_certs/
+
+# 日志
+*.log
+
+# 临时文件
+*.tmp
+*.swp
+*.bak
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db

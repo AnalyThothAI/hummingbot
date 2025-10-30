@@ -1,0 +1,4 @@
+gateway:
+  gateway_api_host: localhost
+  gateway_api_port: 15888
+  gateway_api_passphrase: SYIuYSGlDeEbmfPF

@@ -1,0 +1,14 @@
+script_file_name: news_sniping_strategy.py
+connector: pancakeswap/router
+trading_pair: WBNB-USDT
+mqtt_broker: localhost
+mqtt_port: 1883
+mqtt_topic: trading/bsc/snipe
+mqtt_username: ''
+mqtt_password: ''
+default_trade_amount: '0.001'
+default_quote_token: WBNB
+gas_buffer: '1.15'
+slippage: '0.05'
+max_retries: 3
+retry_delay: '2.0'
