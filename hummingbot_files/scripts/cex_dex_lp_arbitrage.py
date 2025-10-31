@@ -157,8 +157,13 @@ class ProfitabilityCalculator:
         # CEX 手续费
         cex_fee_pct = self.config.cex_taker_fee_pct
 
-        # Gas 成本转为百分比
-        gas_pct = self.config.gas_cost_quote / trade_value if trade_value > 0 else Decimal("0.01")
+        # Gas 成本转为百分比（设置合理上限，避免小交易量导致巨大百分比）
+        if trade_value > 0:
+            gas_pct = self.config.gas_cost_quote / trade_value
+            # Gas 成本不应超过 5%（如果超过，说明交易量太小）
+            gas_pct = min(gas_pct, Decimal("0.05"))
+        else:
+            gas_pct = Decimal("0.01")
 
         # 滑点预留（1%）
         slippage_pct = Decimal("0.01")
