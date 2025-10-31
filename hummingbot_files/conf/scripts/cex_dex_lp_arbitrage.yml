@@ -25,7 +25,7 @@ dex_exchange: pancakeswap/clmm
 # 交易对
 # 注意: CEX 和 DEX 必须支持相同的交易对
 # DEX 可能使用 WETH 而不是 ETH
-trading_pair: CAKE-USDT
+trading_pair: GIGGLE-WBNB
 
 dex_network: bsc
 # ========== LP 配置 ==========

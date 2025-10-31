@@ -21,10 +21,13 @@ CEX-DEX LP 套利策略
 
 import aiohttp
 import asyncio
+import json
 import logging
 import os
+import redis.asyncio as aioredis
 import ssl
 import time
+import uuid
 from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Optional, Tuple, Union
@@ -71,8 +74,11 @@ class CexDexLpArbitrageConfig(BaseClientModel):
 
     trading_pair: str = Field(
         "WETH-USDC",
-        json_schema_extra={"prompt": "交易对", "prompt_on_new": True}
+        json_schema_extra={"prompt": "DEX 交易对（如 GIGGLE-WBNB）", "prompt_on_new": True}
     )
+
+    # 注意：所有价格最终都会标准化为 USDT 计价
+    # CEX 不需要配置，它只用于对冲，不用于价格发现
 
     # ========== LP 配置 ==========
     lp_token_amount: Decimal = Field(
@@ -132,6 +138,231 @@ class CexDexLpArbitrageConfig(BaseClientModel):
         10,
         json_schema_extra={"prompt": "检查间隔（秒）", "prompt_on_new": False}
     )
+
+    # ========== Redis 配置 ==========
+    redis_host: str = Field(
+        "localhost",
+        json_schema_extra={"prompt": "Redis 主机地址", "prompt_on_new": False}
+    )
+
+    redis_port: int = Field(
+        6379,
+        json_schema_extra={"prompt": "Redis 端口", "prompt_on_new": False}
+    )
+
+    redis_db: int = Field(
+        0,
+        json_schema_extra={"prompt": "Redis 数据库编号", "prompt_on_new": False}
+    )
+
+    conversion_rate_ttl: int = Field(
+        60,
+        json_schema_extra={"prompt": "转换率缓存有效期（秒）", "prompt_on_new": False}
+    )
+
+
+# ========================================
+# Redis 缓存管理器
+# ========================================
+
+class ConversionRateCache:
+    """
+    基于 Redis 的转换率缓存管理器
+
+    支持：
+    - 分布式缓存（多策略实例共享）
+    - TTL 自动过期
+    - 降级到 last_known 价格
+    - 更新锁（防止多实例并发刷新）
+    """
+
+    def __init__(self, config: 'CexDexLpArbitrageConfig', logger):
+        self.config = config
+        self.logger = logger
+        self.redis_client: Optional[aioredis.Redis] = None
+        self.instance_id = str(uuid.uuid4())[:8]  # 实例标识
+        self.fallback_cache: Dict[str, Tuple[Decimal, float]] = {}  # Redis 不可用时的降级
+
+    async def connect(self):
+        """连接 Redis"""
+        try:
+            self.redis_client = await aioredis.from_url(
+                f"redis://{self.config.redis_host}:{self.config.redis_port}/{self.config.redis_db}",
+                encoding="utf-8",
+                decode_responses=True,
+                socket_connect_timeout=2,
+                socket_timeout=2
+            )
+            # 测试连接
+            await self.redis_client.ping()
+            self.logger.info(f"✅ Redis 连接成功: {self.config.redis_host}:{self.config.redis_port}")
+            return True
+        except Exception as e:
+            self.logger.warning(f"⚠️ Redis 连接失败: {e}，将使用内存缓存降级")
+            self.redis_client = None
+            return False
+
+    async def close(self):
+        """关闭 Redis 连接"""
+        if self.redis_client:
+            await self.redis_client.close()
+
+    def _make_key(self, token: str, key_type: str = "main") -> str:
+        """生成 Redis key"""
+        if key_type == "main":
+            return f"conv_rate:{token}:USDT"
+        elif key_type == "last_known":
+            return f"conv_rate:{token}:USDT:last_known"
+        elif key_type == "lock":
+            return f"conv_rate:{token}:USDT:lock"
+        else:
+            raise ValueError(f"Unknown key_type: {key_type}")
+
+    async def get_rate(self, token: str) -> Optional[Tuple[Decimal, str]]:
+        """
+        获取转换率（优先从 Redis）
+
+        Returns:
+            (price, source) 或 None
+            source: "redis_cache", "redis_last_known", "memory_fallback"
+        """
+        # 稳定币无需查询
+        if token.upper() in ["USDT", "USDC", "BUSD", "DAI"]:
+            return (Decimal("1"), "stablecoin")
+
+        # 尝试从 Redis 主缓存获取
+        if self.redis_client:
+            try:
+                key = self._make_key(token, "main")
+                data_str = await self.redis_client.get(key)
+
+                if data_str:
+                    data = json.loads(data_str)
+                    price = Decimal(data["price"])
+                    self.logger.debug(
+                        f"✅ Redis 缓存命中: {token}/USDT = {price} "
+                        f"(source: {data.get('source', 'unknown')})"
+                    )
+                    return (price, "redis_cache")
+
+                # 主缓存未命中，尝试 last_known
+                last_known_key = self._make_key(token, "last_known")
+                last_data_str = await self.redis_client.get(last_known_key)
+
+                if last_data_str:
+                    data = json.loads(last_data_str)
+                    price = Decimal(data["price"])
+                    age = time.time() - data.get("timestamp", 0)
+                    self.logger.warning(
+                        f"⚠️ 使用 last_known 价格: {token}/USDT = {price} "
+                        f"(age: {age:.0f}s)"
+                    )
+                    return (price, "redis_last_known")
+
+            except Exception as e:
+                self.logger.debug(f"Redis 读取失败: {e}")
+
+        # Redis 不可用，使用内存降级缓存
+        if token in self.fallback_cache:
+            price, cached_time = self.fallback_cache[token]
+            age = time.time() - cached_time
+            if age < self.config.conversion_rate_ttl:
+                self.logger.debug(f"使用内存缓存: {token}/USDT = {price} (age: {age:.0f}s)")
+                return (price, "memory_fallback")
+
+        return None
+
+    async def set_rate(
+        self,
+        token: str,
+        price: Decimal,
+        source: str,
+        confidence: str = "high"
+    ):
+        """
+        设置转换率到 Redis
+
+        Args:
+            token: Token 名称
+            price: 价格
+            source: 数据源 (cex, dex, oracle)
+            confidence: 置信度 (high, medium, low)
+        """
+        data = {
+            "price": str(price),
+            "source": source,
+            "confidence": confidence,
+            "timestamp": time.time(),
+            "instance_id": self.instance_id
+        }
+        data_str = json.dumps(data)
+
+        # 写入 Redis
+        if self.redis_client:
+            try:
+                # 主缓存
+                key = self._make_key(token, "main")
+                await self.redis_client.setex(
+                    key,
+                    self.config.conversion_rate_ttl,
+                    data_str
+                )
+
+                # Last known（24小时）
+                if confidence in ["high", "medium"]:
+                    last_known_key = self._make_key(token, "last_known")
+                    await self.redis_client.setex(
+                        last_known_key,
+                        86400,  # 24 hours
+                        data_str
+                    )
+
+                self.logger.debug(
+                    f"✅ 写入 Redis: {token}/USDT = {price} "
+                    f"(source: {source}, confidence: {confidence})"
+                )
+            except Exception as e:
+                self.logger.warning(f"⚠️ Redis 写入失败: {e}")
+
+        # 同时写入内存降级缓存
+        self.fallback_cache[token] = (price, time.time())
+
+    async def try_acquire_lock(self, token: str, timeout: int = 5) -> bool:
+        """
+        尝试获取更新锁（防止多实例同时刷新）
+
+        Returns:
+            True if lock acquired
+        """
+        if not self.redis_client:
+            return True  # Redis 不可用，直接允许
+
+        try:
+            lock_key = self._make_key(token, "lock")
+            acquired = await self.redis_client.set(
+                lock_key,
+                self.instance_id,
+                nx=True,  # 只在 key 不存在时设置
+                ex=timeout
+            )
+            return bool(acquired)
+        except Exception as e:
+            self.logger.debug(f"获取锁失败: {e}")
+            return True  # 出错时允许，避免阻塞
+
+    async def release_lock(self, token: str):
+        """释放更新锁"""
+        if not self.redis_client:
+            return
+
+        try:
+            lock_key = self._make_key(token, "lock")
+            # 只删除自己的锁
+            lock_owner = await self.redis_client.get(lock_key)
+            if lock_owner == self.instance_id:
+                await self.redis_client.delete(lock_key)
+        except Exception as e:
+            self.logger.debug(f"释放锁失败: {e}")
 
 
 # ========================================
@@ -483,9 +714,18 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
 
     @classmethod
     def init_markets(cls, config: CexDexLpArbitrageConfig):
+        # 解析 DEX 交易对
+        base_token, dex_quote_token = config.trading_pair.split("-")
+
+        # CEX 使用 base_token-USDT 格式
+        cex_trading_pair = f"{base_token}-USDT"
+
+        # DEX 使用配置中的交易对
+        dex_trading_pair = config.trading_pair
+
         cls.markets = {
-            config.cex_exchange: {config.trading_pair},
-            config.dex_exchange: {config.trading_pair}
+            config.cex_exchange: {cex_trading_pair},  # 如 GIGGLE-USDT
+            config.dex_exchange: {dex_trading_pair}   # 如 GIGGLE-WBNB
         }
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: CexDexLpArbitrageConfig):
@@ -496,8 +736,16 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
         self.cex_connector = connectors[config.cex_exchange]
         self.dex_connector = connectors[config.dex_exchange]
 
-        # Token 名称
-        self.base_token, self.quote_token = config.trading_pair.split("-")
+        # Token 名称（从 DEX 交易对解析）
+        self.base_token, self.dex_quote_token = config.trading_pair.split("-")
+
+        # 所有价格统一标准化为 USDT（美元稳定币）
+        self.standard_quote = "USDT"  # 标准计价单位
+
+        # 价格转换缓存管理器（Redis + 内存降级）
+        self.conversion_rate_cache = ConversionRateCache(config, self.logger())
+        # 异步初始化 Redis 连接
+        safe_ensure_future(self.conversion_rate_cache.connect())
 
         # 初始化模块
         self.profit_calculator = ProfitabilityCalculator(config, self.logger())
@@ -518,17 +766,25 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
         }
 
         # 启动信息
+        price_conversion_info = ""
+        if self.dex_quote_token.upper() not in ["USDT", "USDC", "BUSD", "DAI"]:
+            price_conversion_info = (
+                f"\n   🔄 价格转换: {self.dex_quote_token} → {self.standard_quote} "
+                f"(所有价格统一为美元计价)"
+            )
+
         self.log_with_clock(
             logging.INFO,
             f"CEX-DEX LP 套利策略启动:\n"
-            f"   CEX: {config.cex_exchange}\n"
-            f"   DEX: {config.dex_exchange}\n"
-            f"   交易对: {config.trading_pair}\n"
+            f"   CEX: {config.cex_exchange} (仅用于对冲)\n"
+            f"   DEX: {config.dex_exchange} (价格发现)\n"
+            f"   交易对: {config.trading_pair} (DEX 池子)\n"
             f"   LP 数量: {config.lp_token_amount} {self.base_token}\n"
             f"   目标利润: {config.target_profitability * 100:.2f}%\n"
             f"   最低利润: {config.min_profitability * 100:.2f}%\n"
             f"   卖方套利: {'启用' if config.enable_sell_side else '禁用'}\n"
             f"   买方套利: {'启用' if config.enable_buy_side else '禁用'}"
+            f"{price_conversion_info}"
         )
 
     # ========================================
@@ -874,30 +1130,61 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
     # 辅助方法
     # ========================================
 
+    def _get_cex_trading_pair(self) -> str:
+        """
+        构建 CEX 交易对
+
+        DEX 交易对可能是 GIGGLE-WBNB，但 CEX 是 GIGGLE-USDT
+        统一使用 base_token-USDT 格式
+        """
+        return f"{self.base_token}-{self.standard_quote}"
+
     async def _get_cex_best_ask(self) -> Optional[Decimal]:
         """获取 CEX 最佳卖价（我们的买入价）"""
         try:
+            cex_pair = self._get_cex_trading_pair()
+
+            self.logger().debug(f"从 CEX 获取 {cex_pair} Ask 价格...")
+
             price = await self.cex_connector.get_quote_price(
-                trading_pair=self.config.trading_pair,
+                trading_pair=cex_pair,
                 is_buy=True,
                 amount=self.config.lp_token_amount
             )
-            return Decimal(str(price)) if price else None
+
+            if price and price > 0:
+                self.logger().debug(f"✅ CEX Ask: {price} {self.standard_quote}")
+                return Decimal(str(price))
+            else:
+                self.logger().warning(f"⚠️ CEX {cex_pair} 返回空价格")
+                return None
+
         except Exception as e:
-            self.logger().error(f"获取 CEX 买价失败: {e}")
+            self.logger().error(f"获取 CEX 买价失败 ({self._get_cex_trading_pair()}): {e}")
             return None
 
     async def _get_cex_best_bid(self) -> Optional[Decimal]:
         """获取 CEX 最佳买价（我们的卖出价）"""
         try:
+            cex_pair = self._get_cex_trading_pair()
+
+            self.logger().debug(f"从 CEX 获取 {cex_pair} Bid 价格...")
+
             price = await self.cex_connector.get_quote_price(
-                trading_pair=self.config.trading_pair,
+                trading_pair=cex_pair,
                 is_buy=False,
                 amount=self.config.lp_token_amount
             )
-            return Decimal(str(price)) if price else None
+
+            if price and price > 0:
+                self.logger().debug(f"✅ CEX Bid: {price} {self.standard_quote}")
+                return Decimal(str(price))
+            else:
+                self.logger().warning(f"⚠️ CEX {cex_pair} 返回空价格")
+                return None
+
         except Exception as e:
-            self.logger().error(f"获取 CEX 卖价失败: {e}")
+            self.logger().error(f"获取 CEX 卖价失败 ({self._get_cex_trading_pair()}): {e}")
             return None
 
     async def _gateway_request(self, method: str, path_url: str, params: Optional[dict] = None) -> Optional[dict]:
@@ -972,11 +1259,16 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
         """
         内部方法：使用 Gateway quote-swap 端点获取 DEX 价格
 
+        返回价格已标准化为 USDT 计价（如果 DEX 使用不同的 Quote Token）
+
         参考: mtqq_cex_webhook.py:3454-3606
         """
         try:
             # 解析交易对
-            base, quote = self.config.trading_pair.split("-")
+            base, _ = self.config.trading_pair.split("-")
+
+            # 使用实际的 DEX Quote Token（可能与交易对中的不同）
+            dex_quote = self.dex_quote_token
 
             # 解析 DEX 配置
             exchange_parts = self.config.dex_exchange.split("/")
@@ -992,14 +1284,14 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
             price_params = {
                 "network": self.config.dex_network,
                 "baseToken": base,
-                "quoteToken": quote,
+                "quoteToken": dex_quote,  # 使用 DEX 的实际 Quote Token
                 "amount": "1",  # 获取 1 个 base token 的价格
                 "side": "SELL"
             }
 
             self.logger().debug(
                 f"🔍 获取 DEX 价格: {exchange}/{pool_type} on {self.config.dex_network}, "
-                f"{base}-{quote}"
+                f"{base}-{dex_quote}"
             )
 
             # 调用 Gateway API（GET 请求）
@@ -1007,6 +1299,191 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
 
             if not response:
                 self.logger().warning("⚠️ Gateway 返回空响应")
+                return None
+
+            # 提取价格（DEX Quote Token 计价）
+            dex_price_raw = None
+            if "amountOut" in response:
+                dex_price_raw = Decimal(str(response["amountOut"]))
+            elif "price" in response:
+                dex_price_raw = Decimal(str(response["price"]))
+            elif "expectedAmount" in response:
+                dex_price_raw = Decimal(str(response["expectedAmount"]))
+
+            if not dex_price_raw:
+                self.logger().warning(f"⚠️ 响应中没有价格数据: {response}")
+                return None
+
+            self.logger().debug(f"✅ DEX 原始价格: {dex_price_raw} {dex_quote}")
+
+            # 如果 DEX Quote Token 不是稳定币，需要标准化为 USDT
+            if dex_quote.upper() not in ["USDT", "USDC", "BUSD", "DAI"]:
+                self.logger().debug(
+                    f"🔄 需要价格标准化: {dex_quote} -> {self.standard_quote}"
+                )
+                normalized_price = await self._normalize_price_to_usdt(dex_price_raw, dex_quote)
+
+                if not normalized_price:
+                    self.logger().error("❌ 价格标准化失败")
+                    return None
+
+                self.logger().info(
+                    f"✅ DEX 标准化价格: {dex_price_raw} {dex_quote} "
+                    f"-> {normalized_price} {self.standard_quote}"
+                )
+                final_price = normalized_price
+            else:
+                # DEX 已经是稳定币计价，无需转换
+                self.logger().debug(f"✅ DEX 已是稳定币计价，无需转换")
+                final_price = dex_price_raw
+
+            # 注入价格到 RateOracle（避免 "rate not found" 错误）
+            try:
+                rate_oracle = RateOracle.get_instance()
+                rate_oracle.set_price(self.config.trading_pair, final_price)
+                self.logger().debug(
+                    f"📊 已注入价格到 RateOracle: {self.config.trading_pair} = ${final_price}"
+                )
+            except Exception as oracle_err:
+                self.logger().debug(f"⚠️ 注入 RateOracle 失败: {oracle_err}")
+
+            return final_price
+
+        except Exception as e:
+            self.logger().error(f"❌ 获取 DEX 价格失败: {e}", exc_info=True)
+            raise
+
+    async def _get_dex_price(self) -> Optional[Decimal]:
+        """获取 DEX 价格（公开接口）"""
+        return await self._get_dex_price_with_retry()
+
+    # ========================================
+    # 价格转换（跨 Quote Token 支持）
+    # ========================================
+
+    async def _get_conversion_rate_to_usdt(self, token: str) -> Optional[Decimal]:
+        """
+        获取 Token 相对 USDT 的转换率（Redis + 多层降级）
+
+        Args:
+            token: Token 名称（如 WBNB, BNB）
+
+        Returns:
+            转换率（1 token = ? USDT），失败返回 None
+
+        示例:
+            WBNB = 600 USDT -> 返回 Decimal("600")
+        """
+        # 1. 先从 Redis 缓存获取
+        cached_result = await self.conversion_rate_cache.get_rate(token)
+        if cached_result:
+            price, source = cached_result
+            self.logger().debug(f"✅ 缓存命中: {token}/USDT = {price} (source: {source})")
+            return price
+
+        # 2. 尝试获取分布式锁（防止多实例并发刷新）
+        lock_acquired = await self.conversion_rate_cache.try_acquire_lock(token, timeout=5)
+
+        if not lock_acquired:
+            # 未获取锁，等待并重试一次缓存
+            self.logger().debug(f"⏳ 等待其他实例更新 {token}/USDT...")
+            await asyncio.sleep(0.5)
+            cached_result = await self.conversion_rate_cache.get_rate(token)
+            if cached_result:
+                price, source = cached_result
+                return price
+
+        try:
+            # 3. 依次尝试数据源获取转换率
+            conversion_rate = None
+            source = None
+            confidence = "low"
+
+            # 策略 1: CEX (最可靠，延迟 ~100ms)
+            conversion_rate = await self._fetch_conversion_rate_from_cex(token)
+            if conversion_rate:
+                source, confidence = "cex", "high"
+                self.logger().info(f"✅ CEX 获取成功: {token}/USDT = {conversion_rate}")
+
+            # 策略 2: DEX (备用，延迟 ~500ms)
+            if not conversion_rate:
+                conversion_rate = await self._fetch_conversion_rate_from_dex(token)
+                if conversion_rate:
+                    source, confidence = "dex", "medium"
+                    self.logger().info(f"✅ DEX 获取成功: {token}/USDT = {conversion_rate}")
+
+            # 策略 3: RateOracle (历史价格)
+            if not conversion_rate:
+                conversion_rate = await self._fetch_conversion_rate_from_oracle(token)
+                if conversion_rate:
+                    source, confidence = "oracle", "low"
+                    self.logger().warning(f"⚠️ 使用历史价格: {token}/USDT = {conversion_rate}")
+
+            # 4. 写入 Redis 缓存
+            if conversion_rate:
+                await self.conversion_rate_cache.set_rate(
+                    token, conversion_rate, source, confidence
+                )
+                return conversion_rate
+            else:
+                self.logger().error(f"❌ 所有数据源均失败: {token}/USDT")
+                return None
+
+        finally:
+            # 5. 释放分布式锁
+            if lock_acquired:
+                await self.conversion_rate_cache.release_lock(token)
+
+    async def _fetch_conversion_rate_from_cex(self, token: str) -> Optional[Decimal]:
+        """从 CEX 获取 Token/USDT 价格"""
+        try:
+            # 构建交易对（如 WBNB -> BNB-USDT）
+            # 去掉 "W" 前缀（WBNB -> BNB）
+            base_token = token[1:] if token.startswith("W") and len(token) > 1 else token
+            trading_pair = f"{base_token}-USDT"
+
+            self.logger().debug(f"从 CEX 获取 {trading_pair} 价格...")
+
+            # 使用 CEX connector 获取价格
+            price = await self.cex_connector.get_quote_price(
+                trading_pair=trading_pair,
+                is_buy=True,  # 获取卖价（Ask）
+                amount=Decimal("1")
+            )
+
+            if price and price > 0:
+                return Decimal(str(price))
+            else:
+                return None
+
+        except Exception as e:
+            self.logger().debug(f"从 CEX 获取 {token}/USDT 失败: {e}")
+            return None
+
+    async def _fetch_conversion_rate_from_dex(self, token: str) -> Optional[Decimal]:
+        """从 DEX 获取 Token/USDT 价格（通过 Gateway）"""
+        try:
+            # 解析 DEX 配置
+            exchange_parts = self.config.dex_exchange.split("/")
+            exchange = exchange_parts[0]
+            pool_type = exchange_parts[1] if len(exchange_parts) > 1 else "clmm"
+
+            path_url = f"connectors/{exchange}/{pool_type}/quote-swap"
+
+            # 构建查询参数
+            price_params = {
+                "network": self.config.dex_network,
+                "baseToken": token,
+                "quoteToken": "USDT",
+                "amount": "1",
+                "side": "SELL"
+            }
+
+            self.logger().debug(f"从 DEX 获取 {token}/USDT 价格...")
+
+            response = await self._gateway_request("get", path_url, params=price_params)
+
+            if not response:
                 return None
 
             # 提取价格
@@ -1018,31 +1495,71 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
             elif "expectedAmount" in response:
                 price = Decimal(str(response["expectedAmount"]))
 
-            if price:
-                self.logger().debug(f"✅ DEX 价格: ${price}")
+            return price if price and price > 0 else None
 
-                # 注入价格到 RateOracle（避免 "rate not found" 错误）
-                try:
-                    rate_oracle = RateOracle.get_instance()
-                    rate_oracle.set_price(self.config.trading_pair, price)
-                    self.logger().debug(
-                        f"📊 已注入价格到 RateOracle: {self.config.trading_pair} = ${price}"
-                    )
-                except Exception as oracle_err:
-                    self.logger().debug(f"⚠️ 注入 RateOracle 失败: {oracle_err}")
+        except Exception as e:
+            self.logger().debug(f"从 DEX 获取 {token}/USDT 失败: {e}")
+            return None
 
-                return price
+    async def _fetch_conversion_rate_from_oracle(self, token: str) -> Optional[Decimal]:
+        """从 RateOracle 获取 Token/USDT 价格"""
+        try:
+            # 去掉 "W" 前缀
+            base_token = token[1:] if token.startswith("W") and len(token) > 1 else token
+            trading_pair = f"{base_token}-USDT"
+
+            rate_oracle = RateOracle.get_instance()
+            rate = rate_oracle.get_pair_rate(trading_pair)
+
+            if rate and rate > 0:
+                self.logger().debug(f"从 RateOracle 获取 {trading_pair} 价格: {rate}")
+                return Decimal(str(rate))
             else:
-                self.logger().warning(f"⚠️ 响应中没有价格数据: {response}")
                 return None
 
         except Exception as e:
-            self.logger().error(f"❌ 获取 DEX 价格失败: {e}", exc_info=True)
-            raise
+            self.logger().debug(f"从 RateOracle 获取 {token}/USDT 失败: {e}")
+            return None
 
-    async def _get_dex_price(self) -> Optional[Decimal]:
-        """获取 DEX 价格（公开接口）"""
-        return await self._get_dex_price_with_retry()
+    async def _normalize_price_to_usdt(
+        self,
+        price: Decimal,
+        quote_token: str
+    ) -> Optional[Decimal]:
+        """
+        将价格统一转换为 USDT 计价
+
+        Args:
+            price: 原始价格
+            quote_token: 原始 Quote Token（如 WBNB, USDT）
+
+        Returns:
+            USDT 计价的价格，失败返回 None
+
+        示例:
+            价格 0.00155 WBNB，WBNB = 600 USDT
+            -> 返回 0.00155 * 600 = 0.93 USDT
+        """
+        if quote_token.upper() in ["USDT", "USDC", "BUSD", "DAI"]:
+            # 已经是稳定币计价，无需转换
+            return price
+
+        # 获取转换率
+        conversion_rate = await self._get_conversion_rate_to_usdt(quote_token)
+
+        if not conversion_rate:
+            self.logger().error(f"❌ 无法获取 {quote_token}/USDT 转换率，价格标准化失败")
+            return None
+
+        # 转换价格
+        normalized_price = price * conversion_rate
+
+        self.logger().debug(
+            f"价格标准化: {price} {quote_token} × {conversion_rate} (USDT/{quote_token}) "
+            f"= {normalized_price} USDT"
+        )
+
+        return normalized_price
 
     # ========================================
     # 状态显示
@@ -1058,6 +1575,11 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
         lines.append("=" * 70)
         lines.append(f"CEX: {self.config.cex_exchange:20} | DEX: {self.config.dex_exchange}")
         lines.append(f"交易对: {self.config.trading_pair:18} | LP 数量: {self.config.lp_token_amount}")
+
+        # 价格转换提示
+        if self.dex_quote_token.upper() not in ["USDT", "USDC", "BUSD", "DAI"]:
+            lines.append(f"🔄 价格转换: {self.dex_quote_token} → {self.standard_quote} (所有价格统一为美元计价)")
+
         lines.append("-" * 70)
 
         # ========== 实时市场数据 ==========
@@ -1101,20 +1623,23 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
             cex_mid = (cex_ask + cex_bid) / 2
             cex_spread = ((cex_ask - cex_bid) / cex_mid * 100) if cex_mid > 0 else 0
 
-            lines.append(f"CEX ({self.config.cex_exchange}):")
-            lines.append(f"   买价 (Ask): {cex_ask:>12.6f} {self.quote_token}  ← 我们买入的价格")
-            lines.append(f"   卖价 (Bid): {cex_bid:>12.6f} {self.quote_token}  ← 我们卖出的价格")
-            lines.append(f"   中间价:     {cex_mid:>12.6f} {self.quote_token}")
+            lines.append(f"CEX ({self.config.cex_exchange}) - 用于对冲:")
+            lines.append(f"   基准价:     {cex_mid:>12.6f} {self.standard_quote}")
             lines.append(f"   价差:       {cex_spread:>12.4f} %")
+            lines.append(f"   (Ask: {cex_ask:.6f}, Bid: {cex_bid:.6f})")
         else:
             lines.append(f"CEX: ⚠️  无法获取价格")
 
         lines.append("")
 
-        # 显示 DEX 价格
+        # 显示 DEX 价格（已标准化为 USDT）
         if dex_price:
-            lines.append(f"DEX ({self.config.dex_exchange}):")
-            lines.append(f"   报价:       {dex_price:>12.6f} {self.quote_token}")
+            dex_price_label = f"DEX ({self.config.dex_exchange}) - 价格发现:"
+            if self.dex_quote_token.upper() not in ["USDT", "USDC", "BUSD", "DAI"]:
+                dex_price_label += f" [池子: {self.base_token}-{self.dex_quote_token}]"
+
+            lines.append(dex_price_label)
+            lines.append(f"   报价:       {dex_price:>12.6f} {self.standard_quote}")
         else:
             lines.append(f"DEX: ⚠️  无法获取价格")
 
@@ -1150,17 +1675,23 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
                 # 计算费用
                 total_fees_pct = self.profit_calculator.estimate_total_fees_pct(trade_value)
 
-                lines.append(f"   DEX 价格:        {dex_price:>12.6f} {self.quote_token}")
-                lines.append(f"   CEX 买价:        {cex_ask:>12.6f} {self.quote_token}")
-                lines.append(f"   价差:            {price_diff:>+12.6f} {self.quote_token}  ({price_diff_pct:+.2f}%)")
+                # 计算各项费用（应用相同的上限逻辑）
+                cex_fee_display = self.config.cex_taker_fee_pct * 100
+                gas_pct_raw = self.config.gas_cost_quote / trade_value if trade_value > 0 else Decimal("0.01")
+                gas_pct_display = min(gas_pct_raw, Decimal("0.05")) * 100  # 应用 5% 上限
+                slippage_display = Decimal("1.0")
+
+                lines.append(f"   DEX 价格:        {dex_price:>12.6f} {self.standard_quote}")
+                lines.append(f"   CEX 买价:        {cex_ask:>12.6f} {self.standard_quote}")
+                lines.append(f"   价差:            {price_diff:>+12.6f} {self.standard_quote}  ({price_diff_pct:+.2f}%)")
                 lines.append(f"   ")
-                lines.append(f"   目标开仓价:      {target_price:>12.6f} {self.quote_token}  (需 {self.config.target_profitability*100:.1f}% 利润)")
-                lines.append(f"   最低价格(止损):  {min_price:>12.6f} {self.quote_token}  (需 {self.config.min_profitability*100:.1f}% 利润)")
+                lines.append(f"   目标开仓价:      {target_price:>12.6f} {self.standard_quote}  (需 {self.config.target_profitability*100:.1f}% 利润)")
+                lines.append(f"   最低价格(止损):  {min_price:>12.6f} {self.standard_quote}  (需 {self.config.min_profitability*100:.1f}% 利润)")
                 lines.append(f"   ")
                 lines.append(f"   总费用率:        {total_fees_pct*100:>12.2f} %")
-                lines.append(f"     - CEX 手续费:  {self.config.cex_taker_fee_pct*100:>12.2f} %")
-                lines.append(f"     - Gas 成本:    {(self.config.gas_cost_quote/trade_value*100) if trade_value > 0 else 0:>12.2f} %")
-                lines.append(f"     - 滑点预留:    {1.0:>12.2f} %")
+                lines.append(f"     - CEX 手续费:  {cex_fee_display:>12.2f} %")
+                lines.append(f"     - Gas 成本:    {gas_pct_display:>12.2f} % (实际: {self.config.gas_cost_quote} {self.standard_quote})")
+                lines.append(f"     - 滑点预留:    {slippage_display:>12.2f} %")
                 lines.append(f"     - LP 费收入:   -{self.config.dex_lp_fee_pct*100:>12.2f} %")
                 lines.append(f"   ")
 
@@ -1169,12 +1700,12 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
                     expected_profit_pct = (dex_price - cex_ask) / cex_ask - total_fees_pct + self.config.dex_lp_fee_pct
                     expected_profit_amount = expected_profit_pct * trade_value
                     lines.append(f"   ✅ 有套利机会！")
-                    lines.append(f"      预期利润:     {expected_profit_amount:>12.4f} {self.quote_token}  ({expected_profit_pct*100:+.2f}%)")
+                    lines.append(f"      预期利润:     {expected_profit_amount:>12.4f} {self.standard_quote}  ({expected_profit_pct*100:+.2f}%)")
                 else:
                     gap = target_price - dex_price
                     gap_pct = (gap / dex_price * 100) if dex_price > 0 else 0
                     lines.append(f"   ❌ 暂无机会")
-                    lines.append(f"      需要涨幅:     {gap:>12.6f} {self.quote_token}  ({gap_pct:.2f}%)")
+                    lines.append(f"      需要涨幅:     {gap:>12.6f} {self.standard_quote}  ({gap_pct:.2f}%)")
 
             lines.append("")
 
@@ -1192,10 +1723,10 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
                     trade_value=trade_value
                 )
 
-                lines.append(f"   CEX 卖价:        {cex_bid:>12.6f} {self.quote_token}")
-                lines.append(f"   DEX 价格:        {dex_price:>12.6f} {self.quote_token}")
-                lines.append(f"   价差:            {price_diff:>+12.6f} {self.quote_token}  ({price_diff_pct:+.2f}%)")
-                lines.append(f"   目标开仓价:      {target_price:>12.6f} {self.quote_token}")
+                lines.append(f"   CEX 卖价:        {cex_bid:>12.6f} {self.standard_quote}")
+                lines.append(f"   DEX 价格:        {dex_price:>12.6f} {self.standard_quote}")
+                lines.append(f"   价差:            {price_diff:>+12.6f} {self.standard_quote}  ({price_diff_pct:+.2f}%)")
+                lines.append(f"   目标开仓价:      {target_price:>12.6f} {self.standard_quote}")
 
                 if dex_price <= target_price:
                     lines.append(f"   ✅ 有套利机会！")
@@ -1218,18 +1749,18 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
             open_cex_price = self.lp_position_info["open_cex_price"]
 
             lines.append(f"方向:        {side}")
-            lines.append(f"价格区间:    {lower:.6f} - {upper:.6f} {self.quote_token}")
-            lines.append(f"均价:        {avg_price:.6f} {self.quote_token}")
+            lines.append(f"价格区间:    {lower:.6f} - {upper:.6f} {self.standard_quote}")
+            lines.append(f"均价:        {avg_price:.6f} {self.standard_quote}")
             lines.append(f"数量:        {self.lp_position_info['token_amount']} {self.base_token}")
             lines.append(f"持仓时间:    {int(elapsed)}秒 / {self.config.lp_timeout_seconds}秒")
-            lines.append(f"开仓CEX价:   {open_cex_price:.6f} {self.quote_token}")
+            lines.append(f"开仓CEX价:   {open_cex_price:.6f} {self.standard_quote}")
 
             # 当前 CEX 价格变化
             if cex_ask and side == "SELL":
                 current_cex = cex_ask
                 price_change = current_cex - open_cex_price
                 price_change_pct = (price_change / open_cex_price * 100) if open_cex_price > 0 else 0
-                lines.append(f"当前CEX价:   {current_cex:.6f} {self.quote_token}  (变化: {price_change:+.6f}, {price_change_pct:+.2f}%)")
+                lines.append(f"当前CEX价:   {current_cex:.6f} {self.standard_quote}  (变化: {price_change:+.6f}, {price_change_pct:+.2f}%)")
 
                 # 预期盈亏
                 if avg_price > current_cex:
@@ -1245,10 +1776,10 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
         lines.append("📊 统计信息")
         lines.append("-" * 70)
         lines.append(f"完成周期:    {self.stats['completed_cycles']}")
-        lines.append(f"累计利润:    {self.stats['total_profit']:.4f} {self.quote_token}")
+        lines.append(f"累计利润:    {self.stats['total_profit']:.4f} {self.standard_quote}")
         if self.stats['completed_cycles'] > 0:
             avg_profit = self.stats['total_profit'] / self.stats['completed_cycles']
-            lines.append(f"平均利润:    {avg_profit:.4f} {self.quote_token}")
+            lines.append(f"平均利润:    {avg_profit:.4f} {self.standard_quote}")
         lines.append(f"LP开仓失败:  {self.stats['lp_open_failures']}")
         lines.append(f"对冲失败:    {self.stats['hedge_failures']}")
 
