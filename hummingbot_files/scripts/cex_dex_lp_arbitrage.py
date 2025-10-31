@@ -19,18 +19,23 @@ CEX-DEX LP 套利策略
 - amm_trade_example.py (DEX 交易)
 """
 
+import aiohttp
 import asyncio
 import logging
 import os
+import ssl
 import time
 from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Optional, Tuple, Union
+from urllib.parse import urlencode
 
 from pydantic import Field
 
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient
+from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.connector.gateway.common_types import ConnectorType, get_connector_type
 from hummingbot.connector.gateway.gateway_lp import AMMPositionInfo, CLMMPositionInfo
 from hummingbot.core.data_type.common import OrderType
@@ -57,6 +62,11 @@ class CexDexLpArbitrageConfig(BaseClientModel):
     dex_exchange: str = Field(
         "pancakeswap/clmm",
         json_schema_extra={"prompt": "DEX 交易所（格式: name/type，如 uniswap/clmm）", "prompt_on_new": True}
+    )
+
+    dex_network: str = Field(
+        "bsc",
+        json_schema_extra={"prompt": "DEX 网络（如 bsc, mainnet, arbitrum）", "prompt_on_new": True}
     )
 
     trading_pair: str = Field(
@@ -736,17 +746,39 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
     # ========================================
 
     def did_fill_order(self, event: OrderFilledEvent):
-        """订单成交事件"""
+        """
+        订单成交事件（生产级优化）
+
+        参考: mtqq_cex_webhook.py:338-435
+        """
+        # 注入价格到 RateOracle（在 MarketsRecorder 计算前完成）
+        try:
+            rate_oracle = RateOracle.get_instance()
+            rate_oracle.set_price(event.trading_pair, Decimal(str(event.price)))
+            self.logger().debug(
+                f"📊 注入价格到 RateOracle: {event.trading_pair} = ${event.price:.6f}"
+            )
+        except Exception as oracle_err:
+            self.logger().debug(f"⚠️ 注入 RateOracle 失败: {oracle_err}")
+
         # LP 开仓成交
         if hasattr(event, 'order_id') and event.order_id == self.lp_manager.open_order_id:
-            self.logger().info(f"LP 开仓成交: {event.order_id}")
+            self.logger().info(f"✅ LP 开仓成交: {event.order_id}")
+
+            # 记录 Gas Price（EVM 链）
+            safe_ensure_future(self._record_gas_price(event))
+
             self.lp_manager.position_opening = False
             # 需要异步获取 position_info
             safe_ensure_future(self._fetch_lp_position_info())
 
         # LP 关仓成交
         elif hasattr(event, 'order_id') and event.order_id == self.lp_manager.close_order_id:
-            self.logger().info(f"LP 关仓成交: {event.order_id}")
+            self.logger().info(f"✅ LP 关仓成交: {event.order_id}")
+
+            # 记录 Gas Price（EVM 链）
+            safe_ensure_future(self._record_gas_price(event))
+
             self.lp_manager.position_closing = False
             self.lp_manager.position_info = None
             self.lp_position_opened = False
@@ -754,7 +786,7 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
 
         # CEX 对冲成交
         elif hasattr(event, 'order_id') and event.order_id == self.hedge_executor.pending_order_id:
-            self.logger().info(f"CEX 对冲成交: {event.order_id}")
+            self.logger().info(f"✅ CEX 对冲成交: {event.order_id}")
             safe_ensure_future(self._handle_hedge_filled(event))
 
     async def _fetch_lp_position_info(self):
@@ -776,6 +808,50 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
                     )
         except Exception as e:
             self.logger().error(f"获取 LP 仓位信息失败: {e}")
+
+    async def _record_gas_price(self, event: OrderFilledEvent):
+        """
+        记录 Gas Price（仅 EVM 链）
+
+        参考: mtqq_cex_webhook.py:361-383
+        """
+        try:
+            # 只对 DEX 交易记录 gas
+            if not hasattr(self.dex_connector, 'in_flight_orders'):
+                return
+
+            in_flight_order = self.dex_connector.in_flight_orders.get(event.order_id)
+            if not in_flight_order:
+                return
+
+            if not hasattr(in_flight_order, 'gas_price'):
+                return
+
+            gas_price_wei = float(in_flight_order.gas_price)
+            if gas_price_wei <= 0:
+                return
+
+            # 转换 Wei -> Gwei
+            gas_price_gwei = gas_price_wei / 1e9
+
+            self.logger().info(
+                f"⛽ Gas Price 记录:\n"
+                f"   订单: {event.order_id}\n"
+                f"   Gas: {gas_price_gwei:.2f} Gwei\n"
+                f"   TX: {event.exchange_trade_id}"
+            )
+
+            # 可选：记录到统计信息
+            if "total_gas_gwei" not in self.stats:
+                self.stats["total_gas_gwei"] = 0
+                self.stats["gas_tx_count"] = 0
+
+            self.stats["total_gas_gwei"] += gas_price_gwei
+            self.stats["gas_tx_count"] += 1
+
+        except Exception as e:
+            # Gas 记录失败不应影响主流程
+            self.logger().debug(f"⚠️ 记录 Gas Price 失败: {e}")
 
     async def _handle_hedge_filled(self, event: OrderFilledEvent):
         """处理对冲成交"""
@@ -819,75 +895,149 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
             self.logger().error(f"获取 CEX 卖价失败: {e}")
             return None
 
-    async def _get_dex_pool_info(self):
+    async def _gateway_request(self, method: str, path_url: str, params: Optional[dict] = None) -> Optional[dict]:
         """
-        获取 DEX 池子信息
+        调用 Gateway REST API（使用官方 GatewayHttpClient）
 
-        参考 lp_manage_position.py 的实现
+        Args:
+            method: HTTP 方法（get/post）
+            path_url: API 路径（不带前导斜杠），例如 "connectors/pancakeswap_clmm/quote-swap"
+            params: 请求参数字典
+
+        Returns:
+            响应字典，失败返回 None
         """
         try:
-            self.logger().info(f"正在获取 {self.config.trading_pair} 池子信息...")
-            self.logger().info(f"DEX Connector: {self.config.dex_exchange}")
-            self.logger().info(f"Connector type: {type(self.dex_connector).__name__}")
+            # 使用官方 GatewayHttpClient
+            gateway_client = GatewayHttpClient.get_instance()
 
-            # 先尝试获取 pool address（用于诊断）
-            try:
-                if hasattr(self.dex_connector, 'get_pool_address'):
-                    pool_address = await self.dex_connector.get_pool_address(
-                        trading_pair=self.config.trading_pair
-                    )
-                    self.logger().info(f"Pool address: {pool_address}")
-                else:
-                    self.logger().warning("DEX connector 没有 get_pool_address 方法")
-            except Exception as e:
-                self.logger().warning(f"获取 pool address 失败: {e}")
-
-            # 获取 pool info
-            pool_info = await self.dex_connector.get_pool_info(
-                trading_pair=self.config.trading_pair
+            # 调用 api_request 方法
+            # 参考: gateway_http_client.py:414-421
+            response = await gateway_client.api_request(
+                method=method.lower(),
+                path_url=path_url,
+                params=params or {},
+                fail_silently=True
             )
 
-            if pool_info:
-                self.logger().info(f"✅ 成功获取池子信息: price={pool_info.price}")
-            else:
-                self.logger().warning(f"❌ get_pool_info 返回 None - 可能的原因:")
-                self.logger().warning(f"   1. 池子不存在或 trading_pair 格式错误")
-                self.logger().warning(f"   2. Gateway 未正确连接")
-                self.logger().warning(f"   3. 网络问题")
-                self.logger().warning(f"")
-                self.logger().warning(f"请检查:")
-                self.logger().warning(f"   - Gateway 状态: gateway status")
-                self.logger().warning(f"   - Trading pair 格式: {self.config.trading_pair}")
-                self.logger().warning(f"   - DEX connector: {self.config.dex_exchange}")
+            return response
 
-            return pool_info
-        except AttributeError as e:
-            self.logger().error(f"DEX connector 不支持 get_pool_info 方法: {e}")
-            self.logger().error(f"Connector type: {type(self.dex_connector)}")
-            self.logger().error(f"Available methods: {[m for m in dir(self.dex_connector) if not m.startswith('_')]}")
-            return None
         except Exception as e:
-            self.logger().error(f"获取 DEX 池子信息失败: {e}", exc_info=True)
+            self.logger().error(f"Gateway API 请求失败 [{method} {path_url}]: {e}")
             return None
 
-    async def _get_dex_price(self) -> Optional[Decimal]:
+    async def _get_dex_price_with_retry(self) -> Optional[Decimal]:
         """
-        获取 DEX 价格（从 pool_info 中提取）
+        获取 DEX 价格（带重试逻辑）
 
-        参考 lp_manage_position.py 的实现
+        使用 Gateway quote-swap 端点，参考 mtqq_cex_webhook.py
+        """
+        max_retries = 3
+        retry_delay = 1  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                price = await self._fetch_dex_price_internal()
+                if price:
+                    return price
+            except Exception as e:
+                error_msg = str(e)
+
+                # 检测暂时性错误（Division by zero 通常是 RPC 缓存问题）
+                if "division by zero" in error_msg.lower():
+                    if attempt < max_retries - 1:
+                        self.logger().warning(
+                            f"⚠️ 暂时性错误（尝试 {attempt + 1}/{max_retries}）: {error_msg[:50]} - "
+                            f"等待 {retry_delay}s 后重试..."
+                        )
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # 指数退避
+                        continue
+                    else:
+                        self.logger().error(f"❌ 重试 {max_retries} 次后仍失败: {error_msg}")
+                        return None
+
+                # 其他错误直接失败
+                self.logger().error(f"❌ 获取 DEX 价格失败: {e}")
+                return None
+
+        return None
+
+    async def _fetch_dex_price_internal(self) -> Optional[Decimal]:
+        """
+        内部方法：使用 Gateway quote-swap 端点获取 DEX 价格
+
+        参考: mtqq_cex_webhook.py:3454-3606
         """
         try:
-            pool_info = await self._get_dex_pool_info()
-            if pool_info and hasattr(pool_info, 'price'):
-                price = Decimal(str(pool_info.price))
-                self.logger().info(f"DEX 价格: {price}")
+            # 解析交易对
+            base, quote = self.config.trading_pair.split("-")
+
+            # 解析 DEX 配置
+            exchange_parts = self.config.dex_exchange.split("/")
+            exchange = exchange_parts[0]  # "pancakeswap"
+            pool_type = exchange_parts[1] if len(exchange_parts) > 1 else "clmm"
+
+            # 构建 Gateway API 路径（不带前导斜杠）
+            # Gateway 路由格式: /connectors/{exchange}/{pool_type}/quote-swap
+            # 参考: gateway/src/app.ts - prefix: '/connectors/pancakeswap/clmm'
+            path_url = f"connectors/{exchange}/{pool_type}/quote-swap"
+
+            # 构建查询参数
+            price_params = {
+                "network": self.config.dex_network,
+                "baseToken": base,
+                "quoteToken": quote,
+                "amount": "1",  # 获取 1 个 base token 的价格
+                "side": "SELL"
+            }
+
+            self.logger().debug(
+                f"🔍 获取 DEX 价格: {exchange}/{pool_type} on {self.config.dex_network}, "
+                f"{base}-{quote}"
+            )
+
+            # 调用 Gateway API（GET 请求）
+            response = await self._gateway_request("get", path_url, params=price_params)
+
+            if not response:
+                self.logger().warning("⚠️ Gateway 返回空响应")
+                return None
+
+            # 提取价格
+            price = None
+            if "amountOut" in response:
+                price = Decimal(str(response["amountOut"]))
+            elif "price" in response:
+                price = Decimal(str(response["price"]))
+            elif "expectedAmount" in response:
+                price = Decimal(str(response["expectedAmount"]))
+
+            if price:
+                self.logger().debug(f"✅ DEX 价格: ${price}")
+
+                # 注入价格到 RateOracle（避免 "rate not found" 错误）
+                try:
+                    rate_oracle = RateOracle.get_instance()
+                    rate_oracle.set_price(self.config.trading_pair, price)
+                    self.logger().debug(
+                        f"📊 已注入价格到 RateOracle: {self.config.trading_pair} = ${price}"
+                    )
+                except Exception as oracle_err:
+                    self.logger().debug(f"⚠️ 注入 RateOracle 失败: {oracle_err}")
+
                 return price
             else:
-                self.logger().warning(f"无法从 pool_info 获取价格")
+                self.logger().warning(f"⚠️ 响应中没有价格数据: {response}")
                 return None
+
         except Exception as e:
-            self.logger().error(f"获取 DEX 价格失败: {e}", exc_info=True)
-            return None
+            self.logger().error(f"❌ 获取 DEX 价格失败: {e}", exc_info=True)
+            raise
+
+    async def _get_dex_price(self) -> Optional[Decimal]:
+        """获取 DEX 价格（公开接口）"""
+        return await self._get_dex_price_with_retry()
 
     # ========================================
     # 状态显示
@@ -1096,6 +1246,12 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
             lines.append(f"平均利润:    {avg_profit:.4f} {self.quote_token}")
         lines.append(f"LP开仓失败:  {self.stats['lp_open_failures']}")
         lines.append(f"对冲失败:    {self.stats['hedge_failures']}")
+
+        # Gas 统计
+        if "gas_tx_count" in self.stats and self.stats["gas_tx_count"] > 0:
+            avg_gas = self.stats["total_gas_gwei"] / self.stats["gas_tx_count"]
+            lines.append(f"Gas 交易数:  {self.stats['gas_tx_count']}")
+            lines.append(f"平均 Gas:    {avg_gas:.2f} Gwei")
 
         lines.append("")
         lines.append("=" * 70)

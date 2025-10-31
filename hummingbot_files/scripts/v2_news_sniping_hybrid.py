@@ -27,6 +27,7 @@ from typing import Dict, List, Optional
 from pydantic import Field, field_validator
 
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.core.clock import Clock
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.event.events import (
@@ -360,8 +361,8 @@ class NewsSnipingV2Hybrid(StrategyV2Base):
 
             # 计算交易数量
             if is_buy:
-                # 获取参考价格
-                temp_price = await self.connector.get_quote_price(
+                # 获取参考价格（带重试）
+                temp_price = await self._get_quote_price_with_retry(
                     trading_pair=trading_pair,
                     is_buy=True,
                     amount=Decimal("1")
@@ -380,9 +381,9 @@ class NewsSnipingV2Hybrid(StrategyV2Base):
             # 量化
             base_amount = self.connector.quantize_order_amount(trading_pair, base_amount)
 
-            # 获取精确报价
+            # 获取精确报价（带重试）
             # Gateway 返回的价格已经是预期成交价，不需要手动调整
-            entry_price = await self.connector.get_quote_price(
+            entry_price = await self._get_quote_price_with_retry(
                 trading_pair=trading_pair,
                 is_buy=is_buy,
                 amount=base_amount
@@ -453,7 +454,24 @@ class NewsSnipingV2Hybrid(StrategyV2Base):
 
     # ========== 订单事件回调（手动管理）==========
     def did_fill_order(self, event: OrderFilledEvent):
-        """订单成交回调 - 启动止盈止损监控"""
+        """
+        订单成交回调 - 启动止盈止损监控（生产级优化）
+
+        参考: mtqq_cex_webhook.py:338-435
+        """
+        # 注入价格到 RateOracle（避免 "rate not found" 错误）
+        try:
+            rate_oracle = RateOracle.get_instance()
+            rate_oracle.set_price(event.trading_pair, Decimal(str(event.price)))
+            self.logger().debug(
+                f"📊 注入价格到 RateOracle: {event.trading_pair} = ${event.price:.6f}"
+            )
+        except Exception as oracle_err:
+            self.logger().debug(f"⚠️ 注入 RateOracle 失败: {oracle_err}")
+
+        # 记录 Gas Price（EVM 链）
+        safe_ensure_future(self._record_gas_price(event))
+
         order_id = event.order_id
 
         if order_id in self.pending_orders:
@@ -551,9 +569,9 @@ class NewsSnipingV2Hybrid(StrategyV2Base):
                             await self._close_position(order_id, "TIMEOUT")
                             break
 
-                    # 获取当前价格（用于 PnL 计算）
+                    # 获取当前价格（用于 PnL 计算，带重试）
                     # 重要：需要获取与入场时相同方向和数量的价格进行比较
-                    current_price = await self.connector.get_quote_price(
+                    current_price = await self._get_quote_price_with_retry(
                         trading_pair=trading_pair,
                         is_buy=is_buy,  # 与入场方向一致！
                         amount=position["fill_amount"]
@@ -621,6 +639,93 @@ class NewsSnipingV2Hybrid(StrategyV2Base):
             if order_id in self.position_monitors:
                 del self.position_monitors[order_id]
 
+    async def _get_quote_price_with_retry(
+        self,
+        trading_pair: str,
+        is_buy: bool,
+        amount: Decimal,
+        max_retries: int = 3
+    ) -> Optional[Decimal]:
+        """
+        获取报价（带重试逻辑）
+
+        参考: mtqq_cex_webhook.py:3420-3452
+        """
+        retry_delay = 1  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                price = await self.connector.get_quote_price(
+                    trading_pair=trading_pair,
+                    is_buy=is_buy,
+                    amount=amount
+                )
+
+                if price and price > 0:
+                    return price
+
+            except Exception as e:
+                error_msg = str(e)
+
+                # 检测暂时性错误
+                if "division by zero" in error_msg.lower() or "timeout" in error_msg.lower():
+                    if attempt < max_retries - 1:
+                        self.logger().warning(
+                            f"⚠️ 暂时性错误（尝试 {attempt + 1}/{max_retries}）- "
+                            f"等待 {retry_delay}s 后重试..."
+                        )
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # 指数退避
+                        continue
+                    else:
+                        self.logger().error(f"❌ 重试 {max_retries} 次后仍失败")
+                        return None
+
+                # 其他错误直接失败
+                self.logger().error(f"❌ 获取报价失败: {e}")
+                return None
+
+        return None
+
+    async def _record_gas_price(self, event: OrderFilledEvent):
+        """
+        记录 Gas Price（仅 EVM 链）
+
+        参考: mtqq_cex_webhook.py:361-383
+        """
+        try:
+            if not hasattr(self.connector, 'in_flight_orders'):
+                return
+
+            in_flight_order = self.connector.in_flight_orders.get(event.order_id)
+            if not in_flight_order:
+                return
+
+            if not hasattr(in_flight_order, 'gas_price'):
+                return
+
+            gas_price_wei = float(in_flight_order.gas_price)
+            if gas_price_wei <= 0:
+                return
+
+            # 转换 Wei -> Gwei
+            gas_price_gwei = gas_price_wei / 1e9
+
+            self.logger().info(
+                f"⛽ Gas: {gas_price_gwei:.2f} Gwei | TX: {event.exchange_trade_id}"
+            )
+
+            # 记录到统计
+            if "total_gas_gwei" not in self.stats:
+                self.stats["total_gas_gwei"] = 0
+                self.stats["gas_tx_count"] = 0
+
+            self.stats["total_gas_gwei"] += gas_price_gwei
+            self.stats["gas_tx_count"] += 1
+
+        except Exception as e:
+            self.logger().debug(f"⚠️ 记录 Gas Price 失败: {e}")
+
     async def _close_position(self, order_id: str, reason: str):
         """
         平仓
@@ -643,9 +748,9 @@ class NewsSnipingV2Hybrid(StrategyV2Base):
                 f"   数量: {amount}"
             )
 
-            # 获取平仓价格
+            # 获取平仓价格（带重试）
             # Gateway 返回的已经是预期成交价，不需要手动调整
-            close_price = await self.connector.get_quote_price(
+            close_price = await self._get_quote_price_with_retry(
                 trading_pair=trading_pair,
                 is_buy=not is_buy,
                 amount=amount

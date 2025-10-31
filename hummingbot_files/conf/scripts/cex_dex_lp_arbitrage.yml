@@ -27,6 +27,7 @@ dex_exchange: pancakeswap/clmm
 # DEX 可能使用 WETH 而不是 ETH
 trading_pair: CAKE-USDT
 
+dex_network: bsc
 # ========== LP 配置 ==========
 
 # LP 单边 Token 数量
