@@ -73,7 +73,7 @@ dex_lp_fee_pct: 0.003
 # Polygon: 0.1-1 USDC
 # BSC: 0.5-2 USDC
 # Arbitrum: 0.5-2 USDC
-gas_cost_quote: 5
+gas_cost_quote: 0.5
 
 # ========== 策略配置 ==========
 
