@@ -24,10 +24,8 @@ import asyncio
 import json
 import logging
 import os
-import redis.asyncio as aioredis
 import ssl
 import time
-import uuid
 from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Optional, Tuple, Union
@@ -45,6 +43,9 @@ from hummingbot.core.data_type.common import OrderType
 from hummingbot.core.event.events import BuyOrderCompletedEvent, OrderFilledEvent, SellOrderCompletedEvent
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+
+# 导入 Redis 缓存管理器
+from .redis_cache_manager import RedisCacheManager, RedisConfig
 
 
 # ========================================
@@ -162,12 +163,12 @@ class CexDexLpArbitrageConfig(BaseClientModel):
 
 
 # ========================================
-# Redis 缓存管理器
+# Redis 缓存管理器（使用通用 RedisCacheManager）
 # ========================================
 
 class ConversionRateCache:
     """
-    基于 Redis 的转换率缓存管理器
+    转换率缓存管理器（基于通用 RedisCacheManager）
 
     支持：
     - 分布式缓存（多策略实例共享）
@@ -179,44 +180,28 @@ class ConversionRateCache:
     def __init__(self, config: 'CexDexLpArbitrageConfig', logger):
         self.config = config
         self.logger = logger
-        self.redis_client: Optional[aioredis.Redis] = None
-        self.instance_id = str(uuid.uuid4())[:8]  # 实例标识
-        self.fallback_cache: Dict[str, Tuple[Decimal, float]] = {}  # Redis 不可用时的降级
+
+        # 使用通用 Redis 缓存管理器
+        redis_config = RedisConfig(
+            host=config.redis_host,
+            port=config.redis_port,
+            db=config.redis_db,
+            password=None
+        )
+        self.cache_manager = RedisCacheManager(
+            prefix="conv_rate",
+            config=redis_config,
+            logger=logger,
+            enable_memory_fallback=True
+        )
 
     async def connect(self):
         """连接 Redis"""
-        try:
-            self.redis_client = await aioredis.from_url(
-                f"redis://{self.config.redis_host}:{self.config.redis_port}/{self.config.redis_db}",
-                encoding="utf-8",
-                decode_responses=True,
-                socket_connect_timeout=2,
-                socket_timeout=2
-            )
-            # 测试连接
-            await self.redis_client.ping()
-            self.logger.info(f"✅ Redis 连接成功: {self.config.redis_host}:{self.config.redis_port}")
-            return True
-        except Exception as e:
-            self.logger.warning(f"⚠️ Redis 连接失败: {e}，将使用内存缓存降级")
-            self.redis_client = None
-            return False
+        return await self.cache_manager.connect()
 
     async def close(self):
         """关闭 Redis 连接"""
-        if self.redis_client:
-            await self.redis_client.close()
-
-    def _make_key(self, token: str, key_type: str = "main") -> str:
-        """生成 Redis key"""
-        if key_type == "main":
-            return f"conv_rate:{token}:USDT"
-        elif key_type == "last_known":
-            return f"conv_rate:{token}:USDT:last_known"
-        elif key_type == "lock":
-            return f"conv_rate:{token}:USDT:lock"
-        else:
-            raise ValueError(f"Unknown key_type: {key_type}")
+        await self.cache_manager.close()
 
     async def get_rate(self, token: str) -> Optional[Tuple[Decimal, str]]:
         """
@@ -224,51 +209,43 @@ class ConversionRateCache:
 
         Returns:
             (price, source) 或 None
-            source: "redis_cache", "redis_last_known", "memory_fallback"
         """
         # 稳定币无需查询
         if token.upper() in ["USDT", "USDC", "BUSD", "DAI"]:
             return (Decimal("1"), "stablecoin")
 
         # 尝试从 Redis 主缓存获取
-        if self.redis_client:
+        key = f"{token}:USDT"
+        data_str = await self.cache_manager.get(key)
+
+        if data_str:
             try:
-                key = self._make_key(token, "main")
-                data_str = await self.redis_client.get(key)
-
-                if data_str:
-                    data = json.loads(data_str)
-                    price = Decimal(data["price"])
-                    self.logger.debug(
-                        f"✅ Redis 缓存命中: {token}/USDT = {price} "
-                        f"(source: {data.get('source', 'unknown')})"
-                    )
-                    return (price, "redis_cache")
-
-                # 主缓存未命中，尝试 last_known
-                last_known_key = self._make_key(token, "last_known")
-                last_data_str = await self.redis_client.get(last_known_key)
-
-                if last_data_str:
-                    data = json.loads(last_data_str)
-                    price = Decimal(data["price"])
-                    age = time.time() - data.get("timestamp", 0)
-                    self.logger.warning(
-                        f"⚠️ 使用 last_known 价格: {token}/USDT = {price} "
-                        f"(age: {age:.0f}s)"
-                    )
-                    return (price, "redis_last_known")
-
+                data = json.loads(data_str)
+                price = Decimal(data["price"])
+                self.logger.debug(
+                    f"✅ Redis 缓存命中: {token}/USDT = {price} "
+                    f"(source: {data.get('source', 'unknown')})"
+                )
+                return (price, "redis_cache")
             except Exception as e:
-                self.logger.debug(f"Redis 读取失败: {e}")
+                self.logger.error(f"解析缓存数据失败: {e}")
 
-        # Redis 不可用，使用内存降级缓存
-        if token in self.fallback_cache:
-            price, cached_time = self.fallback_cache[token]
-            age = time.time() - cached_time
-            if age < self.config.conversion_rate_ttl:
-                self.logger.debug(f"使用内存缓存: {token}/USDT = {price} (age: {age:.0f}s)")
-                return (price, "memory_fallback")
+        # 主缓存未命中，尝试 last_known
+        last_known_key = f"{token}:USDT:last_known"
+        last_data_str = await self.cache_manager.get(last_known_key)
+
+        if last_data_str:
+            try:
+                data = json.loads(last_data_str)
+                price = Decimal(data["price"])
+                age = time.time() - data.get("timestamp", 0)
+                self.logger.warning(
+                    f"⚠️ 使用 last_known 价格: {token}/USDT = {price} "
+                    f"(age: {age:.0f}s)"
+                )
+                return (price, "redis_last_known")
+            except Exception as e:
+                self.logger.error(f"解析 last_known 数据失败: {e}")
 
         return None
 
@@ -292,40 +269,23 @@ class ConversionRateCache:
             "price": str(price),
             "source": source,
             "confidence": confidence,
-            "timestamp": time.time(),
-            "instance_id": self.instance_id
+            "timestamp": time.time()
         }
         data_str = json.dumps(data)
 
-        # 写入 Redis
-        if self.redis_client:
-            try:
-                # 主缓存
-                key = self._make_key(token, "main")
-                await self.redis_client.setex(
-                    key,
-                    self.config.conversion_rate_ttl,
-                    data_str
-                )
+        # 写入主缓存
+        key = f"{token}:USDT"
+        await self.cache_manager.set(key, data_str, ttl=self.config.conversion_rate_ttl)
 
-                # Last known（24小时）
-                if confidence in ["high", "medium"]:
-                    last_known_key = self._make_key(token, "last_known")
-                    await self.redis_client.setex(
-                        last_known_key,
-                        86400,  # 24 hours
-                        data_str
-                    )
+        # 写入 last_known（24小时）
+        if confidence in ["high", "medium"]:
+            last_known_key = f"{token}:USDT:last_known"
+            await self.cache_manager.set_persistent(last_known_key, data_str, ttl=86400)
 
-                self.logger.debug(
-                    f"✅ 写入 Redis: {token}/USDT = {price} "
-                    f"(source: {source}, confidence: {confidence})"
-                )
-            except Exception as e:
-                self.logger.warning(f"⚠️ Redis 写入失败: {e}")
-
-        # 同时写入内存降级缓存
-        self.fallback_cache[token] = (price, time.time())
+        self.logger.debug(
+            f"✅ 写入 Redis: {token}/USDT = {price} "
+            f"(source: {source}, confidence: {confidence})"
+        )
 
     async def try_acquire_lock(self, token: str, timeout: int = 5) -> bool:
         """
@@ -334,35 +294,13 @@ class ConversionRateCache:
         Returns:
             True if lock acquired
         """
-        if not self.redis_client:
-            return True  # Redis 不可用，直接允许
-
-        try:
-            lock_key = self._make_key(token, "lock")
-            acquired = await self.redis_client.set(
-                lock_key,
-                self.instance_id,
-                nx=True,  # 只在 key 不存在时设置
-                ex=timeout
-            )
-            return bool(acquired)
-        except Exception as e:
-            self.logger.debug(f"获取锁失败: {e}")
-            return True  # 出错时允许，避免阻塞
+        lock_key = f"{token}:USDT"
+        return await self.cache_manager.acquire_lock(lock_key, timeout=timeout)
 
     async def release_lock(self, token: str):
         """释放更新锁"""
-        if not self.redis_client:
-            return
-
-        try:
-            lock_key = self._make_key(token, "lock")
-            # 只删除自己的锁
-            lock_owner = await self.redis_client.get(lock_key)
-            if lock_owner == self.instance_id:
-                await self.redis_client.delete(lock_key)
-        except Exception as e:
-            self.logger.debug(f"释放锁失败: {e}")
+        lock_key = f"{token}:USDT"
+        await self.cache_manager.release_lock(lock_key)
 
 
 # ========================================
@@ -765,6 +703,13 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
             "hedge_failures": 0,
         }
 
+        # 钱包余额缓存
+        self.wallet_balances = {
+            "base_token": Decimal("0"),
+            "quote_token": Decimal("0"),
+            "last_update": 0
+        }
+
         # 启动信息
         price_conversion_info = ""
         if self.dex_quote_token.upper() not in ["USDT", "USDC", "BUSD", "DAI"]:
@@ -773,19 +718,113 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
                 f"(所有价格统一为美元计价)"
             )
 
+        # 计算有效交易量
+        effective_amount_info = ""
+        if config.lp_token_amount == 0:
+            effective_amount_info = f"\n   💰 交易量: 自动（使用钱包余额的 80%）"
+        else:
+            effective_amount_info = f"\n   💰 交易量: {config.lp_token_amount} {self.base_token}"
+
         self.log_with_clock(
             logging.INFO,
             f"CEX-DEX LP 套利策略启动:\n"
             f"   CEX: {config.cex_exchange} (仅用于对冲)\n"
             f"   DEX: {config.dex_exchange} (价格发现)\n"
-            f"   交易对: {config.trading_pair} (DEX 池子)\n"
-            f"   LP 数量: {config.lp_token_amount} {self.base_token}\n"
+            f"   交易对: {config.trading_pair} (DEX 池子)"
+            f"{effective_amount_info}\n"
             f"   目标利润: {config.target_profitability * 100:.2f}%\n"
             f"   最低利润: {config.min_profitability * 100:.2f}%\n"
             f"   卖方套利: {'启用' if config.enable_sell_side else '禁用'}\n"
             f"   买方套利: {'启用' if config.enable_buy_side else '禁用'}"
             f"{price_conversion_info}"
         )
+
+    # ========================================
+    # 钱包余额管理
+    # ========================================
+
+    async def _update_wallet_balances(self) -> bool:
+        """
+        更新钱包余额（带缓存，60秒更新一次）
+
+        Returns:
+            是否成功更新
+        """
+        current_time = time.time()
+
+        # 60秒内使用缓存
+        if current_time - self.wallet_balances["last_update"] < 60:
+            return True
+
+        try:
+            # 获取 DEX 钱包余额
+            base_balance = self.dex_connector.get_available_balance(self.base_token)
+            quote_balance = self.dex_connector.get_available_balance(self.dex_quote_token)
+
+            if base_balance is not None and quote_balance is not None:
+                self.wallet_balances["base_token"] = Decimal(str(base_balance))
+                self.wallet_balances["quote_token"] = Decimal(str(quote_balance))
+                self.wallet_balances["last_update"] = current_time
+
+                self.logger().debug(
+                    f"💰 钱包余额更新:\n"
+                    f"   {self.base_token}: {base_balance}\n"
+                    f"   {self.dex_quote_token}: {quote_balance}"
+                )
+                return True
+            else:
+                self.logger().warning("⚠️ 无法获取钱包余额")
+                return False
+
+        except Exception as e:
+            self.logger().error(f"获取钱包余额失败: {e}")
+            return False
+
+    def _get_effective_lp_amount(self, is_sell_side: bool) -> Decimal:
+        """
+        计算有效的 LP 交易量
+
+        如果配置中 lp_token_amount = 0，则使用钱包可用余额的 80%
+        否则使用配置值与钱包余额中的较小值
+
+        Args:
+            is_sell_side: 是否卖方套利
+
+        Returns:
+            有效交易量
+        """
+        # 从配置读取
+        configured_amount = self.config.lp_token_amount
+
+        # 确定使用哪个 token 的余额
+        if is_sell_side:
+            # 卖方：使用 base token
+            available_balance = self.wallet_balances["base_token"]
+            token_name = self.base_token
+        else:
+            # 买方：使用 quote token
+            available_balance = self.wallet_balances["quote_token"]
+            token_name = self.dex_quote_token
+
+        # 如果配置为 0，自动使用钱包余额的 80%
+        if configured_amount == 0:
+            effective_amount = available_balance * Decimal("0.8")
+            self.logger().debug(
+                f"💰 自动计算交易量: {effective_amount:.6f} {token_name} "
+                f"(钱包余额: {available_balance:.6f}, 使用 80%)"
+            )
+        else:
+            # 使用配置值，但不超过钱包余额的 90%（预留 10% 作为 Gas）
+            max_usable = available_balance * Decimal("0.9")
+            effective_amount = min(configured_amount, max_usable)
+
+            if effective_amount < configured_amount:
+                self.logger().warning(
+                    f"⚠️ 配置交易量 {configured_amount} {token_name} 超过钱包余额，"
+                    f"调整为 {effective_amount:.6f} {token_name}"
+                )
+
+        return effective_amount
 
     # ========================================
     # 主循环
@@ -816,6 +855,9 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
     async def _check_opening_opportunity(self):
         """检查开仓机会"""
         try:
+            # 更新钱包余额
+            await self._update_wallet_balances()
+
             # 获取市场数据
             cex_best_ask = await self._get_cex_best_ask()
             cex_best_bid = await self._get_cex_best_bid()
@@ -832,48 +874,64 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
                 self.logger().warning("无法获取市场数据")
                 return
 
-            trade_value = self.config.lp_token_amount * cex_best_ask
-
             # 检查卖方机会
             if self.config.enable_sell_side:
-                target_price = self.profit_calculator.calculate_target_lp_price(
-                    cex_price=cex_best_ask,
-                    is_sell_side=True,
-                    trade_value=trade_value
-                )
+                # 计算有效交易量（基于钱包余额）
+                effective_amount = self._get_effective_lp_amount(is_sell_side=True)
 
-                if dex_price >= target_price:
-                    self.logger().info(
-                        f"发现卖方套利机会:\n"
-                        f"   DEX 价格: {dex_price}\n"
-                        f"   目标价格: {target_price}\n"
-                        f"   CEX 买价: {cex_best_ask}"
+                if effective_amount <= 0:
+                    self.logger().warning(f"⚠️ {self.base_token} 余额不足，跳过卖方套利")
+                else:
+                    trade_value = effective_amount * cex_best_ask
+
+                    target_price = self.profit_calculator.calculate_target_lp_price(
+                        cex_price=cex_best_ask,
+                        is_sell_side=True,
+                        trade_value=trade_value
                     )
-                    await self._open_sell_side_position(target_price, cex_best_ask)
-                    return
+
+                    if dex_price >= target_price:
+                        self.logger().info(
+                            f"发现卖方套利机会:\n"
+                            f"   交易量: {effective_amount} {self.base_token}\n"
+                            f"   DEX 价格: {dex_price}\n"
+                            f"   目标价格: {target_price}\n"
+                            f"   CEX 买价: {cex_best_ask}"
+                        )
+                        await self._open_sell_side_position(target_price, cex_best_ask, effective_amount)
+                        return
 
             # 检查买方机会
             if self.config.enable_buy_side:
-                target_price = self.profit_calculator.calculate_target_lp_price(
-                    cex_price=cex_best_bid,
-                    is_sell_side=False,
-                    trade_value=trade_value
-                )
+                # 计算有效交易量（基于钱包余额）
+                effective_amount = self._get_effective_lp_amount(is_sell_side=False)
 
-                if dex_price <= target_price:
-                    self.logger().info(
-                        f"发现买方套利机会:\n"
-                        f"   DEX 价格: {dex_price}\n"
-                        f"   目标价格: {target_price}\n"
-                        f"   CEX 卖价: {cex_best_bid}"
+                if effective_amount <= 0:
+                    self.logger().warning(f"⚠️ {self.dex_quote_token} 余额不足，跳过买方套利")
+                else:
+                    trade_value = effective_amount * cex_best_bid
+
+                    target_price = self.profit_calculator.calculate_target_lp_price(
+                        cex_price=cex_best_bid,
+                        is_sell_side=False,
+                        trade_value=trade_value
                     )
-                    await self._open_buy_side_position(target_price, cex_best_bid)
-                    return
+
+                    if dex_price <= target_price:
+                        self.logger().info(
+                            f"发现买方套利机会:\n"
+                            f"   交易量: {effective_amount} {self.dex_quote_token}\n"
+                            f"   DEX 价格: {dex_price}\n"
+                            f"   目标价格: {target_price}\n"
+                            f"   CEX 卖价: {cex_best_bid}"
+                        )
+                        await self._open_buy_side_position(target_price, cex_best_bid, effective_amount)
+                        return
 
         except Exception as e:
             self.logger().error(f"检查开仓机会失败: {e}")
 
-    async def _open_sell_side_position(self, target_price: Decimal, cex_price: Decimal):
+    async def _open_sell_side_position(self, target_price: Decimal, cex_price: Decimal, token_amount: Decimal):
         """开卖方 LP 仓位"""
         # 计算 LP 区间
         lower_bound = target_price
@@ -883,7 +941,7 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
             order_id = await self.lp_manager.open_lp_position(
                 is_sell_side=True,
                 price_range=(lower_bound, upper_bound),
-                token_amount=self.config.lp_token_amount
+                token_amount=token_amount
             )
 
             # 记录信息
@@ -892,7 +950,7 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
                 "side": "SELL",
                 "order_id": order_id,
                 "price_range": (lower_bound, upper_bound),
-                "token_amount": self.config.lp_token_amount,
+                "token_amount": token_amount,
                 "open_time": time.time(),
                 "open_cex_price": cex_price,
             }
@@ -901,7 +959,7 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
             self.logger().error(f"开卖方仓位失败: {e}")
             self.stats["lp_open_failures"] += 1
 
-    async def _open_buy_side_position(self, target_price: Decimal, cex_price: Decimal):
+    async def _open_buy_side_position(self, target_price: Decimal, cex_price: Decimal, token_amount: Decimal):
         """开买方 LP 仓位"""
         # 计算 LP 区间
         upper_bound = target_price
@@ -911,7 +969,7 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
             order_id = await self.lp_manager.open_lp_position(
                 is_sell_side=False,
                 price_range=(lower_bound, upper_bound),
-                token_amount=self.config.lp_token_amount
+                token_amount=token_amount
             )
 
             self.lp_position_opened = True
@@ -919,7 +977,7 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
                 "side": "BUY",
                 "order_id": order_id,
                 "price_range": (lower_bound, upper_bound),
-                "token_amount": self.config.lp_token_amount,
+                "token_amount": token_amount,
                 "open_time": time.time(),
                 "open_cex_price": cex_price,
             }
@@ -1574,9 +1632,27 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
         lines.append("CEX-DEX LP 套利策略".center(70))
         lines.append("=" * 70)
         lines.append(f"CEX: {self.config.cex_exchange:20} | DEX: {self.config.dex_exchange}")
-        lines.append(f"交易对: {self.config.trading_pair:18} | LP 数量: {self.config.lp_token_amount}")
+
+        # 显示交易量配置
+        if self.config.lp_token_amount == 0:
+            lines.append(f"交易对: {self.config.trading_pair:18} | LP 数量: 自动（余额的 80%）")
+        else:
+            lines.append(f"交易对: {self.config.trading_pair:18} | LP 数量: {self.config.lp_token_amount}")
+
+        # 钱包余额
+        lines.append("")
+        lines.append("💰 钱包余额")
+        if self.wallet_balances["last_update"] > 0:
+            age = int(time.time() - self.wallet_balances["last_update"])
+            lines.append(f"   {self.base_token:12}: {self.wallet_balances['base_token']:>12.6f}")
+            lines.append(f"   {self.dex_quote_token:12}: {self.wallet_balances['quote_token']:>12.6f}")
+            lines.append(f"   (更新于 {age}秒前)")
+        else:
+            lines.append(f"   {self.base_token:12}: 加载中...")
+            lines.append(f"   {self.dex_quote_token:12}: 加载中...")
 
         # 价格转换提示
+        lines.append("")
         if self.dex_quote_token.upper() not in ["USDT", "USDC", "BUSD", "DAI"]:
             lines.append(f"🔄 价格转换: {self.dex_quote_token} → {self.standard_quote} (所有价格统一为美元计价)")
 

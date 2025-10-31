@@ -31,9 +31,10 @@ dex_network: bsc
 # ========== LP 配置 ==========
 
 # LP 单边 Token 数量
-# 卖方: 放入 Base Token (WETH)
-# 买方: 放入 Quote Token (USDC)
-lp_token_amount: 0.1
+# 卖方: 放入 Base Token (如 GIGGLE)
+# 买方: 放入 Quote Token (如 WBNB/USDT)
+# 注意: 设置为 0 时会使用钱包可用余额的 80%（预留 20% 作为 Gas 和缓冲）
+lp_token_amount: 0
 
 # LP 价格区间宽度（百分比）
 # 0.01 = 1%
@@ -47,14 +48,14 @@ lp_timeout_seconds: 300
 # ========== 盈利目标 ==========
 
 # 目标利润率（百分比）
-# 0.02 = 2%
+# 0.03 = 3% (BSC 网络推荐)
 # 只有预期利润 > 此值时才开仓
-target_profitability: 0.02
+target_profitability: 0.03
 
 # 最低利润率（止损线）
-# 0.005 = 0.5%
+# 0.015 = 1.5%
 # 持仓中如果预期利润 < 此值，触发止损
-min_profitability: 0.005
+min_profitability: 0.015
 
 # ========== 费用估算 ==========
 
@@ -68,12 +69,12 @@ cex_taker_fee_pct: 0.001
 # PancakeSwap: 0.0025 (0.25%)
 dex_lp_fee_pct: 0.003
 
-# 预估 Gas 成本（Quote Token 单位）
-# Ethereum Mainnet: 5-20 USDC
-# Polygon: 0.1-1 USDC
-# BSC: 0.5-2 USDC
-# Arbitrum: 0.5-2 USDC
-gas_cost_quote: 0.5
+# 预估 Gas 成本（USDT 单位）
+# Ethereum Mainnet: 5-20 USDT
+# Polygon: 0.1-0.5 USDT
+# BSC: 0.01-0.1 USDT (推荐 0.05)
+# Arbitrum: 0.1-0.5 USDT
+gas_cost_quote: 0.05
 
 # ========== 策略配置 ==========
 
