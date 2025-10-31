@@ -819,37 +819,74 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
             self.logger().error(f"获取 CEX 卖价失败: {e}")
             return None
 
-    async def _get_dex_price(self) -> Optional[Decimal]:
-        """
-        获取 DEX 价格
-
-        使用 get_quote_price() 而不是 get_pool_info()
-        因为更通用，所有 Gateway connector 都支持
-        """
-        try:
-            # 获取买入报价（相当于池子价格）
-            price = await self.dex_connector.get_quote_price(
-                trading_pair=self.config.trading_pair,
-                is_buy=True,
-                amount=self.config.lp_token_amount
-            )
-            return Decimal(str(price)) if price else None
-        except Exception as e:
-            self.logger().error(f"获取 DEX 价格失败: {e}")
-            return None
-
     async def _get_dex_pool_info(self):
         """
-        获取 DEX 池子信息（如果支持的话）
+        获取 DEX 池子信息
 
-        作为备用方法，某些 connector 可能不支持
+        参考 lp_manage_position.py 的实现
         """
         try:
-            return await self.dex_connector.get_pool_info(
+            self.logger().info(f"正在获取 {self.config.trading_pair} 池子信息...")
+            self.logger().info(f"DEX Connector: {self.config.dex_exchange}")
+            self.logger().info(f"Connector type: {type(self.dex_connector).__name__}")
+
+            # 先尝试获取 pool address（用于诊断）
+            try:
+                if hasattr(self.dex_connector, 'get_pool_address'):
+                    pool_address = await self.dex_connector.get_pool_address(
+                        trading_pair=self.config.trading_pair
+                    )
+                    self.logger().info(f"Pool address: {pool_address}")
+                else:
+                    self.logger().warning("DEX connector 没有 get_pool_address 方法")
+            except Exception as e:
+                self.logger().warning(f"获取 pool address 失败: {e}")
+
+            # 获取 pool info
+            pool_info = await self.dex_connector.get_pool_info(
                 trading_pair=self.config.trading_pair
             )
+
+            if pool_info:
+                self.logger().info(f"✅ 成功获取池子信息: price={pool_info.price}")
+            else:
+                self.logger().warning(f"❌ get_pool_info 返回 None - 可能的原因:")
+                self.logger().warning(f"   1. 池子不存在或 trading_pair 格式错误")
+                self.logger().warning(f"   2. Gateway 未正确连接")
+                self.logger().warning(f"   3. 网络问题")
+                self.logger().warning(f"")
+                self.logger().warning(f"请检查:")
+                self.logger().warning(f"   - Gateway 状态: gateway status")
+                self.logger().warning(f"   - Trading pair 格式: {self.config.trading_pair}")
+                self.logger().warning(f"   - DEX connector: {self.config.dex_exchange}")
+
+            return pool_info
+        except AttributeError as e:
+            self.logger().error(f"DEX connector 不支持 get_pool_info 方法: {e}")
+            self.logger().error(f"Connector type: {type(self.dex_connector)}")
+            self.logger().error(f"Available methods: {[m for m in dir(self.dex_connector) if not m.startswith('_')]}")
+            return None
         except Exception as e:
-            self.logger().debug(f"获取 DEX 池子信息失败（不是所有 connector 都支持）: {e}")
+            self.logger().error(f"获取 DEX 池子信息失败: {e}", exc_info=True)
+            return None
+
+    async def _get_dex_price(self) -> Optional[Decimal]:
+        """
+        获取 DEX 价格（从 pool_info 中提取）
+
+        参考 lp_manage_position.py 的实现
+        """
+        try:
+            pool_info = await self._get_dex_pool_info()
+            if pool_info and hasattr(pool_info, 'price'):
+                price = Decimal(str(pool_info.price))
+                self.logger().info(f"DEX 价格: {price}")
+                return price
+            else:
+                self.logger().warning(f"无法从 pool_info 获取价格")
+                return None
+        except Exception as e:
+            self.logger().error(f"获取 DEX 价格失败: {e}", exc_info=True)
             return None
 
     # ========================================
