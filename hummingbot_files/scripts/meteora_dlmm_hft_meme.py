@@ -177,11 +177,11 @@ class FastStopLossEngine:
         lower_price: Decimal,
         upper_price: Decimal,
         current_volume: Optional[Decimal] = None
-    ) -> Tuple[bool, str, str]:
+    ) -> Tuple[bool, str, str, float]:
         """
         检查是否触发止损
 
-        返回: (是否止损, 止损类型, 原因)
+        返回: (是否止损, 止损类型, 原因, 超出区间时长)
         止损类型: "HARD_STOP" (立即止损) or "SOFT_STOP" (建议止损)
         """
 
@@ -190,29 +190,32 @@ class FastStopLossEngine:
         # === Level 1: 幅度止损（最高优先级）===
         price_change_pct = (current_price - open_price) / open_price * Decimal("100")
 
-        if price_change_pct <= -self.config.stop_loss_pct:
-            return True, "HARD_STOP", f"下跌 {abs(price_change_pct):.2f}% 超过止损线 {self.config.stop_loss_pct}%"
-
-        # === Level 2: 60秒规则 + 下跌 ===
+        # 计算超出区间时长（在所有逻辑之前）
         is_out_of_range = current_price < lower_price or current_price > upper_price
 
         if is_out_of_range:
             if self.price_out_of_range_since is None:
                 self.price_out_of_range_since = now
-
             out_duration = now - self.price_out_of_range_since
+        else:
+            # 价格在区间内
+            out_duration = 0.0
+            # 重置计时器
+            self.price_out_of_range_since = None
 
+        if price_change_pct <= -self.config.stop_loss_pct:
+            return True, "HARD_STOP", f"下跌 {abs(price_change_pct):.2f}% 超过止损线 {self.config.stop_loss_pct}%", out_duration
+
+        # === Level 2: 60秒规则 + 下跌 ===
+        if is_out_of_range:
             if self.config.enable_60s_rule and out_duration >= self.config.out_of_range_timeout_seconds:
                 # 超出 60 秒，检查方向
                 if current_price < lower_price and price_change_pct < -3:
                     # 下跌方向，立即止损
-                    return True, "HARD_STOP", f"下跌超出区间 {out_duration:.0f}秒"
+                    return True, "HARD_STOP", f"下跌超出区间 {out_duration:.0f}秒", out_duration
                 else:
                     # 上涨方向，触发再平衡（不是止损）
-                    return False, "REBALANCE", f"超出区间 {out_duration:.0f}秒，需要再平衡"
-        else:
-            # 价格回到区间内，重置计时
-            self.price_out_of_range_since = None
+                    return False, "REBALANCE", f"超出区间 {out_duration:.0f}秒，需要再平衡", out_duration
 
         # === Level 3: 交易量骤降 ===
         if self.config.enable_volume_monitoring and current_volume is not None:
@@ -230,7 +233,7 @@ class FastStopLossEngine:
                     volume_change_pct = (recent_volume - hour_ago_volume) / hour_ago_volume * Decimal("100")
 
                     if volume_change_pct <= -self.config.volume_drop_threshold_pct:
-                        return True, "SOFT_STOP", f"交易量骤降 {abs(volume_change_pct):.1f}%，市场冷却"
+                        return True, "SOFT_STOP", f"交易量骤降 {abs(volume_change_pct):.1f}%，市场冷却", out_duration
 
         # === Level 4: 持仓时长 ===
         if self.position_opened_at is not None:
@@ -239,10 +242,10 @@ class FastStopLossEngine:
             if hold_hours >= float(self.config.max_position_hold_hours):
                 # 持仓过久且未盈利
                 if price_change_pct < 0:
-                    return True, "SOFT_STOP", f"持仓 {hold_hours:.1f}h 未盈利"
+                    return True, "SOFT_STOP", f"持仓 {hold_hours:.1f}h 未盈利", out_duration
 
         # 无止损触发
-        return False, "NONE", ""
+        return False, "NONE", "", out_duration
 
 
 # ========================================
@@ -400,6 +403,7 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
 
         # 时间追踪
         self.last_check_time: Optional[datetime] = None
+        self.position_info_last_update: Optional[float] = None  # 仓位信息缓存时间戳
 
         # 延迟初始化
         safe_ensure_future(self.initialize_strategy())
@@ -922,13 +926,26 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             if not self.stop_loss_engine or not self.rebalance_engine:
                 return
 
-            # 只在没有仓位信息时才检查（避免频繁 Gateway 调用）
-            if not self.position_info:
+            # 智能更新仓位信息：
+            # 1. position_info为None时立即获取
+            # 2. 距离上次更新超过60秒时刷新（避免频繁API调用）
+            POSITION_INFO_UPDATE_INTERVAL = 60  # 60秒更新一次
+            now = time.time()
+
+            should_update_position = (
+                not self.position_info or
+                (self.position_info_last_update is None) or
+                (now - self.position_info_last_update > POSITION_INFO_UPDATE_INTERVAL)
+            )
+
+            if should_update_position:
                 try:
                     await self.check_existing_positions()
+                    self.position_info_last_update = now
+                    self.logger().debug(f"仓位信息已更新（间隔: {POSITION_INFO_UPDATE_INTERVAL}秒）")
                 except Exception as e:
                     self.logger().warning(f"监控中检查仓位失败: {e}")
-                    return
+                    # 注意：不要return，继续用旧的position_info
 
             if not self.position_opened or not self.position_info:
                 return
@@ -955,7 +972,7 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             # === 优先级 1: 检查快速止损 ===
             current_volume = Decimal(str(self.pool_info.volume_24h)) if hasattr(self.pool_info, 'volume_24h') else None
 
-            should_stop, stop_type, stop_reason = self.stop_loss_engine.check_stop_loss(
+            should_stop, stop_type, stop_reason, out_duration = self.stop_loss_engine.check_stop_loss(
                 current_price=current_price,
                 open_price=self.open_price,
                 lower_price=lower_price,
@@ -974,7 +991,7 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                     # 可以根据累积收益决定是否退出
 
             # === 优先级 2: 检查高频再平衡 ===
-            out_duration = (time.time() - self.stop_loss_engine.price_out_of_range_since) if self.stop_loss_engine.price_out_of_range_since else 0
+            # out_duration 现在从 check_stop_loss 返回，不再需要单独计算
 
             should_rebal, rebal_reason = await self.rebalance_engine.should_rebalance(
                 current_price=current_price,
