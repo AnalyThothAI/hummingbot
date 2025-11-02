@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 from decimal import Decimal
@@ -129,6 +130,30 @@ class CLMMPositionManager(ScriptStrategyBase):
         except Exception as e:
             self.logger().error(f"Error fetching pool info: {str(e)}")
 
+    async def fetch_position_info_after_fill(self):
+        """Fetch position info after LP order is filled - mimics official lp_manage_position.py"""
+        try:
+            # Wait for the position to be fully created on-chain
+            self.logger().info("开仓成功，获取仓位信息...")
+            await asyncio.sleep(2)
+
+            # Use the connector's get_user_positions method to fetch all positions for this pool
+            positions = await self.gateway_lp.get_user_positions(pool_address=self.config.pool_address)
+
+            if positions and len(positions) > 0:
+                # Get the most recent position (last in the list)
+                latest_position = positions[-1]
+                self.position_address = latest_position.address
+                self.position_lower_price = float(latest_position.lower_price)
+                self.position_upper_price = float(latest_position.upper_price)
+                self.logger().info(f"成功获取CLMM仓位: {self.position_address}")
+                self.logger().info(f"仓位价格区间: {self.position_lower_price} - {self.position_upper_price}")
+            else:
+                self.logger().warning("未发现现有仓位")
+
+        except Exception as e:
+            self.logger().error(f"获取仓位信息失败: {str(e)}")
+
     async def fetch_position_info(self):
         """Fetch actual position information including price bounds"""
         if not self.position_address:
@@ -223,18 +248,18 @@ class CLMMPositionManager(ScriptStrategyBase):
                 self.position_opening = False
                 return
 
-            # Use the gateway LP connector to open position
-            self.logger().info(f"Opening position on pool {self.config.pool_address} around price {self.last_price} with width {self.config.position_width_pct}%")
+            # Use the gateway LP connector to add liquidity (new API)
+            self.logger().info(f"Opening position on pool {self.config.pool_address} around price {self.last_price} with width ±{self.config.position_width_pct}%")
 
-            # Use the open_position method from gateway_lp
-            # Don't pass trading_pair when using pool_address
-            order_id = self.gateway_lp.open_position(
-                trading_pair="",  # Empty string since we're using pool_address
+            # Use add_liquidity method (replaces open_position)
+            # For CLMM, we need to provide upper_width_pct and lower_width_pct
+            order_id = self.gateway_lp.add_liquidity(
+                trading_pair="",  # Empty string since we're using pool_address directly
                 price=float(self.last_price),
-                spread_pct=float(self.config.position_width_pct),
-                base_token_amount=float(self.config.base_token_amount) if self.config.base_token_amount > 0 else None,
-                quote_token_amount=float(self.config.quote_token_amount) if self.config.quote_token_amount > 0 else None,
-                slippage_pct=0.5,
+                upper_width_pct=float(self.config.position_width_pct),
+                lower_width_pct=float(self.config.position_width_pct),
+                base_token_amount=float(self.config.base_token_amount),
+                quote_token_amount=float(self.config.quote_token_amount),
                 pool_address=self.config.pool_address  # Pass the pool address
             )
 
@@ -312,11 +337,11 @@ class CLMMPositionManager(ScriptStrategyBase):
         try:
             self.logger().info(f"Closing position {self.position_address}...")
 
-            # Use the close_position method from gateway_lp
-            # Don't pass trading_pair when using position_address
-            order_id = self.gateway_lp.close_position(
-                trading_pair="",  # Empty string since we're using position_address
-                position_address=self.position_address
+            # Use remove_liquidity method (replaces close_position)
+            order_id = self.gateway_lp.remove_liquidity(
+                trading_pair="",  # Empty string since we're using position_address directly
+                position_address=self.position_address,
+                percentage=100.0  # Remove 100% of the liquidity
             )
 
             self.logger().info(f"Position closing order submitted: {order_id}")
@@ -333,14 +358,17 @@ class CLMMPositionManager(ScriptStrategyBase):
         Called when an order is filled.
         """
         if hasattr(self, 'opening_order_id') and event.order_id == self.opening_order_id:
-            self.logger().info(f"Position opened successfully! Order {event.order_id} filled.")
+            self.logger().info(f"准备开仓，当前价格: {self.last_price}")
             self.position_opened = True
             self.position_opening = False
-            # Extract position address from event if available
-            if hasattr(event, 'exchange_order_id'):
-                self.position_address = event.exchange_order_id
-                # Fetch actual position info to get the exact price bounds
-                safe_ensure_future(self.fetch_position_info())
+
+            # Log fill details if available
+            if hasattr(event, 'amount'):
+                self.logger().info(f"订单已成交，数量: {event.amount}")
+
+            # Fetch position info after the order is filled - using official approach
+            safe_ensure_future(self.fetch_position_info_after_fill())
+
         elif hasattr(self, 'closing_order_id') and event.order_id == self.closing_order_id:
             self.logger().info(f"Position closed successfully! Order {event.order_id} filled.")
             # Reset position state
