@@ -1,0 +1,184 @@
+# Meteora DLMM 智能 LP 策略 V2 配置文件
+# 多层级区间策略 - 适用于 meme 币等高波动资产
+
+# ========================================
+# 基础配置
+# ========================================
+
+# 连接器名称（Meteora DLMM）
+connector: meteora_solana
+
+# 交易对（示例：SOL-USDC, BONK-USDC 等）
+trading_pair: SOL-USDC
+
+# 池子地址（可选，留空自动获取）
+pool_address: ""
+
+
+# ========================================
+# 多层级区间配置
+# ========================================
+
+# 总价格区间宽度（百分比）
+# 推荐值：
+# - 低波动币：8-12%
+# - 中等波动：12-18%
+# - 高波动（meme币）：18-35%
+price_range_pct: 12.0
+
+# 层级数量
+# 推荐值：3-6 层
+# - 3 层：简单，适合稳定币对
+# - 4-5 层：均衡，适合主流币
+# - 6+ 层：精细，适合高波动 meme 币
+num_layers: 4
+
+# 流动性分布模式
+# - neutral: 均匀分布（适合震荡行情）
+# - bullish: 上层流动性更多（看涨）
+# - bearish: 下层流动性更多（看跌）
+liquidity_distribution: neutral
+
+
+# ========================================
+# 资金配置
+# ========================================
+
+# Base Token 数量（如 SOL）
+# 设置为 0.0 表示使用钱包余额的百分比
+base_token_amount: 0.0
+
+# Quote Token 数量（如 USDC）
+# 设置为 0.0 表示使用钱包余额的百分比
+quote_token_amount: 0.0
+
+# 钱包余额使用百分比
+# 仅在 token_amount = 0 时生效
+# 推荐：80% (保留 20% 作为 gas 费和缓冲)
+wallet_allocation_pct: 80.0
+
+
+# ========================================
+# Jupiter 自动换币配置
+# ========================================
+
+# 启用 Jupiter 自动换币
+# true: 初始化时自动准备双边代币
+# false: 需要手动准备代币
+enable_auto_swap: true
+
+# 自动换币滑点容忍度（百分比）
+# 推荐：1.0-2.0%
+auto_swap_slippage_pct: 1.0
+
+# 最小代币余额比例
+# 如果某代币占比 < 此值，触发自动换币
+# 推荐：0.4 (40%)，即双边至少各占 40%
+min_token_balance_ratio: 0.4
+
+
+# ========================================
+# 再平衡配置（保守策略）
+# ========================================
+
+# 再平衡触发阈值（百分比）
+# 表示价格距离区间边界的剩余空间
+# 95.0 = 只有 5% 空间时才触发（非常保守）
+# 90.0 = 还有 10% 空间时触发
+# 推荐：90-95%（避免频繁再平衡）
+rebalance_threshold_pct: 95.0
+
+# 再平衡冷却期（秒）
+# 避免频繁操作，降低 gas 成本
+# 86400 = 24 小时
+# 43200 = 12 小时
+# 推荐：24 小时
+rebalance_cooldown_seconds: 86400
+
+# 最小再平衡盈利要求（百分比）
+# 仅在盈利 > 此值时才允许再平衡
+# 推荐：5-10%（确保再平衡有利可图）
+min_profit_for_rebalance: 10.0
+
+
+# ========================================
+# 波动率计算配置
+# ========================================
+
+# 波动率计算周期（价格样本数量）
+# 推荐：30-100
+# - 30: 快速响应，适合高波动
+# - 50: 均衡
+# - 100: 稳定，适合低波动
+volatility_periods: 50
+
+# 价格更新间隔（秒）
+# 用于采集价格样本
+# 推荐：60 秒（1 分钟）
+price_update_interval_seconds: 60
+
+
+# ========================================
+# 风险控制
+# ========================================
+
+# 止损百分比（相对初始投入）
+# 触发后关闭所有仓位并暂停
+# 推荐：10-20%
+stop_loss_pct: 15.0
+
+# 盈利保护阈值（百分比）
+# 盈利超过此值后启动移动止损
+# 推荐：20-50%
+profit_take_threshold_pct: 30.0
+
+# 移动止损百分比
+# 从峰值回撤超过此值触发止盈
+# 推荐：5-15%
+trailing_stop_pct: 10.0
+
+# 价格超出区间时暂停
+# true: 超出区间后关闭仓位，等待价格回调
+# false: 保持仓位（但不再赚取手续费）
+pause_on_out_of_range: true
+
+
+# ========================================
+# 监控配置
+# ========================================
+
+# 检查间隔（秒）
+# 推荐：30-60 秒
+check_interval_seconds: 30
+
+
+# ========================================
+# 使用示例
+# ========================================
+
+# 示例 1: SOL-USDC 中性策略
+# connector: meteora_solana
+# trading_pair: SOL-USDC
+# price_range_pct: 12.0
+# num_layers: 4
+# liquidity_distribution: neutral
+# rebalance_threshold_pct: 95.0
+# min_profit_for_rebalance: 10.0
+
+# 示例 2: BONK-USDC 看涨策略（meme 币）
+# connector: meteora_solana
+# trading_pair: BONK-USDC
+# price_range_pct: 25.0
+# num_layers: 5
+# liquidity_distribution: bullish
+# rebalance_threshold_pct: 92.0
+# min_profit_for_rebalance: 15.0
+
+# 示例 3: WIF-USDC 看跌策略（预期下跌）
+# connector: meteora_solana
+# trading_pair: WIF-USDC
+# price_range_pct: 20.0
+# num_layers: 4
+# liquidity_distribution: bearish
+# rebalance_threshold_pct: 95.0
+# min_profit_for_rebalance: 8.0

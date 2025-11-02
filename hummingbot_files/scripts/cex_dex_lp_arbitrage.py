@@ -140,6 +140,14 @@ class CexDexLpArbitrageConfig(BaseClientModel):
         json_schema_extra={"prompt": "检查间隔（秒）", "prompt_on_new": False}
     )
 
+    use_dex_price_for_cex_fallback: bool = Field(
+        False,
+        json_schema_extra={
+            "prompt": "CEX 无法获取价格时使用 DEX 价格代替（仅测试用）",
+            "prompt_on_new": False
+        }
+    )
+
     # ========== Redis 配置 ==========
     redis_host: str = Field(
         "localhost",
@@ -1010,10 +1018,11 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
             if not current_cex_price:
                 return
 
-            # 计算止损价格
+            # 计算止损价格（使用实际开仓时的交易量）
             lower_bound, upper_bound = self.lp_position_info["price_range"]
             avg_lp_price = (lower_bound + upper_bound) / 2
-            trade_value = self.config.lp_token_amount * current_cex_price
+            actual_token_amount = self.lp_position_info["token_amount"]
+            trade_value = actual_token_amount * current_cex_price
 
             cutoff_price = self.profit_calculator.calculate_min_lp_price(
                 cex_price=current_cex_price,
@@ -1207,7 +1216,7 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
             price = await self.cex_connector.get_quote_price(
                 trading_pair=cex_pair,
                 is_buy=True,
-                amount=self.config.lp_token_amount
+                amount=self.config.lp_token_amount if self.config.lp_token_amount > 0 else Decimal("1")
             )
 
             if price and price > 0:
@@ -1215,11 +1224,11 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
                 return Decimal(str(price))
             else:
                 self.logger().warning(f"⚠️ CEX {cex_pair} 返回空价格")
-                return None
+                return await self._fallback_to_dex_price("ask")
 
         except Exception as e:
             self.logger().error(f"获取 CEX 买价失败 ({self._get_cex_trading_pair()}): {e}")
-            return None
+            return await self._fallback_to_dex_price("ask")
 
     async def _get_cex_best_bid(self) -> Optional[Decimal]:
         """获取 CEX 最佳买价（我们的卖出价）"""
@@ -1231,7 +1240,7 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
             price = await self.cex_connector.get_quote_price(
                 trading_pair=cex_pair,
                 is_buy=False,
-                amount=self.config.lp_token_amount
+                amount=self.config.lp_token_amount if self.config.lp_token_amount > 0 else Decimal("1")
             )
 
             if price and price > 0:
@@ -1239,11 +1248,45 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
                 return Decimal(str(price))
             else:
                 self.logger().warning(f"⚠️ CEX {cex_pair} 返回空价格")
-                return None
+                return await self._fallback_to_dex_price("bid")
 
         except Exception as e:
             self.logger().error(f"获取 CEX 卖价失败 ({self._get_cex_trading_pair()}): {e}")
+            return await self._fallback_to_dex_price("bid")
+
+    async def _fallback_to_dex_price(self, side: str) -> Optional[Decimal]:
+        """
+        CEX 价格降级：使用 DEX 价格代替（仅测试用）
+
+        Args:
+            side: "ask" 或 "bid"
+
+        Returns:
+            DEX 价格（如果启用降级）或 None
+        """
+        if not self.config.use_dex_price_for_cex_fallback:
             return None
+
+        try:
+            dex_price = await self._get_dex_price()
+            if dex_price:
+                # 添加微小价差模拟 CEX spread
+                if side == "ask":
+                    # Ask 稍高（+0.1%）
+                    fallback_price = dex_price * Decimal("1.001")
+                else:
+                    # Bid 稍低（-0.1%）
+                    fallback_price = dex_price * Decimal("0.999")
+
+                self.logger().warning(
+                    f"⚠️ CEX 价格不可用，使用 DEX 价格代替: {fallback_price} {self.standard_quote} "
+                    f"(DEX: {dex_price}, side: {side})"
+                )
+                return fallback_price
+        except Exception as e:
+            self.logger().error(f"DEX 降级价格获取失败: {e}")
+
+        return None
 
     async def _gateway_request(self, method: str, path_url: str, params: Optional[dict] = None) -> Optional[dict]:
         """
@@ -1735,8 +1778,10 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
                 price_diff = dex_price - cex_ask
                 price_diff_pct = (price_diff / cex_ask * 100) if cex_ask > 0 else 0
 
-                # 计算目标价格
-                trade_value = self.config.lp_token_amount * cex_ask
+                # 计算有效交易量和目标价格
+                effective_amount = self._get_effective_lp_amount(is_sell_side=True)
+                trade_value = effective_amount * cex_ask if effective_amount > 0 else Decimal("1") * cex_ask
+
                 target_price = self.profit_calculator.calculate_target_lp_price(
                     cex_price=cex_ask,
                     is_sell_side=True,
@@ -1792,7 +1837,10 @@ class CexDexLpArbitrageStrategy(ScriptStrategyBase):
                 price_diff = cex_bid - dex_price
                 price_diff_pct = (price_diff / dex_price * 100) if dex_price > 0 else 0
 
-                trade_value = self.config.lp_token_amount * cex_bid
+                # 计算有效交易量
+                effective_amount = self._get_effective_lp_amount(is_sell_side=False)
+                trade_value = effective_amount * cex_bid if effective_amount > 0 else Decimal("1") * cex_bid
+
                 target_price = self.profit_calculator.calculate_target_lp_price(
                     cex_price=cex_bid,
                     is_sell_side=False,
