@@ -5,8 +5,11 @@
 # 基础配置
 # ========================================
 
-# 连接器名称（Meteora DLMM）
-connector: meteora_solana
+# LP 连接器名称（Meteora DLMM）
+connector: meteora/clmm
+
+# Swap 连接器名称（Jupiter Router）
+swap_connector: jupiter/router
 
 # 交易对（示例：SOL-USDC, BONK-USDC 等）
 trading_pair: SOL-USDC
@@ -55,7 +58,7 @@ quote_token_amount: 0.0
 # 钱包余额使用百分比
 # 仅在 token_amount = 0 时生效
 # 推荐：80% (保留 20% 作为 gas 费和缓冲)
-wallet_allocation_pct: 80.0
+wallet_allocation_pct: 50.0
 
 
 # ========================================
@@ -69,7 +72,7 @@ enable_auto_swap: true
 
 # 自动换币滑点容忍度（百分比）
 # 推荐：1.0-2.0%
-auto_swap_slippage_pct: 1.0
+auto_swap_slippage_pct: 3.0
 
 # 最小代币余额比例
 # 如果某代币占比 < 此值，触发自动换币

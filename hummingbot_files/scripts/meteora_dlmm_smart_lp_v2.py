@@ -14,6 +14,12 @@ Meteora DLMM 智能 LP 管理策略 V2 - 多层级区间版本
 - 避免频繁再平衡：从 30-60 次/月降至 0-3 次/月
 - 简单波动率计算决定区间宽度，无需复杂技术分析
 
+⚠️ 当前限制:
+- Meteora DLMM仅支持在**包含当前价格的区间**创建LP仓位
+- 多层级开仓时，只有当前价格所在的层会成功
+- 其他层将被自动跳过，并在价格移动后可通过再平衡创建
+- 未来版本将优化为根据价格移动动态创建其他层
+
 参考文档:
 - MULTI_LAYER_DLMM_STRATEGY_THEORY.md
 - IMPROVED_STRATEGY_DESIGN.md
@@ -51,7 +57,15 @@ class MeteoraDlmmSmartLpV2Config(BaseClientModel):
     connector: str = Field(
         "meteora/clmm",
         json_schema_extra={
-            "prompt": "连接器名称",
+            "prompt": "LP 连接器名称（如 meteora/clmm）",
+            "prompt_on_new": True
+        }
+    )
+
+    swap_connector: str = Field(
+        "jupiter/router",
+        json_schema_extra={
+            "prompt": "Swap 连接器名称（如 jupiter/router）",
             "prompt_on_new": True
         }
     )
@@ -250,7 +264,11 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
 
     @classmethod
     def init_markets(cls, config: MeteoraDlmmSmartLpV2Config):
-        cls.markets = {config.connector: {config.trading_pair}}
+        # 初始化两个 connector：LP connector 和 Swap connector
+        cls.markets = {
+            config.connector: {config.trading_pair},  # Meteora LP
+            config.swap_connector: {config.trading_pair}  # Jupiter Swap
+        }
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: MeteoraDlmmSmartLpV2Config):
         super().__init__(connectors)
@@ -258,7 +276,8 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
 
         # 连接器
         self.exchange = config.connector
-        self.connector = connectors[config.connector]
+        self.connector = connectors[config.connector]  # Meteora LP connector
+        self.swap_connector = connectors[config.swap_connector]  # Jupiter Swap connector
         self.connector_type = get_connector_type(config.connector)
 
         # Token 信息
@@ -289,6 +308,10 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
         self.last_check_time: Optional[datetime] = None
         self.pause_start_time: Optional[float] = None
 
+        # Jupiter swap 追踪
+        self.pending_swap_order_id: Optional[str] = None
+        self.swap_order_filled: bool = False
+
         # 性能统计
         self.stats = {
             "total_fees_earned": Decimal("0"),
@@ -301,10 +324,15 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
             "avg_volatility": Decimal("0"),
         }
 
+        # 🔧 修复：添加标志位避免重复准备代币
+        self.tokens_prepared = False
+
         # 启动信息
         self.log_with_clock(
             logging.INFO,
             f"Meteora DLMM 智能 LP 策略 V2 启动:\n"
+            f"   LP Connector: {config.connector}\n"
+            f"   Swap Connector: {config.swap_connector}\n"
             f"   交易对: {config.trading_pair}\n"
             f"   价格区间: ±{config.price_range_pct}%\n"
             f"   层级数量: {config.num_layers} 层\n"
@@ -332,9 +360,8 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
             # 2. 检查现有仓位
             await self.check_existing_positions()
 
-            # 3. 如果启用自动换币且无仓位，准备代币
-            if self.config.enable_auto_swap and not self.position_opened:
-                await self.prepare_tokens_for_multi_layer_position()
+            # 🔧 修复：不在初始化时准备代币，由开仓逻辑负责
+            # 避免与 check_and_open_positions 重复调用
 
             self.logger().info("策略初始化完成")
 
@@ -368,6 +395,17 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
             self.pool_info = await self.connector.get_pool_info(
                 trading_pair=self.config.trading_pair
             )
+
+            # 注入价格到 RateOracle
+            if self.pool_info:
+                try:
+                    current_price = Decimal(str(self.pool_info.price))
+                    rate_oracle = RateOracle.get_instance()
+                    rate_oracle.set_price(self.config.trading_pair, current_price)
+                    self.logger().debug(f"注入池子价格到 RateOracle: {self.config.trading_pair} = {current_price}")
+                except Exception as oracle_err:
+                    self.logger().debug(f"RateOracle 注入失败: {oracle_err}")
+
             return self.pool_info
         except Exception as e:
             self.logger().error(f"获取池子信息失败: {e}")
@@ -399,9 +437,16 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
             True 如果代币准备成功
         """
         try:
-            # 获取当前余额
-            base_balance = self.connector.get_available_balance(self.base_token)
-            quote_balance = self.connector.get_available_balance(self.quote_token)
+            # 🔧 修复：强制刷新余额后再读取（避免使用旧缓存）
+            try:
+                await self.swap_connector.update_balances(on_interval=False)
+                await self.connector.update_balances(on_interval=False)
+            except Exception as e:
+                self.logger().warning(f"刷新余额失败: {e}")
+
+            # 使用 swap_connector 读取余额（因为刚刚可能进行了兑换）
+            base_balance = self.swap_connector.get_available_balance(self.base_token)
+            quote_balance = self.swap_connector.get_available_balance(self.quote_token)
 
             self.logger().info(
                 f"当前余额:\n"
@@ -419,45 +464,57 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
 
             current_price = Decimal(str(self.pool_info.price))
 
-            # 计算总价值（以 quote token 计价）
-            total_value_in_quote = (Decimal(str(base_balance)) * current_price) + Decimal(str(quote_balance))
+            # 🔧 修复：基于实际余额计算兑换数量，而不是"要使用的资金"
+            # 首先计算实际余额的总价值和比例
+            actual_base_value = Decimal(str(base_balance)) * current_price
+            actual_quote_value = Decimal(str(quote_balance))
+            total_actual_value = actual_base_value + actual_quote_value
 
-            if total_value_in_quote == 0:
+            if total_actual_value == 0:
                 self.logger().error("钱包余额不足，无法开仓")
                 return False
 
-            # 计算当前比例
-            base_value = Decimal(str(base_balance)) * current_price
-            base_ratio = base_value / total_value_in_quote if total_value_in_quote > 0 else Decimal("0")
-
-            self.logger().info(
-                f"当前资产分布:\n"
-                f"   {self.base_token} 价值: {base_value:.2f} {self.quote_token} ({base_ratio * 100:.1f}%)\n"
-                f"   {self.quote_token} 价值: {quote_balance:.2f} ({(1 - base_ratio) * 100:.1f}%)\n"
-                f"   总价值: {total_value_in_quote:.2f} {self.quote_token}"
-            )
+            # 计算实际余额的比例
+            actual_base_ratio = actual_base_value / total_actual_value if total_actual_value > 0 else Decimal("0")
 
             # 目标比例：50/50
             target_ratio = Decimal("0.5")
             min_ratio = self.config.min_token_balance_ratio
             max_ratio = Decimal("1.0") - min_ratio
 
-            # 检查是否需要换币
-            if base_ratio < min_ratio:
-                # Base token 不足，需要用 quote token 换 base token
-                shortage_value = (target_ratio - base_ratio) * total_value_in_quote
-                quote_to_swap = shortage_value * Decimal("1.02")  # 加 2% 缓冲
+            self.logger().info(
+                f"钱包实际资产分布:\n"
+                f"   {self.base_token}: {base_balance} ({actual_base_ratio * 100:.1f}%)\n"
+                f"   {self.quote_token}: {quote_balance} ({(1 - actual_base_ratio) * 100:.1f}%)\n"
+                f"   总价值: {total_actual_value:.2f} {self.quote_token}\n"
+                f"   目标比例: 50/50"
+            )
 
-                if Decimal(str(quote_balance)) >= quote_to_swap:
+            # 检查是否需要换币（基于实际余额）
+            if actual_base_ratio < min_ratio:
+                # Base token 不足，需要用 quote token 换 base token
+                # 计算目标：实际余额达到50/50后，base应该有多少
+                target_base_value = total_actual_value * target_ratio
+                target_base_amount = target_base_value / current_price
+                shortage_amount = target_base_amount - Decimal(str(base_balance))
+
+                # 🔧 修复：需要买入的 base token 数量（加2%缓冲）
+                base_to_buy = shortage_amount * Decimal("1.02")
+
+                # 估算需要的 quote token（用于余额检查）
+                estimated_quote_needed = base_to_buy * current_price * Decimal("1.05")  # 再加5%滑点缓冲
+
+                if Decimal(str(quote_balance)) >= estimated_quote_needed:
                     self.logger().info(
                         f"{self.base_token} 不足，准备兑换:\n"
-                        f"   用 {quote_to_swap:.6f} {self.quote_token} 换取 {self.base_token}"
+                        f"   买入约 {base_to_buy:.6f} {self.base_token}\n"
+                        f"   预计花费约 {estimated_quote_needed:.6f} {self.quote_token}"
                     )
 
                     success = await self.swap_via_jupiter(
                         from_token=self.quote_token,
                         to_token=self.base_token,
-                        amount=quote_to_swap
+                        amount=base_to_buy  # ✅ 传入要买入的 base token 数量
                     )
 
                     if not success:
@@ -465,26 +522,47 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
                         return False
 
                     self.stats["jupiter_swaps"] += 1
+
+                    # 🔧 修复：强制刷新余额（参考 amm_trade_example.py:183-184）
+                    self.logger().info("等待余额更新...")
+                    await asyncio.sleep(3)
+
+                    # 强制刷新余额
+                    try:
+                        await self.swap_connector.update_balances(on_interval=False)
+                        self.logger().debug("已强制刷新余额")
+                    except Exception as e:
+                        self.logger().warning(f"刷新余额失败: {e}")
+
+                    # 验证余额是否更新
+                    new_base_balance = self.swap_connector.get_available_balance(self.base_token)
+                    self.logger().info(f"兑换后 {self.base_token} 余额: {new_base_balance}")
 
                 else:
                     self.logger().error(f"{self.quote_token} 余额不足以兑换")
                     return False
 
-            elif base_ratio > max_ratio:
+            elif actual_base_ratio > max_ratio:
                 # Base token 过多，需要换成 quote token
-                excess_value = (base_ratio - target_ratio) * total_value_in_quote
-                base_to_swap = (excess_value / current_price) * Decimal("1.02")  # 加 2% 缓冲
+                # 计算目标：实际余额达到50/50后，base应该有多少
+                target_base_value = total_actual_value * target_ratio
+                target_base_amount = target_base_value / current_price
+                excess_amount = Decimal(str(base_balance)) - target_base_amount
 
-                if Decimal(str(base_balance)) >= base_to_swap:
+                # 🔧 修复：需要卖出的 base token 数量（不加缓冲，避免卖过头）
+                base_to_sell = excess_amount * Decimal("0.98")  # 减2%，避免余额不足
+
+                if Decimal(str(base_balance)) >= base_to_sell:
                     self.logger().info(
                         f"{self.base_token} 过多，准备兑换:\n"
-                        f"   用 {base_to_swap:.6f} {self.base_token} 换取 {self.quote_token}"
+                        f"   卖出约 {base_to_sell:.6f} {self.base_token}\n"
+                        f"   预计获得约 {base_to_sell * current_price:.6f} {self.quote_token}"
                     )
 
                     success = await self.swap_via_jupiter(
                         from_token=self.base_token,
                         to_token=self.quote_token,
-                        amount=base_to_swap
+                        amount=base_to_sell  # ✅ 传入要卖出的 base token 数量
                     )
 
                     if not success:
@@ -492,6 +570,21 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
                         return False
 
                     self.stats["jupiter_swaps"] += 1
+
+                    # 🔧 修复：强制刷新余额
+                    self.logger().info("等待余额更新...")
+                    await asyncio.sleep(3)
+
+                    # 强制刷新余额
+                    try:
+                        await self.swap_connector.update_balances(on_interval=False)
+                        self.logger().debug("已强制刷新余额")
+                    except Exception as e:
+                        self.logger().warning(f"刷新余额失败: {e}")
+
+                    # 验证余额是否更新
+                    new_quote_balance = self.swap_connector.get_available_balance(self.quote_token)
+                    self.logger().info(f"兑换后 {self.quote_token} 余额: {new_quote_balance}")
 
                 else:
                     self.logger().error(f"{self.base_token} 余额不足以兑换")
@@ -516,33 +609,47 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
         """
         通过 Jupiter 兑换代币
 
-        使用 Gateway connector 标准化方法:
-        - connector.get_quote_price() 获取报价
-        - connector.place_order() 执行兑换
+        使用独立的 Jupiter Swap Connector (jupiter/router)
+        参考: amm_trade_example.py
 
         Args:
-            from_token: 源代币
-            to_token: 目标代币
-            amount: 兑换数量
+            from_token: 源代币（卖出）
+            to_token: 目标代币（买入）
+            amount: **base_token 的数量**
+                - 如果 from_token == base_token: 卖出 amount 个 base_token
+                - 如果 to_token == base_token: 买入 amount 个 base_token
             max_retries: 最大重试次数
 
         Returns:
             True 如果兑换成功
         """
-        trading_pair = f"{from_token}-{to_token}"
-        is_buy = (to_token == self.base_token)  # 如果目标是 base token，则为 buy
+        # 使用原始交易对
+        trading_pair = self.config.trading_pair
+
+        # 🔧 关键修复：确定交易方向
+        # Gateway API 语义（参考 gateway_swap.py:17-32）：
+        # - is_buy=True + amount: 买入 amount 数量的 base_token
+        # - is_buy=False + amount: 卖出 amount 数量的 base_token
+        # - amount 参数**始终**是 base_token 的数量
+        if from_token == self.base_token:
+            # 卖出 base_token
+            is_buy = False
+        else:
+            # 买入 base_token（卖出 quote_token）
+            is_buy = True
 
         retry_delay = 1
 
         for attempt in range(max_retries):
             try:
-                # 1. 获取报价（使用 Gateway 标准化方法）
+                # 1. 获取报价（使用 Jupiter Swap Connector）
                 self.logger().info(f"获取 Jupiter 报价 (尝试 {attempt + 1}/{max_retries})...")
 
-                quote_price = await self.connector.get_quote_price(
+                # 使用 swap_connector（jupiter/router）
+                quote_price = await self.swap_connector.get_quote_price(
                     trading_pair=trading_pair,
                     is_buy=is_buy,
-                    amount=float(amount)
+                    amount=amount
                 )
 
                 if not quote_price or quote_price <= 0:
@@ -554,32 +661,77 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
                     else:
                         return False
 
-                self.logger().info(f"报价: {quote_price} {to_token}/{from_token}")
+                # 注入价格到 RateOracle（参考 cex_dex_lp_arbitrage.py:1082-1090）
+                try:
+                    rate_oracle = RateOracle.get_instance()
+                    rate_oracle.set_price(trading_pair, Decimal(str(quote_price)))
+                    self.logger().debug(f"注入价格到 RateOracle: {trading_pair} = {quote_price}")
+                except Exception as oracle_err:
+                    self.logger().debug(f"RateOracle 注入失败: {oracle_err}")
 
-                # 2. 计算预期输出
-                expected_output = amount / Decimal(str(quote_price)) if not is_buy else amount * Decimal(str(quote_price))
+                # 2. 计算预期的 quote_token 数量
+                # quote_price = 1 base_token 的价格（以 quote_token 计价）
+                # 无论买入还是卖出，quote_token 数量 = base_token 数量 * 价格
+                quote_token_amount = amount * Decimal(str(quote_price))
 
                 # 3. 执行兑换（使用 Gateway 标准化方法）
-                self.logger().info(
-                    f"执行 Jupiter 兑换:\n"
-                    f"   输入: {amount:.6f} {from_token}\n"
-                    f"   预期输出: {expected_output:.6f} {to_token}\n"
-                    f"   价格: {quote_price}"
-                )
+                if is_buy:
+                    # 买入 base_token，卖出 quote_token
+                    self.logger().info(
+                        f"执行 Jupiter 兑换（买入 {self.base_token}）:\n"
+                        f"   卖出约: {quote_token_amount:.6f} {self.quote_token}\n"
+                        f"   买入: {amount:.6f} {self.base_token}\n"
+                        f"   价格: {quote_price:.10f} {self.quote_token}/{self.base_token}"
+                    )
+                else:
+                    # 卖出 base_token，买入 quote_token
+                    self.logger().info(
+                        f"执行 Jupiter 兑换（卖出 {self.base_token}）:\n"
+                        f"   卖出: {amount:.6f} {self.base_token}\n"
+                        f"   买入约: {quote_token_amount:.6f} {self.quote_token}\n"
+                        f"   价格: {quote_price:.10f} {self.quote_token}/{self.base_token}"
+                    )
 
-                order_id = self.connector.place_order(
+                # 使用 swap_connector 执行兑换（jupiter/router）
+                order_id = self.swap_connector.place_order(
                     is_buy=is_buy,
                     trading_pair=trading_pair,
-                    amount=float(amount),
+                    amount=amount,  # 保持 Decimal 类型
                     price=quote_price
                 )
 
-                self.logger().info(f"兑换订单已提交: {order_id}")
+                self.logger().info(f"Jupiter 兑换订单已提交: {order_id}")
 
-                # 4. 等待订单确认（简化处理，实际应该监听订单事件）
-                await asyncio.sleep(3)
+                # 4. 等待订单成交
+                self.pending_swap_order_id = order_id
+                self.swap_order_filled = False
 
-                self.logger().info("Jupiter 兑换成功")
+                # 等待最多 30 秒让订单成交
+                max_wait = 30
+                wait_interval = 1
+                elapsed = 0
+
+                while elapsed < max_wait:
+                    await asyncio.sleep(wait_interval)
+                    elapsed += wait_interval
+
+                    # 检查订单是否成交
+                    if self.swap_order_filled:
+                        self.logger().info(f"Jupiter 兑换成功完成: {order_id}")
+                        self.pending_swap_order_id = None
+                        return True
+
+                    # 检查订单是否失败（pending_swap_order_id 被清除）
+                    if self.pending_swap_order_id is None:
+                        self.logger().error(f"Jupiter 兑换订单失败: {order_id}")
+                        return False
+
+                # 超时检查
+                if not self.swap_order_filled:
+                    self.logger().error(f"Jupiter 兑换超时（{max_wait}秒），订单: {order_id}")
+                    self.pending_swap_order_id = None
+                    return False
+
                 return True
 
             except Exception as e:
@@ -702,32 +854,42 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
         """
         计算多层级区间参数
 
+        🔧 新策略：所有层都围绕当前价格，宽度递增
+        - Layer 1: 最紧的区间（如 ±4%）
+        - Layer 2: 中等区间（如 ±8%）
+        - Layer 3: 最宽区间（如 ±12%）
+
+        这样所有层都包含当前价格，都能成功创建！
+
         Args:
             current_price: 当前价格
-            range_width_pct: 总区间宽度（百分比，如 12.0 表示 ±12%）
+            range_width_pct: 最外层区间宽度（百分比，如 12.0 表示 ±12%）
             num_layers: 层级数量
 
         Returns:
             层级列表，每层包含 {layer_id, lower, upper, liquidity_pct, name}
         """
-        lower_bound = current_price * (Decimal("1") - range_width_pct / Decimal("100"))
-        upper_bound = current_price * (Decimal("1") + range_width_pct / Decimal("100"))
-        layer_width = (upper_bound - lower_bound) / num_layers
-
         # 根据趋势生成流动性分布
         distribution = self._generate_liquidity_distribution(num_layers)
 
         layers = []
         for i in range(num_layers):
-            layer_lower = lower_bound + i * layer_width
-            layer_upper = layer_lower + layer_width
+            # 每层的宽度递增：从内层到外层
+            # Layer 1 (内层): range_width_pct / num_layers
+            # Layer 2 (中层): range_width_pct * 2 / num_layers
+            # Layer 3 (外层): range_width_pct * 3 / num_layers (= 总宽度)
+            layer_width_pct = range_width_pct * (i + 1) / num_layers
+
+            layer_lower = current_price * (Decimal("1") - layer_width_pct / Decimal("100"))
+            layer_upper = current_price * (Decimal("1") + layer_width_pct / Decimal("100"))
 
             layers.append({
                 "layer_id": i + 1,
                 "lower": layer_lower,
                 "upper": layer_upper,
                 "liquidity_pct": distribution[i],
-                "name": f"Layer_{i + 1}"
+                "name": f"Layer_{i + 1}",
+                "width_pct": layer_width_pct  # 记录宽度便于调试
             })
 
         return layers
@@ -830,6 +992,15 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
                 f"   配置区间: ±{self.config.price_range_pct}%"
             )
 
+            # 🔧 修复：只准备一次代币（避免重复调用）
+            if self.config.enable_auto_swap and not self.tokens_prepared:
+                success = await self.prepare_tokens_for_multi_layer_position()
+                if not success:
+                    self.logger().error("代币准备失败，跳过本次开仓，将在下个周期重试")
+                    return
+                # 标记为已准备，避免重复调用
+                self.tokens_prepared = True
+
             # 开仓（使用配置的区间，不自动调整）
             await self.open_multi_layer_positions(current_price)
 
@@ -876,12 +1047,12 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
             # 3. 为每一层创建仓位
             created_positions = 0
             for layer in layers:
-                # 计算该层的代币数量
+                # ✅ 所有层都围绕当前价格，都需要两种代币
                 layer_base = total_base_amount * layer['liquidity_pct']
                 layer_quote = total_quote_amount * layer['liquidity_pct']
 
                 self.logger().info(
-                    f"开仓 {layer['name']}:\n"
+                    f"开仓 {layer['name']} (宽度: ±{layer['width_pct']:.1f}%):\n"
                     f"   区间: {layer['lower']:.6f} - {layer['upper']:.6f}\n"
                     f"   {self.base_token}: {layer_base:.6f}\n"
                     f"   {self.quote_token}: {layer_quote:.6f}"
@@ -889,13 +1060,24 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
 
                 # 提交开仓订单
                 try:
-                    # 计算价格区间百分比
+                    # 🔧 使用当前市场价格
+                    # price参数用于计算代币数量，应该是当前市场价格
+                    # 区间通过lower_width_pct和upper_width_pct设置
+
+                    # 计算相对于当前市场价格的区间百分比
                     lower_width_pct = float(((center_price - layer['lower']) / center_price) * 100)
                     upper_width_pct = float(((layer['upper'] - center_price) / center_price) * 100)
 
+                    self.logger().debug(
+                        f"{layer['name']} 参数:\n"
+                        f"   当前价格: {center_price:.10f}\n"
+                        f"   区间下界: {layer['lower']:.10f} (距离: -{lower_width_pct:.2f}%)\n"
+                        f"   区间上界: {layer['upper']:.10f} (距离: +{upper_width_pct:.2f}%)"
+                    )
+
                     order_id = self.connector.add_liquidity(
                         trading_pair=self.config.trading_pair,
-                        price=float(center_price),
+                        price=float(center_price),  # ✅ 使用当前市场价格
                         upper_width_pct=upper_width_pct,
                         lower_width_pct=lower_width_pct,
                         base_token_amount=float(layer_base),
@@ -943,8 +1125,16 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
 
         # 否则，使用钱包余额的百分比
         try:
-            base_balance = self.connector.get_available_balance(self.base_token)
-            quote_balance = self.connector.get_available_balance(self.quote_token)
+            # 🔧 修复：开仓前强制刷新余额
+            try:
+                await self.swap_connector.update_balances(on_interval=False)
+                await self.connector.update_balances(on_interval=False)
+            except Exception as e:
+                self.logger().warning(f"刷新余额失败: {e}")
+
+            # 使用 swap_connector 读取最新余额
+            base_balance = self.swap_connector.get_available_balance(self.base_token)
+            quote_balance = self.swap_connector.get_available_balance(self.quote_token)
 
             allocation_pct = self.config.wallet_allocation_pct / Decimal("100")
 
@@ -1399,11 +1589,32 @@ class MeteoraDlmmSmartLpV2(ScriptStrategyBase):
             if hasattr(event, 'order_id'):
                 self.logger().info(f"订单成交: {event.order_id}")
 
+                # 检查是否是 Jupiter swap 订单
+                if self.pending_swap_order_id and event.order_id == self.pending_swap_order_id:
+                    self.swap_order_filled = True
+                    self.logger().info(f"Jupiter swap 订单已成交: {event.order_id}")
+
                 # 更新仓位信息
                 safe_ensure_future(self.fetch_positions_after_fill())
 
         except Exception as e:
             self.logger().error(f"处理订单成交事件失败: {e}")
+
+    def did_fail_order(self, event):
+        """订单失败事件"""
+        try:
+            if hasattr(event, 'order_id'):
+                self.logger().warning(f"订单失败: {event.order_id}")
+
+                # 检查是否是 Jupiter swap 订单失败
+                if self.pending_swap_order_id and event.order_id == self.pending_swap_order_id:
+                    self.swap_order_filled = False  # 确保标记为未成交
+                    self.logger().error(f"Jupiter swap 订单失败: {event.order_id}")
+                    # 清除待处理订单ID，让 swap_via_jupiter 方法能够检测到失败
+                    self.pending_swap_order_id = None
+
+        except Exception as e:
+            self.logger().error(f"处理订单失败事件错误: {e}")
 
     async def fetch_positions_after_fill(self):
         """订单成交后获取仓位信息"""
