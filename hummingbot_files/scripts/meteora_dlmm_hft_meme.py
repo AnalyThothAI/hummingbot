@@ -187,8 +187,15 @@ class FastStopLossEngine:
 
         now = time.time()
 
-        # === Level 1: 幅度止损（最高优先级）===
-        price_change_pct = (current_price - open_price) / open_price * Decimal("100")
+        # === 防御性检查：open_price ===
+        if not open_price or open_price <= 0:
+            self.logger.warning("⚠️  开仓价格无效，部分止损逻辑将跳过")
+            # 设置一个默认值，避免后续崩溃
+            price_change_pct = Decimal("0")
+            has_valid_open_price = False
+        else:
+            price_change_pct = (current_price - open_price) / open_price * Decimal("100")
+            has_valid_open_price = True
 
         # 计算超出区间时长（在所有逻辑之前）
         is_out_of_range = current_price < lower_price or current_price > upper_price
@@ -203,14 +210,15 @@ class FastStopLossEngine:
             # 重置计时器
             self.price_out_of_range_since = None
 
-        if price_change_pct <= -self.config.stop_loss_pct:
+        # === Level 1: 幅度止损（最高优先级）===
+        if has_valid_open_price and price_change_pct <= -self.config.stop_loss_pct:
             return True, "HARD_STOP", f"下跌 {abs(price_change_pct):.2f}% 超过止损线 {self.config.stop_loss_pct}%", out_duration
 
         # === Level 2: 60秒规则 + 下跌 ===
         if is_out_of_range:
             if self.config.enable_60s_rule and out_duration >= self.config.out_of_range_timeout_seconds:
                 # 超出 60 秒，检查方向
-                if current_price < lower_price and price_change_pct < -3:
+                if current_price < lower_price and has_valid_open_price and price_change_pct < -3:
                     # 下跌方向，立即止损
                     return True, "HARD_STOP", f"下跌超出区间 {out_duration:.0f}秒", out_duration
                 else:
@@ -241,7 +249,7 @@ class FastStopLossEngine:
 
             if hold_hours >= float(self.config.max_position_hold_hours):
                 # 持仓过久且未盈利
-                if price_change_pct < 0:
+                if has_valid_open_price and price_change_pct < 0:
                     return True, "SOFT_STOP", f"持仓 {hold_hours:.1f}h 未盈利", out_duration
 
         # 无止损触发
@@ -784,11 +792,24 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                 self.position_opening = False
                 return
 
+            # 计算预估总价值
+            estimated_total_value = float(total_base) * float(center_price) + float(total_quote)
+
             self.logger().info(
-                f"开仓（高频模式）:\n"
-                f"  价格: {center_price:.8f}\n"
-                f"  区间: [{lower_price:.8f}, {upper_price:.8f}] (±{range_width_pct}%)\n"
-                f"  投入: {total_base:.6f} {self.base_token} + {total_quote:.2f} {self.quote_token}"
+                f"📊 开仓计划（高频模式）:\n"
+                f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"  中心价格: {center_price:.10f}\n"
+                f"  区间宽度: ±{range_width_pct}%\n"
+                f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"  目标区间:\n"
+                f"    下界: {lower_price:.10f}\n"
+                f"    上界: {upper_price:.10f}\n"
+                f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"  投入资金:\n"
+                f"    {self.base_token}: {total_base:.6f}\n"
+                f"    {self.quote_token}: {total_quote:.6f}\n"
+                f"  预估总价值: {estimated_total_value:.6f} {self.quote_token}\n"
+                f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             )
 
             # ========================================
@@ -838,7 +859,7 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
 
     async def get_token_amounts(self) -> Tuple[Decimal, Decimal]:
         """
-        获取代币数量（带详细日志）
+        获取代币数量（带详细日志和强制余额刷新）
 
         Returns:
             (base_amount, quote_amount)
@@ -853,22 +874,38 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                 )
                 return self.config.base_token_amount, self.config.quote_token_amount
 
+            # ===  强制刷新余额（关键修复）===
+            self.logger().info("强制刷新余额...")
+            await self.connector.update_balances(on_interval=False)
+
+            # 等待余额更新完成
+            await asyncio.sleep(1)
+
             # 否则使用钱包余额的百分比
             base_balance = self.connector.get_available_balance(self.base_token)
             quote_balance = self.connector.get_available_balance(self.quote_token)
 
-            self.logger().debug(
-                f"当前钱包余额:\n"
+            self.logger().info(
+                f"当前钱包余额（已刷新）:\n"
                 f"  {self.base_token}: {base_balance}\n"
                 f"  {self.quote_token}: {quote_balance}"
             )
+
+            # 检查余额是否足够
+            if base_balance <= 0 and quote_balance <= 0:
+                self.logger().error(
+                    f"❌ 余额不足，无法开仓\n"
+                    f"   {self.base_token}: {base_balance}\n"
+                    f"   {self.quote_token}: {quote_balance}"
+                )
+                return Decimal("0"), Decimal("0")
 
             allocation_pct = self.config.wallet_allocation_pct / Decimal("100")
 
             allocated_base = Decimal(str(base_balance)) * allocation_pct
             allocated_quote = Decimal(str(quote_balance)) * allocation_pct
 
-            self.logger().debug(
+            self.logger().info(
                 f"分配 {self.config.wallet_allocation_pct}% 的余额:\n"
                 f"  {self.base_token}: {allocated_base}\n"
                 f"  {self.quote_token}: {allocated_quote}"
@@ -1094,6 +1131,8 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             self.position_opened = False
             self.position_id = None
             self.position_info = None
+            self.tokens_prepared = False  # 重置token准备标志
+            self.position_info_last_update = None  # 重置仓位信息更新时间
 
         except Exception as e:
             self.logger().error(f"关闭仓位失败: {e}", exc_info=True)
@@ -1165,12 +1204,29 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             await self.check_existing_positions()
 
             if self.position_info:
+                # 计算实际总价值
+                if self.pool_info and self.pool_info.price:
+                    actual_total_value = (
+                        Decimal(str(self.position_info.base_token_amount)) *
+                        Decimal(str(self.pool_info.price)) +
+                        Decimal(str(self.position_info.quote_token_amount))
+                    )
+                else:
+                    actual_total_value = Decimal("0")
+
                 self.logger().info(
-                    f"仓位信息已获取:\n"
+                    f"📊 实际结果对照:\n"
+                    f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"  仓位ID: {self.position_id}\n"
-                    f"  价格区间: [{self.position_info.lower_price:.8f}, {self.position_info.upper_price:.8f}]\n"
-                    f"  代币数量: {self.position_info.base_token_amount:.6f} {self.base_token} + "
-                    f"{self.position_info.quote_token_amount:.2f} {self.quote_token}"
+                    f"  实际区间:\n"
+                    f"    下界: {self.position_info.lower_price:.10f}\n"
+                    f"    上界: {self.position_info.upper_price:.10f}\n"
+                    f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"  实际持仓:\n"
+                    f"    {self.base_token}: {self.position_info.base_token_amount:.6f}\n"
+                    f"    {self.quote_token}: {self.position_info.quote_token_amount:.6f}\n"
+                    f"  实际总价值: {actual_total_value:.6f} {self.quote_token}\n"
+                    f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 )
             else:
                 self.logger().warning("未能获取到仓位信息，将在下次监控时重试")
@@ -1183,24 +1239,156 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
     # ========================================
 
     def format_status(self) -> str:
-        """格式化状态"""
+        """格式化状态（增强版）"""
+        lines = []
+        lines.append("=" * 70)
+        lines.append("⚡ Meteora DLMM 高频做市策略 - 实时状态")
+        lines.append("=" * 70)
+
+        # === 1. 钱包余额 ===
+        lines.append("\n💰 钱包余额:")
+        try:
+            base_balance = self.connector.get_available_balance(self.base_token)
+            quote_balance = self.connector.get_available_balance(self.quote_token)
+            lines.append(f"  {self.base_token}: {base_balance:.6f}")
+            lines.append(f"  {self.quote_token}: {quote_balance:.6f}")
+        except Exception as e:
+            lines.append(f"  无法获取余额: {e}")
+
+        # === 2. 仓位状态 ===
         if not self.position_opened or not self.position_info:
-            return "无持仓"
+            lines.append("\n📊 仓位状态: 无持仓")
 
+            # 显示下次检查时间
+            if self.last_check_time:
+                from datetime import datetime
+                next_check_seconds = self.config.check_interval_seconds - (datetime.now() - self.last_check_time).total_seconds()
+                if next_check_seconds > 0:
+                    lines.append(f"⏱️  下次检查: {next_check_seconds:.0f}秒后")
+
+            lines.append("=" * 70)
+            return "\n".join(lines)
+
+        lines.append("\n📊 仓位状态: 已开仓")
+        lines.append(f"仓位ID: {self.position_id[:10]}...{self.position_id[-10:] if self.position_id else ''}")
+
+        # === 3. 价格和距离信息 ===
         current_price = Decimal(str(self.pool_info.price)) if self.pool_info else Decimal("0")
-        price_change = (current_price - self.open_price) / self.open_price * Decimal("100") if self.open_price else Decimal("0")
+        lower_price = Decimal(str(self.position_info.lower_price))
+        upper_price = Decimal(str(self.position_info.upper_price))
 
-        return (
-            f"\n{'=' * 60}\n"
-            f"⚡ Meteora DLMM 高频做市状态\n"
-            f"{'=' * 60}\n"
-            f"交易对: {self.config.trading_pair}\n"
-            f"当前价格: {current_price:.8f} ({price_change:+.2f}%)\n"
-            f"区间: [{self.position_info.lower_price:.8f}, {self.position_info.upper_price:.8f}]\n"
-            f"今日再平衡: {self.rebalance_count_today} 次\n"
-            f"今日止损: {self.stop_loss_count_today} 次\n"
-            f"{'=' * 60}\n"
-        )
+        lines.append(f"\n💹 价格信息:")
+        lines.append(f"  当前价格: {current_price:.10f}")
+        lines.append(f"  价格区间: [{lower_price:.10f}, {upper_price:.10f}]")
+
+        # 计算距离边界
+        if lower_price <= current_price <= upper_price:
+            distance_to_lower_pct = ((current_price - lower_price) / lower_price) * 100
+            distance_to_upper_pct = ((upper_price - current_price) / current_price) * 100
+            lines.append(f"  状态: ✅ 在范围内")
+            lines.append(f"  距下界: +{distance_to_lower_pct:.2f}%")
+            lines.append(f"  距上界: +{distance_to_upper_pct:.2f}%")
+        elif current_price < lower_price:
+            out_pct = ((lower_price - current_price) / lower_price) * 100
+            lines.append(f"  状态: ⚠️  超出下界 {out_pct:.2f}%")
+        else:
+            out_pct = ((current_price - upper_price) / upper_price) * 100
+            lines.append(f"  状态: ⚠️  超出上界 {out_pct:.2f}%")
+
+        # === 4. 盈亏信息 ===
+        if self.open_price:
+            price_change_pct = ((current_price - self.open_price) / self.open_price) * 100
+            lines.append(f"\n📈 盈亏分析:")
+            lines.append(f"  开仓价格: {self.open_price:.10f}")
+            lines.append(f"  价格变化: {price_change_pct:+.2f}%")
+
+            # 计算当前仓位价值
+            base_amount = Decimal(str(self.position_info.base_token_amount))
+            quote_amount = Decimal(str(self.position_info.quote_token_amount))
+            current_value = (base_amount * current_price) + quote_amount
+
+            # 计算手续费
+            base_fees = Decimal(str(self.position_info.base_fee_amount))
+            quote_fees = Decimal(str(self.position_info.quote_fee_amount))
+            fees_value = (base_fees * current_price) + quote_fees
+
+            if self.initial_investment > 0:
+                # 未实现盈亏 = (当前价值 + 手续费) - 初始投资
+                unrealized_pnl = (current_value + fees_value) - self.initial_investment
+                unrealized_pnl_pct = (unrealized_pnl / self.initial_investment) * 100
+
+                pnl_icon = "📈" if unrealized_pnl > 0 else "📉"
+                lines.append(f"  {pnl_icon} 未实现盈亏: {unrealized_pnl:+.6f} {self.quote_token} ({unrealized_pnl_pct:+.2f}%)")
+                lines.append(f"  初始投资: {self.initial_investment:.6f} {self.quote_token}")
+                lines.append(f"  当前价值: {current_value:.6f} {self.quote_token}")
+                lines.append(f"  累计手续费: {fees_value:.6f} {self.quote_token}")
+
+                # 显示仓位组成
+                lines.append(f"\n  仓位组成:")
+                lines.append(f"    {self.base_token}: {base_amount:.6f}")
+                lines.append(f"    {self.quote_token}: {quote_amount:.6f}")
+
+        # === 5. 止损状态 ===
+        lines.append(f"\n🛡️  止损状态:")
+        if self.stop_loss_engine and self.stop_loss_engine.price_out_of_range_since:
+            import time
+            out_duration = time.time() - self.stop_loss_engine.price_out_of_range_since
+            remaining = self.config.out_of_range_timeout_seconds - out_duration
+            progress = (out_duration / self.config.out_of_range_timeout_seconds) * 100
+
+            lines.append(f"  ⏰ 超出区间: {out_duration:.0f}s / {self.config.out_of_range_timeout_seconds}s ({progress:.0f}%)")
+            lines.append(f"  剩余时间: {max(0, remaining):.0f}s")
+
+            if remaining <= 10:
+                lines.append(f"  ⚠️  即将触发60秒规则!")
+        else:
+            lines.append(f"  ✅ 价格在范围内")
+
+        # 显示止损配置
+        if self.open_price and current_price:
+            price_change_pct = ((current_price - self.open_price) / self.open_price) * 100
+            stop_loss_trigger = self.config.stop_loss_pct
+            distance_to_stop = float(abs(price_change_pct)) - float(stop_loss_trigger)
+
+            if price_change_pct < 0:
+                lines.append(f"  幅度止损: {stop_loss_trigger}% (当前: {abs(price_change_pct):.2f}%, 距离: {distance_to_stop:.2f}%)")
+
+        # === 6. 再平衡状态 ===
+        lines.append(f"\n🔄 再平衡状态:")
+        lines.append(f"  今日次数: {self.rebalance_count_today}")
+        lines.append(f"  配置:")
+        lines.append(f"    阈值: {self.config.rebalance_threshold_pct}%")
+        lines.append(f"    冷却期: {self.config.rebalance_cooldown_seconds}秒")
+        lines.append(f"    最小盈利: {self.config.min_profit_for_rebalance}%")
+
+        if self.rebalance_engine and self.rebalance_engine.last_rebalance_time:
+            remaining_cooldown = self.rebalance_engine._remaining_cooldown(self.config.rebalance_cooldown_seconds)
+            if remaining_cooldown > 0:
+                lines.append(f"  冷却中: 剩余 {remaining_cooldown:.0f}s")
+            else:
+                lines.append(f"  状态: ✅ 就绪")
+
+        # === 7. 策略配置 ===
+        lines.append(f"\n⚙️  策略配置:")
+        lines.append(f"  交易对: {self.config.trading_pair}")
+        lines.append(f"  区间宽度: ±{self.config.price_range_pct}%")
+        lines.append(f"  60秒规则: {'✅ 启用' if self.config.enable_60s_rule else '❌ 禁用'}")
+        lines.append(f"  幅度止损: {self.config.stop_loss_pct}%")
+        lines.append(f"  检查间隔: {self.config.check_interval_seconds}秒")
+
+        # === 8. 今日统计 ===
+        lines.append(f"\n📊 今日统计:")
+        lines.append(f"  再平衡: {self.rebalance_count_today} 次")
+        lines.append(f"  止损: {self.stop_loss_count_today} 次")
+
+        # === 9. 下次检查时间 ===
+        if self.last_check_time:
+            next_check_seconds = self.config.check_interval_seconds - (datetime.now() - self.last_check_time).total_seconds()
+            if next_check_seconds > 0:
+                lines.append(f"\n⏱️  下次检查: {next_check_seconds:.0f}秒后")
+
+        lines.append("=" * 70)
+        return "\n".join(lines)
 
 
 if __name__ == "__main__":
