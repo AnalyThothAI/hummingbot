@@ -3,7 +3,7 @@ connector: meteora/clmm
 swap_connector: jupiter/router
 trading_pair: PAYAI-SOL
 pool_address: '7hMhU52uguE8T5SZjFAqDgvBeeKm3g1KfivnmTPCxtd9'
-price_range_pct: '10'
+price_range_pct: '3'
 rebalance_threshold_pct: '75.0'
 rebalance_cooldown_seconds: 180
 min_profit_for_rebalance: '2.0'

@@ -1240,155 +1240,163 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
 
     def format_status(self) -> str:
         """格式化状态（增强版）"""
-        lines = []
-        lines.append("=" * 70)
-        lines.append("⚡ Meteora DLMM 高频做市策略 - 实时状态")
-        lines.append("=" * 70)
-
-        # === 1. 钱包余额 ===
-        lines.append("\n💰 钱包余额:")
         try:
-            base_balance = self.connector.get_available_balance(self.base_token)
-            quote_balance = self.connector.get_available_balance(self.quote_token)
-            lines.append(f"  {self.base_token}: {base_balance:.6f}")
-            lines.append(f"  {self.quote_token}: {quote_balance:.6f}")
-        except Exception as e:
-            lines.append(f"  无法获取余额: {e}")
+            lines = []
+            lines.append("=" * 70)
+            lines.append("⚡ Meteora DLMM 高频做市策略 - 实时状态")
+            lines.append("=" * 70)
 
-        # === 2. 仓位状态 ===
-        if not self.position_opened or not self.position_info:
-            lines.append("\n📊 仓位状态: 无持仓")
+            # === 1. 钱包余额 ===
+            lines.append("\n💰 钱包余额:")
+            try:
+                base_balance = self.connector.get_available_balance(self.base_token)
+                quote_balance = self.connector.get_available_balance(self.quote_token)
+                lines.append(f"  {self.base_token}: {base_balance:.6f}")
+                lines.append(f"  {self.quote_token}: {quote_balance:.6f}")
+            except Exception as e:
+                lines.append(f"  无法获取余额: {e}")
 
-            # 显示下次检查时间
+            # === 2. 仓位状态 ===
+            if not self.position_opened or not self.position_info:
+                lines.append("\n📊 仓位状态: 无持仓")
+
+                # 显示下次检查时间
+                if self.last_check_time:
+                    next_check_seconds = self.config.check_interval_seconds - (datetime.now() - self.last_check_time).total_seconds()
+                    if next_check_seconds > 0:
+                        lines.append(f"⏱️  下次检查: {next_check_seconds:.0f}秒后")
+
+                lines.append("=" * 70)
+                return "\n".join(lines)
+
+            lines.append("\n📊 仓位状态: 已开仓")
+            lines.append(f"仓位ID: {self.position_id[:10]}...{self.position_id[-10:] if self.position_id else ''}")
+
+            # === 3. 价格和距离信息 ===
+            current_price = Decimal(str(self.pool_info.price)) if self.pool_info else Decimal("0")
+            lower_price = Decimal(str(self.position_info.lower_price))
+            upper_price = Decimal(str(self.position_info.upper_price))
+
+            lines.append(f"\n💹 价格信息:")
+            lines.append(f"  当前价格: {current_price:.10f}")
+            lines.append(f"  价格区间: [{lower_price:.10f}, {upper_price:.10f}]")
+
+            # 计算距离边界
+            if lower_price <= current_price <= upper_price:
+                distance_to_lower_pct = ((current_price - lower_price) / lower_price) * 100
+                distance_to_upper_pct = ((upper_price - current_price) / current_price) * 100
+                lines.append(f"  状态: ✅ 在范围内")
+                lines.append(f"  距下界: +{distance_to_lower_pct:.2f}%")
+                lines.append(f"  距上界: +{distance_to_upper_pct:.2f}%")
+            elif current_price < lower_price:
+                out_pct = ((lower_price - current_price) / lower_price) * 100
+                lines.append(f"  状态: ⚠️  超出下界 {out_pct:.2f}%")
+            else:
+                out_pct = ((current_price - upper_price) / upper_price) * 100
+                lines.append(f"  状态: ⚠️  超出上界 {out_pct:.2f}%")
+
+            # === 4. 盈亏信息 ===
+            if self.open_price:
+                price_change_pct = ((current_price - self.open_price) / self.open_price) * 100
+                lines.append(f"\n📈 盈亏分析:")
+                lines.append(f"  开仓价格: {self.open_price:.10f}")
+                lines.append(f"  价格变化: {price_change_pct:+.2f}%")
+
+                # 计算当前仓位价值
+                base_amount = Decimal(str(self.position_info.base_token_amount))
+                quote_amount = Decimal(str(self.position_info.quote_token_amount))
+                current_value = (base_amount * current_price) + quote_amount
+
+                # 计算手续费（防御性检查）
+                try:
+                    base_fees = Decimal(str(self.position_info.base_fee_amount)) if hasattr(self.position_info, 'base_fee_amount') else Decimal("0")
+                    quote_fees = Decimal(str(self.position_info.quote_fee_amount)) if hasattr(self.position_info, 'quote_fee_amount') else Decimal("0")
+                    fees_value = (base_fees * current_price) + quote_fees
+                except Exception as e:
+                    self.logger().warning(f"无法计算手续费: {e}")
+                    base_fees = Decimal("0")
+                    quote_fees = Decimal("0")
+                    fees_value = Decimal("0")
+
+                if self.initial_investment > 0:
+                    # 未实现盈亏 = (当前价值 + 手续费) - 初始投资
+                    unrealized_pnl = (current_value + fees_value) - self.initial_investment
+                    unrealized_pnl_pct = (unrealized_pnl / self.initial_investment) * 100
+
+                    pnl_icon = "📈" if unrealized_pnl > 0 else "📉"
+                    lines.append(f"  {pnl_icon} 未实现盈亏: {unrealized_pnl:+.6f} {self.quote_token} ({unrealized_pnl_pct:+.2f}%)")
+                    lines.append(f"  初始投资: {self.initial_investment:.6f} {self.quote_token}")
+                    lines.append(f"  当前价值: {current_value:.6f} {self.quote_token}")
+                    lines.append(f"  累计手续费: {fees_value:.6f} {self.quote_token}")
+
+                    # 显示仓位组成
+                    lines.append(f"\n  仓位组成:")
+                    lines.append(f"    {self.base_token}: {base_amount:.6f}")
+                    lines.append(f"    {self.quote_token}: {quote_amount:.6f}")
+
+            # === 5. 止损状态 ===
+            lines.append(f"\n🛡️  止损状态:")
+            if self.stop_loss_engine and self.stop_loss_engine.price_out_of_range_since:
+                out_duration = time.time() - self.stop_loss_engine.price_out_of_range_since
+                remaining = self.config.out_of_range_timeout_seconds - out_duration
+                progress = (out_duration / self.config.out_of_range_timeout_seconds) * 100
+
+                lines.append(f"  ⏰ 超出区间: {out_duration:.0f}s / {self.config.out_of_range_timeout_seconds}s ({progress:.0f}%)")
+                lines.append(f"  剩余时间: {max(0, remaining):.0f}s")
+
+                if remaining <= 10:
+                    lines.append(f"  ⚠️  即将触发60秒规则!")
+            else:
+                lines.append(f"  ✅ 价格在范围内")
+
+            # 显示止损配置
+            if self.open_price and current_price:
+                price_change_pct = ((current_price - self.open_price) / self.open_price) * 100
+                stop_loss_trigger = self.config.stop_loss_pct
+                distance_to_stop = float(abs(price_change_pct)) - float(stop_loss_trigger)
+
+                if price_change_pct < 0:
+                    lines.append(f"  幅度止损: {stop_loss_trigger}% (当前: {abs(price_change_pct):.2f}%, 距离: {distance_to_stop:.2f}%)")
+
+            # === 6. 再平衡状态 ===
+            lines.append(f"\n🔄 再平衡状态:")
+            lines.append(f"  今日次数: {self.rebalance_count_today}")
+            lines.append(f"  配置:")
+            lines.append(f"    阈值: {self.config.rebalance_threshold_pct}%")
+            lines.append(f"    冷却期: {self.config.rebalance_cooldown_seconds}秒")
+            lines.append(f"    最小盈利: {self.config.min_profit_for_rebalance}%")
+
+            if self.rebalance_engine and self.rebalance_engine.last_rebalance_time:
+                remaining_cooldown = self.rebalance_engine._remaining_cooldown(self.config.rebalance_cooldown_seconds)
+                if remaining_cooldown > 0:
+                    lines.append(f"  冷却中: 剩余 {remaining_cooldown:.0f}s")
+                else:
+                    lines.append(f"  状态: ✅ 就绪")
+
+            # === 7. 策略配置 ===
+            lines.append(f"\n⚙️  策略配置:")
+            lines.append(f"  交易对: {self.config.trading_pair}")
+            lines.append(f"  区间宽度: ±{self.config.price_range_pct}%")
+            lines.append(f"  60秒规则: {'✅ 启用' if self.config.enable_60s_rule else '❌ 禁用'}")
+            lines.append(f"  幅度止损: {self.config.stop_loss_pct}%")
+            lines.append(f"  检查间隔: {self.config.check_interval_seconds}秒")
+
+            # === 8. 今日统计 ===
+            lines.append(f"\n📊 今日统计:")
+            lines.append(f"  再平衡: {self.rebalance_count_today} 次")
+            lines.append(f"  止损: {self.stop_loss_count_today} 次")
+
+            # === 9. 下次检查时间 ===
             if self.last_check_time:
-                from datetime import datetime
                 next_check_seconds = self.config.check_interval_seconds - (datetime.now() - self.last_check_time).total_seconds()
                 if next_check_seconds > 0:
-                    lines.append(f"⏱️  下次检查: {next_check_seconds:.0f}秒后")
+                    lines.append(f"\n⏱️  下次检查: {next_check_seconds:.0f}秒后")
 
             lines.append("=" * 70)
             return "\n".join(lines)
-
-        lines.append("\n📊 仓位状态: 已开仓")
-        lines.append(f"仓位ID: {self.position_id[:10]}...{self.position_id[-10:] if self.position_id else ''}")
-
-        # === 3. 价格和距离信息 ===
-        current_price = Decimal(str(self.pool_info.price)) if self.pool_info else Decimal("0")
-        lower_price = Decimal(str(self.position_info.lower_price))
-        upper_price = Decimal(str(self.position_info.upper_price))
-
-        lines.append(f"\n💹 价格信息:")
-        lines.append(f"  当前价格: {current_price:.10f}")
-        lines.append(f"  价格区间: [{lower_price:.10f}, {upper_price:.10f}]")
-
-        # 计算距离边界
-        if lower_price <= current_price <= upper_price:
-            distance_to_lower_pct = ((current_price - lower_price) / lower_price) * 100
-            distance_to_upper_pct = ((upper_price - current_price) / current_price) * 100
-            lines.append(f"  状态: ✅ 在范围内")
-            lines.append(f"  距下界: +{distance_to_lower_pct:.2f}%")
-            lines.append(f"  距上界: +{distance_to_upper_pct:.2f}%")
-        elif current_price < lower_price:
-            out_pct = ((lower_price - current_price) / lower_price) * 100
-            lines.append(f"  状态: ⚠️  超出下界 {out_pct:.2f}%")
-        else:
-            out_pct = ((current_price - upper_price) / upper_price) * 100
-            lines.append(f"  状态: ⚠️  超出上界 {out_pct:.2f}%")
-
-        # === 4. 盈亏信息 ===
-        if self.open_price:
-            price_change_pct = ((current_price - self.open_price) / self.open_price) * 100
-            lines.append(f"\n📈 盈亏分析:")
-            lines.append(f"  开仓价格: {self.open_price:.10f}")
-            lines.append(f"  价格变化: {price_change_pct:+.2f}%")
-
-            # 计算当前仓位价值
-            base_amount = Decimal(str(self.position_info.base_token_amount))
-            quote_amount = Decimal(str(self.position_info.quote_token_amount))
-            current_value = (base_amount * current_price) + quote_amount
-
-            # 计算手续费
-            base_fees = Decimal(str(self.position_info.base_fee_amount))
-            quote_fees = Decimal(str(self.position_info.quote_fee_amount))
-            fees_value = (base_fees * current_price) + quote_fees
-
-            if self.initial_investment > 0:
-                # 未实现盈亏 = (当前价值 + 手续费) - 初始投资
-                unrealized_pnl = (current_value + fees_value) - self.initial_investment
-                unrealized_pnl_pct = (unrealized_pnl / self.initial_investment) * 100
-
-                pnl_icon = "📈" if unrealized_pnl > 0 else "📉"
-                lines.append(f"  {pnl_icon} 未实现盈亏: {unrealized_pnl:+.6f} {self.quote_token} ({unrealized_pnl_pct:+.2f}%)")
-                lines.append(f"  初始投资: {self.initial_investment:.6f} {self.quote_token}")
-                lines.append(f"  当前价值: {current_value:.6f} {self.quote_token}")
-                lines.append(f"  累计手续费: {fees_value:.6f} {self.quote_token}")
-
-                # 显示仓位组成
-                lines.append(f"\n  仓位组成:")
-                lines.append(f"    {self.base_token}: {base_amount:.6f}")
-                lines.append(f"    {self.quote_token}: {quote_amount:.6f}")
-
-        # === 5. 止损状态 ===
-        lines.append(f"\n🛡️  止损状态:")
-        if self.stop_loss_engine and self.stop_loss_engine.price_out_of_range_since:
-            import time
-            out_duration = time.time() - self.stop_loss_engine.price_out_of_range_since
-            remaining = self.config.out_of_range_timeout_seconds - out_duration
-            progress = (out_duration / self.config.out_of_range_timeout_seconds) * 100
-
-            lines.append(f"  ⏰ 超出区间: {out_duration:.0f}s / {self.config.out_of_range_timeout_seconds}s ({progress:.0f}%)")
-            lines.append(f"  剩余时间: {max(0, remaining):.0f}s")
-
-            if remaining <= 10:
-                lines.append(f"  ⚠️  即将触发60秒规则!")
-        else:
-            lines.append(f"  ✅ 价格在范围内")
-
-        # 显示止损配置
-        if self.open_price and current_price:
-            price_change_pct = ((current_price - self.open_price) / self.open_price) * 100
-            stop_loss_trigger = self.config.stop_loss_pct
-            distance_to_stop = float(abs(price_change_pct)) - float(stop_loss_trigger)
-
-            if price_change_pct < 0:
-                lines.append(f"  幅度止损: {stop_loss_trigger}% (当前: {abs(price_change_pct):.2f}%, 距离: {distance_to_stop:.2f}%)")
-
-        # === 6. 再平衡状态 ===
-        lines.append(f"\n🔄 再平衡状态:")
-        lines.append(f"  今日次数: {self.rebalance_count_today}")
-        lines.append(f"  配置:")
-        lines.append(f"    阈值: {self.config.rebalance_threshold_pct}%")
-        lines.append(f"    冷却期: {self.config.rebalance_cooldown_seconds}秒")
-        lines.append(f"    最小盈利: {self.config.min_profit_for_rebalance}%")
-
-        if self.rebalance_engine and self.rebalance_engine.last_rebalance_time:
-            remaining_cooldown = self.rebalance_engine._remaining_cooldown(self.config.rebalance_cooldown_seconds)
-            if remaining_cooldown > 0:
-                lines.append(f"  冷却中: 剩余 {remaining_cooldown:.0f}s")
-            else:
-                lines.append(f"  状态: ✅ 就绪")
-
-        # === 7. 策略配置 ===
-        lines.append(f"\n⚙️  策略配置:")
-        lines.append(f"  交易对: {self.config.trading_pair}")
-        lines.append(f"  区间宽度: ±{self.config.price_range_pct}%")
-        lines.append(f"  60秒规则: {'✅ 启用' if self.config.enable_60s_rule else '❌ 禁用'}")
-        lines.append(f"  幅度止损: {self.config.stop_loss_pct}%")
-        lines.append(f"  检查间隔: {self.config.check_interval_seconds}秒")
-
-        # === 8. 今日统计 ===
-        lines.append(f"\n📊 今日统计:")
-        lines.append(f"  再平衡: {self.rebalance_count_today} 次")
-        lines.append(f"  止损: {self.stop_loss_count_today} 次")
-
-        # === 9. 下次检查时间 ===
-        if self.last_check_time:
-            next_check_seconds = self.config.check_interval_seconds - (datetime.now() - self.last_check_time).total_seconds()
-            if next_check_seconds > 0:
-                lines.append(f"\n⏱️  下次检查: {next_check_seconds:.0f}秒后")
-
-        lines.append("=" * 70)
-        return "\n".join(lines)
+        except Exception as e:
+            import traceback
+            return f"❌ 状态显示错误: {str(e)}\n{traceback.format_exc()}"
 
 
 if __name__ == "__main__":
