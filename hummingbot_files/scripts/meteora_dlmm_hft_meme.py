@@ -399,6 +399,8 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
         self.open_price: Optional[Decimal] = None
         self.initial_investment: Decimal = Decimal("0")
         self.pending_open_order_id: Optional[str] = None  # 追踪开仓订单ID
+        self.pending_order_start_time: Optional[float] = None  # 订单提交时间戳
+        self.open_retry_count: int = 0  # 开仓重试计数
         self.tokens_prepared = False
 
         # 仓位信息
@@ -569,7 +571,8 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
         # 3. 状态机逻辑
         # ========================================
         if self.position_opening:
-            # 等待开仓确认
+            # 检查订单超时
+            safe_ensure_future(self.check_pending_order_timeout())
             return
         elif not self.position_opened:
             # 无仓位：开仓
@@ -581,6 +584,70 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
     # ========================================
     # 开仓逻辑（同简化版）
     # ========================================
+
+    async def check_pending_order_timeout(self):
+        """检查待处理订单是否超时"""
+        try:
+            if not self.pending_open_order_id or not self.pending_order_start_time:
+                return
+
+            # 检查订单是否超时（默认60秒）
+            timeout_seconds = 60
+            elapsed = time.time() - self.pending_order_start_time
+
+            if elapsed > timeout_seconds:
+                self.logger().warning(
+                    f"⚠️ 开仓订单超时 ({elapsed:.1f}s > {timeout_seconds}s)\n"
+                    f"   订单ID: {self.pending_open_order_id}\n"
+                    f"   尝试次数: {self.open_retry_count + 1}"
+                )
+
+                # 检查是否超过最大重试次数
+                max_retries = 3
+                if self.open_retry_count >= max_retries:
+                    self.logger().error(
+                        f"❌ 开仓失败次数过多 ({self.open_retry_count + 1}次)，暂停开仓\n"
+                        f"   请检查:\n"
+                        f"   1. 钱包是否有足够的 SOL 用于交易费用\n"
+                        f"   2. Gateway 是否正常运行\n"
+                        f"   3. RPC 节点是否稳定\n"
+                        f"   4. 代币余额是否充足"
+                    )
+                    # 重置状态但不再重试
+                    self.position_opening = False
+                    self.pending_open_order_id = None
+                    self.pending_order_start_time = None
+                    self.open_retry_count = 0
+                    return
+
+                # 尝试主动检查订单状态
+                try:
+                    # 检查是否实际已经开仓成功（可能事件丢失）
+                    await self.check_existing_positions()
+
+                    if self.position_opened:
+                        self.logger().info("✅ 检测到仓位已开启（订单事件可能丢失）")
+                        self.position_opening = False
+                        self.pending_open_order_id = None
+                        self.pending_order_start_time = None
+                        self.open_retry_count = 0
+                        return
+                except Exception as e:
+                    self.logger().debug(f"检查现有仓位失败: {e}")
+
+                # 重置状态并准备重试
+                self.position_opening = False
+                self.pending_open_order_id = None
+                self.pending_order_start_time = None
+                self.open_retry_count += 1
+
+                # 等待一段时间后重试
+                retry_delay = min(5 * self.open_retry_count, 30)  # 5秒、10秒、15秒...最多30秒
+                self.logger().info(f"🔄 将在 {retry_delay} 秒后重试开仓...")
+                await asyncio.sleep(retry_delay)
+
+        except Exception as e:
+            self.logger().error(f"检查订单超时失败: {e}", exc_info=True)
 
     async def check_and_open_position(self):
         """检查并开仓"""
@@ -880,6 +947,7 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             )
 
             self.pending_open_order_id = order_id
+            self.pending_order_start_time = time.time()  # 记录订单提交时间
             self.logger().info(f"✅ 开仓订单已提交: {order_id}，等待成交确认...")
 
             # 暂存开仓参数，等待订单成交后使用
@@ -1231,11 +1299,7 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                 trading_pair=self.config.trading_pair,
                 position_address=self.position_id  # ✅ 修复：使用 position_address 参数
             )
-            order_id = self.connector.close_position(
-                trading_pair=self.config.trading_pair,
-                position_address=self.position_id  # ✅ 修复：使用 position_address 参数
-            )
-
+        
             self.logger().info(f"关闭订单: {order_id}")
 
             self.position_opened = False
@@ -1279,8 +1343,10 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                 # 重置止损引擎
                 self.stop_loss_engine.reset()
 
-                # 清除待处理订单ID
+                # 清除待处理订单ID和时间戳
                 self.pending_open_order_id = None
+                self.pending_order_start_time = None
+                self.open_retry_count = 0  # 重置重试计数
 
                 # 异步获取仓位信息
                 safe_ensure_future(self.fetch_positions_after_fill())
@@ -1302,6 +1368,8 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                 self.logger().error(f"❌ 开仓订单失败: {order_id}")
                 self.position_opening = False
                 self.pending_open_order_id = None
+                self.pending_order_start_time = None
+                # 不重置 open_retry_count，让超时机制来处理重试
 
         except Exception as e:
             self.logger().error(f"处理订单失败事件错误: {e}", exc_info=True)
