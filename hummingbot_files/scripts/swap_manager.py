@@ -107,15 +107,23 @@ class SwapManager:
                     )
 
                 # === Step 3: 执行换币 ===
-                order_id = self.connector.sell(
-                    trading_pair=trading_pair,
+                # 直接调用 Gateway 的 execute_swap，支持 slippage_pct
+                from hummingbot.core.data_type.common import TradeType
+
+                order_result = await self.connector._get_gateway_instance().execute_swap(
+                    connector=self.connector.connector_name,
+                    base_asset=token,
+                    quote_asset="SOL",
+                    side=TradeType.SELL,  # 卖出 token
                     amount=balance,
-                    order_type=None,  # Gateway 不需要order_type
-                    price=quote_price
+                    slippage_pct=slippage_pct,  # ✅ 传递滑点参数
+                    network=self.connector.network,
+                    wallet_address=self.connector.address
                 )
 
+                transaction_hash = order_result.get("signature")
                 if self.logger:
-                    self.logger.info(f"  换币订单已提交: {order_id}")
+                    self.logger.info(f"  换币交易已提交: {transaction_hash}")
 
                 # === Step 4: 等待交易确认 ===
                 await asyncio.sleep(5)  # Solana 确认通常很快，5秒足够
@@ -227,10 +235,10 @@ class SwapManager:
                     f"  预期换得: {expected_sol:.6f} SOL"
                 )
 
-            order_id = self.connector.sell(
+            order_id = self.connector.place_order(
+                is_buy=False,  # 卖出 token，买入 SOL
                 trading_pair=trading_pair,
                 amount=amount,
-                order_type=None,
                 price=quote_price
             )
 

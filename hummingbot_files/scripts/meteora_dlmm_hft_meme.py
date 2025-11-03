@@ -464,7 +464,7 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             # 初始化换币管理器
             if self.config.enable_swap_on_downside:
                 self.swap_manager = SwapManager(
-                    connector=self.connector,
+                    connector=self.swap_connector,  # ✅ 使用 Jupiter swap connector
                     logger=self.logger()
                 )
 
@@ -1112,14 +1112,84 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             self.logger().warning(f"🛑 执行止损: {reason}")
             self.logger().warning("=" * 60)
 
+            # 1. 关闭LP仓位
             await self.close_position()
 
             self.stop_loss_count_today += 1
 
-            # 止损后冷静期：5-10 分钟
-            cooldown_minutes = 5
-            self.logger().info(f"止损冷静期：{cooldown_minutes} 分钟")
-            await asyncio.sleep(cooldown_minutes * 60)
+            # 2. 判断是否需要换币到SOL（防止继续持有下跌的meme币）
+            if self.config.enable_swap_on_downside and self.swap_manager:
+                # 检查是否满足换币条件
+                current_price = await self.get_current_price()
+
+                if current_price and self.open_price:
+                    should_swap = should_swap_to_sol(
+                        current_price=current_price,
+                        entry_price=self.open_price,
+                        reason=reason,
+                        threshold_pct=Decimal("3")  # 下跌超过3%才换
+                    )
+
+                    if should_swap:
+                        self.logger().warning(
+                            f"⚠️  下跌止损触发，准备将 {self.base_token} 换成 SOL 以避免进一步损失"
+                        )
+
+                        # 等待链上确认完成（确保余额已更新）
+                        await asyncio.sleep(3)
+                        await self.swap_connector.update_balances(on_interval=False)
+                        await asyncio.sleep(1)
+
+                        # 获取当前 base_token 余额
+                        base_balance = self.swap_connector.get_available_balance(self.base_token)
+
+                        if base_balance > 0:
+                            self.logger().info(f"  {self.base_token} 当前余额: {base_balance:.6f}")
+
+                            # 执行换币
+                            success, sol_amount, error_msg = await self.swap_manager.swap_all_to_sol(
+                                token=self.base_token,
+                                slippage_pct=self.config.swap_slippage_pct,
+                                reason="STOP_LOSS",
+                                retry_count=2
+                            )
+
+                            if success:
+                                self.logger().info(
+                                    f"✅ 成功将 {self.base_token} 换成 SOL\n"
+                                    f"  换得 SOL: {sol_amount:.6f}"
+                                )
+
+                                # 使用更长的冷却期（下跌止损）
+                                cooldown_seconds = self.config.downside_cooldown_seconds
+                            else:
+                                self.logger().error(
+                                    f"❌ 换币失败: {error_msg}\n"
+                                    f"  {self.base_token} 仍在钱包中，请手动处理"
+                                )
+                                cooldown_seconds = self.config.downside_cooldown_seconds
+                        else:
+                            self.logger().info(f"  {self.base_token} 余额为0，无需换币")
+                            cooldown_seconds = self.config.downside_cooldown_seconds
+                    else:
+                        self.logger().info(
+                            f"  价格未大幅下跌（{((current_price - self.open_price) / self.open_price * 100):+.2f}%），"
+                            f"保留 {self.base_token}"
+                        )
+                        cooldown_seconds = 60  # 短冷却期
+                else:
+                    self.logger().warning("  无法获取价格信息，跳过换币逻辑")
+                    cooldown_seconds = self.config.downside_cooldown_seconds
+            else:
+                # 未启用换币，使用短冷却期
+                cooldown_seconds = 60
+                if not self.config.enable_swap_on_downside:
+                    self.logger().info("  换币功能未启用（enable_swap_on_downside=False）")
+
+            # 3. 进入冷却期
+            cooldown_minutes = cooldown_seconds / 60
+            self.logger().info(f"止损冷静期：{cooldown_minutes:.1f} 分钟")
+            await asyncio.sleep(cooldown_seconds)
 
         except Exception as e:
             self.logger().error(f"止损失败: {e}", exc_info=True)
