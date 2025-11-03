@@ -1161,6 +1161,10 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                 trading_pair=self.config.trading_pair,
                 position_address=self.position_id  # ✅ 修复：使用 position_address 参数
             )
+            order_id = self.connector.close_position(
+                trading_pair=self.config.trading_pair,
+                position_address=self.position_id  # ✅ 修复：使用 position_address 参数
+            )
 
             self.logger().info(f"关闭订单: {order_id}")
 
