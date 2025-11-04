@@ -42,8 +42,8 @@ from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 # 导入引擎模块
-from .engines.stop_loss_engine import FastStopLossEngine
-from .engines.rebalance_engine import HighFrequencyRebalanceEngine
+from .engines.stop_loss_engine import StopLossEngine
+from .engines.rebalance_engine import RebalanceEngine
 from .engines.state_manager import StateManager
 
 # 导入工具模块
@@ -187,7 +187,7 @@ class MeteoraDlmmHftMemeConfig(BaseClientModel):
 # ========================================
 # 主策略类
 # ========================================
-# 注意：FastStopLossEngine 和 HighFrequencyRebalanceEngine 已移至 engines/ 模块
+# 注意：StopLossEngine 和 RebalanceEngine 已移至 engines/ 模块
 
 class MeteoraDlmmHftMeme(ScriptStrategyBase):
     """Meteora DLMM 高频做市策略（Meme 币专用）"""
@@ -228,10 +228,10 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
         self.pool_info: Optional[CLMMPoolInfo] = None
 
         # 止损引擎（延迟初始化，避免logger未ready）
-        self.stop_loss_engine: Optional[FastStopLossEngine] = None
+        self.stop_loss_engine: Optional[StopLossEngine] = None
 
         # 再平衡引擎（延迟初始化）
-        self.rebalance_engine: Optional[HighFrequencyRebalanceEngine] = None
+        self.rebalance_engine: Optional[RebalanceEngine] = None
 
         # ========== 新增：风控模块 ==========
         self.state_manager: Optional[StateManager] = None  # 状态持久化管理器
@@ -260,8 +260,8 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
 
         try:
             # 初始化引擎
-            self.stop_loss_engine = FastStopLossEngine(self.logger(), self.config)
-            self.rebalance_engine = HighFrequencyRebalanceEngine(self.logger())
+            self.stop_loss_engine = StopLossEngine(self.logger(), self.config)
+            self.rebalance_engine = RebalanceEngine(self.logger())
 
             # ========== 新增：初始化风控模块 ==========
             if self.config.enable_state_persistence:

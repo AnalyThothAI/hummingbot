@@ -7,12 +7,13 @@ Meteora DLMM HFT 策略引擎模块
 - state_manager: 状态持久化管理器
 """
 
-from .stop_loss_engine import FastStopLossEngine
-from .rebalance_engine import HighFrequencyRebalanceEngine
+from .stop_loss_engine import StopLossEngine
+
+from .rebalance_engine import RebalanceEngine
 from .state_manager import StateManager
 
 __all__ = [
-    "FastStopLossEngine",
-    "HighFrequencyRebalanceEngine",
+    "StopLossEngine",
+    "RebalanceEngine",
     "StateManager",
 ]
