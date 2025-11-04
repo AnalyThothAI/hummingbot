@@ -298,7 +298,7 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                     logger=self.logger()
                 )
 
-                # 检查累计亏损状态
+                # 检查累计亏损状态并恢复开仓价格
                 state = self.state_manager.get_state()
                 if state["manual_kill"]:
                     self.logger().error(
@@ -310,8 +310,13 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                 else:
                     self.logger().info(f"✅ 状态已恢复: 累计盈亏 {state['cumulative_pnl']:+.6f}")
 
+                    # 恢复开仓价格（如果存在）
+                    if state["current_entry_price"] and state["current_entry_price"] > 0:
+                        self.open_price = Decimal(str(state["current_entry_price"]))
+                        self.logger().info(f"✅ 恢复开仓价格: {self.open_price:.10f}")
+
             # 初始化换币管理器
-            if self.config.enable_swap_on_downside:
+            if self.config.enable_swap_on_stop_loss:
                 self.swap_manager = SwapManager(
                     connector=self.swap_connector,  # ✅ 使用 Jupiter swap connector
                     logger=self.logger()
@@ -375,7 +380,8 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             f"区间宽度: ±{self.config.price_range_pct}%\n"
             f"再平衡阈值: {self.config.rebalance_threshold_pct}%\n"
             f"冷却期: {self.config.rebalance_cooldown_seconds}秒\n"
-            f"60秒规则: {'启用' if self.config.enable_60s_rule else '禁用'}\n"
+            f"超出区间确认: {self.config.out_of_range_timeout_seconds}秒\n"
+            f"止损确认: {self.config.stop_loss_confirmation_seconds}秒\n"
             f"幅度止损: {self.config.stop_loss_pct}%\n"
             f"检查频率: {self.config.check_interval_seconds}秒"
         )
@@ -1016,17 +1022,23 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                     self.position_id = position_info.address
                     self.position_opened = True
 
-                    # 设置开仓价格为当前价格
-                    if self.pool_info:
+                    # 设置开仓价格（如果尚未从状态恢复）
+                    if not self.open_price and self.pool_info:
                         self.open_price = Decimal(str(self.pool_info.price))
+                        self.logger().warning(
+                            f"⚠️ 未找到历史开仓价格，使用当前价格: {self.open_price:.10f}"
+                        )
 
-                    self.logger().info(
+                    log_msg = (
                         f"✅ 发现有效仓位:\n"
                         f"   地址: {self.position_id}\n"
                         f"   Base: {base_amount:.6f}\n"
                         f"   Quote: {quote_amount:.6f}\n"
                         f"   区间: {position_info.lower_price:.10f} - {position_info.upper_price:.10f}"
                     )
+                    if self.open_price:
+                        log_msg += f"\n   开仓价格: {self.open_price:.10f}"
+                    self.logger().info(log_msg)
             else:
                 self.position_opened = False
                 self.position_id = None
@@ -1091,7 +1103,7 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             position_value = await self._calculate_position_value()
 
             # === 优先级 1: 检查快速止损 ===
-            should_stop, stop_type, stop_reason, out_duration = self.stop_loss_engine.check_stop_loss(
+            should_stop, stop_type, stop_reason = self.stop_loss_engine.check_stop_loss(
                 current_price=current_price,
                 open_price=self.open_price,
                 lower_price=lower_price,
@@ -1109,17 +1121,19 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                     # 可以根据累积收益决定是否退出
 
             # === 优先级 2: 检查高频再平衡 ===
-            # out_duration 现在从 check_stop_loss 返回，不再需要单独计算
-
             should_rebal, rebal_reason = await self.rebalance_engine.should_rebalance(
                 current_price=current_price,
                 lower_price=lower_price,
                 upper_price=upper_price,
                 accumulated_fees_value=fees_value,
                 position_value=position_value,
-                config=self.config,
-                out_duration_seconds=out_duration
+                config=self.config
             )
+
+            # 计算超出区间时长（用于日志）
+            out_duration = 0.0
+            if self.stop_loss_engine.below_range_since:
+                out_duration = time.time() - self.stop_loss_engine.below_range_since
 
             # 实时监控日志（每次都打印）
             price_change = (current_price - self.open_price) / self.open_price * Decimal("100") if self.open_price else Decimal("0")
@@ -1163,7 +1177,7 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             self.stop_loss_count_today += 1
 
             # 2. 判断是否需要换币到SOL（防止继续持有下跌的meme币）
-            if self.config.enable_swap_on_downside and self.swap_manager:
+            if self.config.enable_swap_on_stop_loss and self.swap_manager:
                 # 检查是否满足换币条件
                 current_price = await self.get_current_price()
 
@@ -1228,8 +1242,8 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             else:
                 # 未启用换币，使用短冷却期
                 cooldown_seconds = 60
-                if not self.config.enable_swap_on_downside:
-                    self.logger().info("  换币功能未启用（enable_swap_on_downside=False）")
+                if not self.config.enable_swap_on_stop_loss:
+                    self.logger().info("  换币功能未启用（enable_swap_on_stop_loss=False）")
 
             # 3. 进入冷却期
             cooldown_minutes = cooldown_seconds / 60
@@ -1316,6 +1330,15 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                     self.open_price = self._pending_open_price
                 if hasattr(self, '_pending_investment'):
                     self.initial_investment = self._pending_investment
+
+                # 记录开仓到状态管理器
+                if self.state_manager and self.open_price:
+                    # 获取仓位ID（异步获取可能还没完成，先用订单ID）
+                    temp_position_id = f"pending_{order_id[:8]}"
+                    self.state_manager.record_open(
+                        position_id=temp_position_id,
+                        entry_price=self.open_price
+                    )
 
                 # 重置止损引擎
                 self.stop_loss_engine.reset()
@@ -1448,21 +1471,21 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
 
             # 计算距离边界
             if lower_price <= current_price <= upper_price:
-                distance_to_lower_pct = ((current_price - lower_price) / lower_price) * 100
-                distance_to_upper_pct = ((upper_price - current_price) / current_price) * 100
+                distance_to_lower_pct = ((current_price - lower_price) / lower_price) * Decimal("100")
+                distance_to_upper_pct = ((upper_price - current_price) / current_price) * Decimal("100")
                 lines.append(f"  状态: ✅ 在范围内")
                 lines.append(f"  距下界: +{distance_to_lower_pct:.2f}%")
                 lines.append(f"  距上界: +{distance_to_upper_pct:.2f}%")
             elif current_price < lower_price:
-                out_pct = ((lower_price - current_price) / lower_price) * 100
+                out_pct = ((lower_price - current_price) / lower_price) * Decimal("100")
                 lines.append(f"  状态: 🔻 超出下界 -{out_pct:.2f}%")
             else:
-                out_pct = ((current_price - upper_price) / upper_price) * 100
+                out_pct = ((current_price - upper_price) / upper_price) * Decimal("100")
                 lines.append(f"  状态: 🔺 超出上界 +{out_pct:.2f}%")
 
             # === 4. 盈亏信息 ===
             if self.open_price and current_price > 0:
-                price_change_pct = ((current_price - self.open_price) / self.open_price) * 100
+                price_change_pct = ((current_price - self.open_price) / self.open_price) * Decimal("100")
                 lines.append(f"\n📈 盈亏分析:")
                 lines.append(f"  开仓价格: {self.open_price:.10f}")
 
@@ -1486,7 +1509,7 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
 
                 if self.initial_investment > 0:
                     unrealized_pnl = (current_value + fees_value) - self.initial_investment
-                    unrealized_pnl_pct = (unrealized_pnl / self.initial_investment) * 100
+                    unrealized_pnl_pct = (unrealized_pnl / self.initial_investment) * Decimal("100")
 
                     pnl_status_icon = "📈" if unrealized_pnl > 0 else "📉"
                     lines.append(f"  {pnl_status_icon} 未实现盈亏: {unrealized_pnl:+.6f} {self.quote_token} ({unrealized_pnl_pct:+.2f}%)")
@@ -1499,8 +1522,8 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
 
             # Level 1: 幅度止损（最高优先级）
             if self.open_price and current_price > 0:
-                price_change_pct = ((current_price - self.open_price) / self.open_price) * 100
-                stop_loss_threshold = -float(self.config.stop_loss_pct)
+                price_change_pct = ((current_price - self.open_price) / self.open_price) * Decimal("100")
+                stop_loss_threshold = -self.config.stop_loss_pct
                 distance_to_hard_stop = price_change_pct - stop_loss_threshold
 
                 if price_change_pct <= stop_loss_threshold:
@@ -1513,13 +1536,13 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                     else:
                         lines.append(f"    当前上涨: {price_change_pct:+.2f}% (无风险)")
 
-            # Level 2: 60秒规则
-            lines.append(f"  {'✅' if self.config.enable_60s_rule else '❌'} Level 2 - 60秒规则: {self.config.out_of_range_timeout_seconds}秒")
+            # Level 2: 超出区间确认
+            lines.append(f"  ✅ Level 2 - 超出区间确认: {self.config.out_of_range_timeout_seconds}秒")
 
-            if self.stop_loss_engine and self.stop_loss_engine.price_out_of_range_since:
-                out_duration = time.time() - self.stop_loss_engine.price_out_of_range_since
-                remaining = self.config.out_of_range_timeout_seconds - out_duration
-                progress = (out_duration / self.config.out_of_range_timeout_seconds) * 100
+            if self.stop_loss_engine and self.stop_loss_engine.below_range_since:
+                out_duration = time.time() - self.stop_loss_engine.below_range_since
+                remaining = float(self.config.out_of_range_timeout_seconds) - out_duration
+                progress = (out_duration / float(self.config.out_of_range_timeout_seconds)) * 100.0
 
                 # 判断方向
                 if current_price < lower_price:
@@ -1559,7 +1582,7 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
 
             # 换币到 SOL 的条件说明
             lines.append(f"\n💱 换币保护:")
-            if self.config.enable_swap_on_downside:
+            if self.config.enable_swap_on_stop_loss:
                 lines.append(f"  ✅ 启用 - 下跌触发硬止损时自动换成 SOL")
                 lines.append(f"  条件: 下跌 > 3% 且触发止损")
                 lines.append(f"  目的: 防止继续持有贬值的 {self.base_token}")
