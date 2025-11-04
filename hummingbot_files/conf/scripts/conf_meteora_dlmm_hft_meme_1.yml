@@ -7,11 +7,11 @@ script_file_name: meteora_dlmm_hft_meme.py
 # ========== 基础配置 ==========
 connector: meteora/clmm
 swap_connector: jupiter/router
-trading_pair: PAYAI-SOL
-pool_address: '7hMhU52uguE8T5SZjFAqDgvBeeKm3g1KfivnmTPCxtd9'
+trading_pair: ACE-SOL
+pool_address: '4osuQeRfBdtZnCtoPEH1k4vWonyXuW8uiD9bx4fbdxgi'
 
 # ========== 高频参数 ==========
-price_range_pct: '5.0'                    # 价格区间宽度 ±3%（极窄区间，适合高频）
+price_range_pct: '10.0'                    # 价格区间宽度 ±3%（极窄区间，适合高频）
 rebalance_threshold_pct: '85.0'           # 再平衡阈值 75%
 rebalance_cooldown_seconds: 180           # 再平衡冷却期 3分钟
 min_profit_for_rebalance: '2.0'           # 最小再平衡盈利 2%
@@ -24,7 +24,7 @@ stop_loss_pct: '5.0'                      # 幅度止损 5%
 # ========== 资金配置 ==========
 base_token_amount: '0.0'                  # 不指定，使用钱包余额
 quote_token_amount: '0.0'                 # 不指定，使用钱包余额
-wallet_allocation_pct: '80.0'             # 使用钱包余额的 80%
+wallet_allocation_pct: '90.0'             # 使用钱包余额的 80%
 
 # ========== Jupiter 自动换币 ==========
 enable_auto_swap: true                    # 启用自动换币（开仓前准备代币）
