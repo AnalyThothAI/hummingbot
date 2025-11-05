@@ -4,7 +4,6 @@
 职责：
 1. 价格止损检测（绝对价格 + 防插针）
 2. 区间止损检测（跌破区间下界 + 60秒规则）
-3. 时间止损检测（持仓过久未盈利）
 
 不负责：
 - 再平衡判断（交给 RebalanceEngine）
@@ -43,9 +42,6 @@ class StopLossEngine:
         self.below_stop_loss_since: Optional[float] = None  # 跌破止损价时间
         self.below_range_since: Optional[float] = None      # 跌破区间下界时间
 
-        # 持仓时间
-        self.position_opened_at: Optional[float] = None
-
     # ========================================
     # 初始化和重置
     # ========================================
@@ -64,10 +60,8 @@ class StopLossEngine:
 
         止损价格计算优先级：
         1. stop_loss_price（用户指定绝对价格）
-        2. stop_loss_below_range_pct（区间下界的百分比）
-        3. stop_loss_pct（开仓价格的百分比）
+        2. stop_loss_pct（开仓价格的百分比）
         """
-        self.position_opened_at = time.time()
         self.below_stop_loss_since = None
         self.below_range_since = None
 
@@ -225,29 +219,6 @@ class StopLossEngine:
                 self.logger.info("✅ 价格回到区间内，取消止损确认")
                 self.below_range_since = None
 
-        # === 硬止损 3: 时间止损（持仓过久 + 亏损）===
-        if self.position_opened_at is not None:
-            hold_hours = (now - self.position_opened_at) / 3600
-            max_hold_hours = float(self.config.max_position_hold_hours)
-
-            if hold_hours >= max_hold_hours:
-                price_change_pct = (current_price - open_price) / open_price * Decimal("100")
-
-                if price_change_pct < 0:
-                    # 持仓过久且亏损，硬止损
-                    return (
-                        True,
-                        "HARD_STOP",
-                        f"持仓 {hold_hours:.1f}h 超过限制（亏损 {abs(price_change_pct):.2f}%）"
-                    )
-                elif price_change_pct < 2:
-                    # 持仓过久但盈利很少，软止损（建议）
-                    return (
-                        True,
-                        "SOFT_STOP",
-                        f"持仓 {hold_hours:.1f}h 超过限制（盈利仅 {price_change_pct:.2f}%）"
-                    )
-
         # 无止损触发
         return False, "NONE", ""
 
@@ -269,7 +240,6 @@ class StopLossEngine:
                 "stop_loss_price": Decimal,
                 "below_stop_loss_duration": float,
                 "below_range_duration": float,
-                "hold_hours": float,
                 "price_change_pct": Decimal
             }
         """
@@ -288,12 +258,6 @@ class StopLossEngine:
             else 0.0
         )
 
-        hold_hours = (
-            (now - self.position_opened_at) / 3600
-            if self.position_opened_at
-            else 0.0
-        )
-
         price_change_pct = (
             (current_price - open_price) / open_price * Decimal("100")
             if open_price and open_price > 0
@@ -304,6 +268,5 @@ class StopLossEngine:
             "stop_loss_price": self.stop_loss_price,
             "below_stop_loss_duration": below_stop_loss_duration,
             "below_range_duration": below_range_duration,
-            "hold_hours": hold_hours,
             "price_change_pct": price_change_pct
         }

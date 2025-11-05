@@ -104,30 +104,46 @@ class MeteoraDlmmHftMemeConfig(BaseClientModel):
         json_schema_extra={"prompt": "中等趋势非对称比例", "prompt_on_new": False}
     )
 
-    # ========== 止损配置 ==========
+    # ========== 止损触发配置 ==========
     stop_loss_price: Optional[Decimal] = Field(
         None,
-        json_schema_extra={"prompt": "止损价格（绝对值，推荐）", "prompt_on_new": False}
-    )
-
-    stop_loss_below_range_pct: Optional[Decimal] = Field(
-        None,
-        json_schema_extra={"prompt": "止损价格（区间下界百分比）", "prompt_on_new": False}
+        json_schema_extra={
+            "prompt": "止损价格（绝对值，如 0.00004，优先级最高）",
+            "prompt_on_new": False
+        }
     )
 
     stop_loss_pct: Decimal = Field(
         Decimal("5.0"),
-        json_schema_extra={"prompt": "止损价格（开仓价百分比）", "prompt_on_new": True}
+        json_schema_extra={
+            "prompt": "止损百分比（相对开仓价，如 5.0 表示 -5%）",
+            "prompt_on_new": True
+        }
     )
 
+    stop_loss_on_out_of_range: bool = Field(
+        True,
+        json_schema_extra={
+            "prompt": "跌破LP区间下界时止损？（强烈建议 True）",
+            "prompt_on_new": False
+        }
+    )
+
+    # 防插针设置
     stop_loss_confirmation_seconds: int = Field(
         60,
-        json_schema_extra={"prompt": "防插针确认时长（秒）", "prompt_on_new": False}
+        json_schema_extra={
+            "prompt": "止损确认时长（秒，防止插针误触发）",
+            "prompt_on_new": False
+        }
     )
 
-    max_position_hold_hours: Decimal = Field(
-        Decimal("8.0"),
-        json_schema_extra={"prompt": "最长持仓时间（小时）", "prompt_on_new": False}
+    out_of_range_confirmation_seconds: int = Field(
+        60,
+        json_schema_extra={
+            "prompt": "超出区间确认时长（秒）",
+            "prompt_on_new": False
+        }
     )
 
     # ========== 再平衡配置 ==========
@@ -151,47 +167,56 @@ class MeteoraDlmmHftMemeConfig(BaseClientModel):
         json_schema_extra={"prompt": "最小再平衡盈利（%）", "prompt_on_new": False}
     )
 
-    # ========== 换币保护 ==========
-    enable_swap_on_stop_loss: bool = Field(
+    # ========== 止损执行配置（强制换SOL模式）==========
+    stop_loss_to_sol: bool = Field(
         True,
-        json_schema_extra={"prompt": "硬止损后自动换成 SOL？", "prompt_on_new": True}
+        json_schema_extra={
+            "prompt": "止损后强制换成 SOL？（推荐 True，保护本金）",
+            "prompt_on_new": True
+        }
     )
 
-    swap_threshold_pct: Decimal = Field(
-        Decimal("3.0"),
-        json_schema_extra={"prompt": "换币阈值（下跌超过此百分比才换）", "prompt_on_new": False}
-    )
-
-    swap_slippage_pct: Decimal = Field(
+    stop_loss_slippage_pct: Decimal = Field(
         Decimal("2.0"),
-        json_schema_extra={"prompt": "换币滑点容忍度（%）", "prompt_on_new": False}
+        json_schema_extra={
+            "prompt": "止损换币滑点容忍度（%）",
+            "prompt_on_new": False
+        }
     )
 
-    # ========== 资金配置 ==========
-    base_token_amount: Decimal = Field(
-        Decimal("0.0"),
-        json_schema_extra={"prompt_on_new": False}
+    # ========== 仓位大小配置（简化版：SOL 统一计价）==========
+    position_size_sol: Decimal = Field(
+        Decimal("1.0"),
+        gt=Decimal("0.1"),
+        json_schema_extra={
+            "prompt": "投入多少 SOL 做 LP（包含 gas 费，建议 >= 0.5）",
+            "prompt_on_new": True
+        }
     )
 
-    quote_token_amount: Decimal = Field(
-        Decimal("0.0"),
-        json_schema_extra={"prompt_on_new": False}
+    sol_for_gas_reserve: Decimal = Field(
+        Decimal("0.1"),
+        json_schema_extra={
+            "prompt": "预留多少 SOL 用于 gas 费（建议 0.1-0.2）",
+            "prompt_on_new": False
+        }
     )
 
-    wallet_allocation_pct: Decimal = Field(
-        Decimal("90.0"),
-        json_schema_extra={"prompt_on_new": False}
-    )
-
-    # ========== 自动换币 ==========
-    enable_auto_swap: bool = Field(
+    # ========== 开仓准备配置 ==========
+    auto_prepare_tokens: bool = Field(
         True,
-        json_schema_extra={"prompt_on_new": False}
+        json_schema_extra={
+            "prompt": "开仓前自动准备代币（50:50分配）？",
+            "prompt_on_new": False
+        }
     )
 
-    auto_swap_slippage_pct: Decimal = Field(
+    prepare_slippage_pct: Decimal = Field(
         Decimal("3.0"),
-        json_schema_extra={"prompt_on_new": False}
+        json_schema_extra={
+            "prompt": "准备代币时的滑点容忍度（%）",
+            "prompt_on_new": False
+        }
     )
 
     # ========== 状态持久化 ==========
@@ -595,7 +620,7 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
 
             self.logger().info(f"准备开仓，当前价格: {current_price}")
 
-            if self.config.enable_auto_swap and not self.tokens_prepared:
+            if self.config.auto_prepare_tokens and not self.tokens_prepared:
                 self.logger().info("检查并准备双边代币...")
                 success = await self.prepare_tokens_for_position(current_price)
                 if not success:
@@ -673,59 +698,80 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             return None
 
     async def prepare_tokens_for_position(self, current_price: Decimal) -> bool:
-        """准备代币（简化版，同之前）"""
+        """
+        准备代币 - 简化版（SOL 统一计价）
+
+        逻辑：
+        1. 计算需要多少 SOL（已在 get_token_amounts 中计算）
+        2. 50% SOL 换成 base token
+        3. 完成后，持有 50% base + 50% SOL
+        """
         try:
             self.logger().info("准备双边代币...")
 
+            # 刷新余额
             await self.swap_connector.update_balances(on_interval=False)
 
+            # 1. 获取配置的投入金额
+            required_sol = self.config.position_size_sol
+            available_sol = required_sol - self.config.sol_for_gas_reserve
+
+            # 2. 50% SOL 换成 base token
+            sol_to_swap = available_sol * Decimal("0.5")
+            base_amount_needed = sol_to_swap / current_price
+
+            self.logger().info(
+                f"📊 准备代币（SOL 统一计价）:\n"
+                f"  总投入: {required_sol} SOL\n"
+                f"  预留 gas: {self.config.sol_for_gas_reserve} SOL\n"
+                f"  可用资金: {available_sol} SOL\n"
+                f"  \n"
+                f"  换币计划:\n"
+                f"    用 {sol_to_swap:.6f} SOL\n"
+                f"    换 {base_amount_needed:.2f} {self.base_token}\n"
+                f"    当前价格: {current_price:.10f}\n"
+                f"  \n"
+                f"  最终持仓:\n"
+                f"    {self.base_token}: {base_amount_needed:.2f}\n"
+                f"    {self.quote_token}: {sol_to_swap:.6f}"
+            )
+
+            # 3. 检查当前是否已经有足够的 base token
             base_balance = self.swap_connector.get_available_balance(self.base_token)
-            quote_balance = self.swap_connector.get_available_balance(self.quote_token)
 
-            # ✅ 如果 quote_token 是 SOL，预留交易费用
-            SOL_FEE_RESERVE = Decimal("0.1")
-            effective_quote_balance = quote_balance
-
-            if self.quote_token.upper() == "SOL" or self.quote_token.upper() == "WSOL":
-                if quote_balance > SOL_FEE_RESERVE:
-                    effective_quote_balance = quote_balance - SOL_FEE_RESERVE
-                    self.logger().info(
-                        f"预留 {SOL_FEE_RESERVE} SOL 用于交易费用\n"
-                        f"  总余额: {quote_balance:.6f} SOL\n"
-                        f"  可用余额: {effective_quote_balance:.6f} SOL"
-                    )
-                else:
-                    self.logger().error(
-                        f"❌ SOL 余额不足（需要至少 {SOL_FEE_RESERVE} SOL 用于交易费用）\n"
-                        f"   当前余额: {quote_balance:.6f} SOL"
-                    )
-                    return False
-
-            actual_base_value = Decimal(str(base_balance)) * current_price
-            actual_quote_value = Decimal(str(effective_quote_balance))
-            total_value = actual_base_value + actual_quote_value
-
-            if total_value == 0:
-                self.logger().error("总余额为 0")
-                return False
-
-            target_base_amount = total_value * Decimal("0.5") / current_price
-            shortage = target_base_amount - Decimal(str(base_balance))
-
-            if abs(shortage) < Decimal("0.001"):
+            if base_balance >= base_amount_needed:
+                self.logger().info(
+                    f"✅ 已有足够的 {self.base_token}:\n"
+                    f"   当前: {base_balance:.2f}\n"
+                    f"   需要: {base_amount_needed:.2f}\n"
+                    f"   无需换币"
+                )
                 return True
 
-            if shortage > 0:
-                await self.swap_via_jupiter(
-                    self.quote_token, self.base_token,
-                    shortage * Decimal("1.02"), "BUY"
-                )
-            else:
-                await self.swap_via_jupiter(
-                    self.base_token, self.quote_token,
-                    abs(shortage) * Decimal("1.02"), "SELL"
-                )
+            # 4. 需要换币
+            shortage = base_amount_needed - base_balance
 
+            if shortage < Decimal("0.001"):
+                self.logger().info("代币数量已接近目标，无需换币")
+                return True
+
+            self.logger().info(
+                f"需要换币:\n"
+                f"  目标: {base_amount_needed:.2f} {self.base_token}\n"
+                f"  当前: {base_balance:.2f} {self.base_token}\n"
+                f"  缺少: {shortage:.2f} {self.base_token}\n"
+                f"  执行: 用 SOL 买入 {shortage * Decimal('1.02'):.2f} {self.base_token} (含 2% buffer)"
+            )
+
+            # 执行换币（加 2% buffer 以应对滑点）
+            await self.swap_via_jupiter(
+                from_token=self.quote_token,
+                to_token=self.base_token,
+                amount=shortage * Decimal("1.02"),
+                side="BUY"
+            )
+
+            self.logger().info(f"✅ 换币完成，代币准备就绪")
             return True
 
         except Exception as e:
@@ -896,86 +942,73 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
 
     async def get_token_amounts(self) -> Tuple[Decimal, Decimal]:
         """
-        获取代币数量（带详细日志和强制余额刷新）
+        获取代币数量 - 简化版（SOL 统一计价）
 
         Returns:
             (base_amount, quote_amount)
+
+        逻辑：
+        1. 检查钱包 SOL 余额是否足够
+        2. 返回需要的 quote (SOL) 数量（50%）
+        3. base token 数量返回 0（将在 prepare_tokens 中换币获得）
         """
         try:
-            # 如果配置了固定数量，直接使用
-            if self.config.base_token_amount > 0 or self.config.quote_token_amount > 0:
-                self.logger().debug(
-                    f"使用配置的固定数量:\n"
-                    f"  {self.base_token}: {self.config.base_token_amount}\n"
-                    f"  {self.quote_token}: {self.config.quote_token_amount}"
-                )
-                return self.config.base_token_amount, self.config.quote_token_amount
-
             # 强制刷新余额
-            self.logger().info("强制刷新余额...")
+            self.logger().info("检查 SOL 余额...")
             await self._refresh_balances(self.connector)
 
-            # 否则使用钱包余额的百分比
-            base_balance = self.connector.get_available_balance(self.base_token)
-            quote_balance = self.connector.get_available_balance(self.quote_token)
+            # 获取 SOL 余额
+            sol_balance = self.connector.get_available_balance(self.quote_token)
+            required_sol = self.config.position_size_sol
 
             self.logger().info(
-                f"当前钱包余额（已刷新）:\n"
-                f"  {self.base_token}: {base_balance}\n"
-                f"  {self.quote_token}: {quote_balance}"
+                f"📊 仓位大小检查:\n"
+                f"  配置投入: {required_sol} SOL\n"
+                f"  钱包余额: {sol_balance} SOL\n"
+                f"  预留 gas: {self.config.sol_for_gas_reserve} SOL"
             )
 
             # 检查余额是否足够
-            if base_balance <= 0 and quote_balance <= 0:
+            if sol_balance < required_sol:
                 self.logger().error(
-                    f"❌ 余额不足，无法开仓\n"
-                    f"   {self.base_token}: {base_balance}\n"
-                    f"   {self.quote_token}: {quote_balance}"
+                    f"❌ SOL 余额不足\n"
+                    f"   需要: {required_sol} SOL\n"
+                    f"   当前: {sol_balance} SOL\n"
+                    f"   缺少: {required_sol - sol_balance} SOL"
                 )
                 return Decimal("0"), Decimal("0")
 
-            allocation_pct = self.config.wallet_allocation_pct / Decimal("100")
+            # 计算可用 SOL（扣除 gas 预留）
+            available_sol = required_sol - self.config.sol_for_gas_reserve
 
-            allocated_base = Decimal(str(base_balance)) * allocation_pct
-            allocated_quote = Decimal(str(quote_balance)) * allocation_pct
+            if available_sol <= 0:
+                self.logger().error(
+                    f"❌ 配置错误: position_size_sol 太小\n"
+                    f"   position_size_sol: {required_sol} SOL\n"
+                    f"   sol_for_gas_reserve: {self.config.sol_for_gas_reserve} SOL\n"
+                    f"   可用资金: {available_sol} SOL (≤ 0)\n"
+                    f"   建议: 增加 position_size_sol 至少到 {self.config.sol_for_gas_reserve + Decimal('0.2')} SOL"
+                )
+                return Decimal("0"), Decimal("0")
 
-            # ✅ 关键修复：如果 quote_token 是 SOL，需要预留 SOL 用于交易费用
-            # Solana 交易费用包括：
-            # - 基础交易费（~0.000005 SOL）
-            # - 优先费（可变，通常 0.001-0.01 SOL）
-            # - Meteora 协议账户租金（~0.02-0.05 SOL）
-            # - 总共预留 0.1 SOL 以确保交易成功
-            SOL_FEE_RESERVE = Decimal("0.1")  # 预留 0.1 SOL 用于交易费用
+            # 50% 用于 quote token (SOL)
+            quote_amount = available_sol * Decimal("0.5")
 
-            if self.quote_token.upper() == "SOL" or self.quote_token.upper() == "WSOL":
-                original_quote = allocated_quote
-
-                # 从分配金额中减去预留的交易费
-                if allocated_quote > SOL_FEE_RESERVE:
-                    allocated_quote = allocated_quote - SOL_FEE_RESERVE
-                    self.logger().info(
-                        f"⚠️  检测到 quote_token 是 SOL，预留 {SOL_FEE_RESERVE} SOL 用于交易费用\n"
-                        f"  原始分配: {original_quote:.6f} SOL\n"
-                        f"  调整后: {allocated_quote:.6f} SOL\n"
-                        f"  预留费用: {SOL_FEE_RESERVE:.6f} SOL"
-                    )
-                else:
-                    self.logger().error(
-                        f"❌ SOL 余额不足以支付交易费用\n"
-                        f"   当前余额: {quote_balance:.6f} SOL\n"
-                        f"   分配金额: {allocated_quote:.6f} SOL\n"
-                        f"   需要预留: {SOL_FEE_RESERVE:.6f} SOL\n"
-                        f"   建议：增加 SOL 余额或降低 wallet_allocation_pct"
-                    )
-                    return Decimal("0"), Decimal("0")
+            # base token 暂时返回 0（将在 prepare_tokens 中通过换币获得）
+            base_amount = Decimal("0")
 
             self.logger().info(
-                f"分配 {self.config.wallet_allocation_pct}% 的余额:\n"
-                f"  {self.base_token}: {allocated_base:.6f}\n"
-                f"  {self.quote_token}: {allocated_quote:.6f}"
+                f"✅ 资金分配计划:\n"
+                f"  总投入: {required_sol} SOL\n"
+                f"  预留 gas: {self.config.sol_for_gas_reserve} SOL\n"
+                f"  可用资金: {available_sol} SOL\n"
+                f"  \n"
+                f"  开仓分配:\n"
+                f"    {self.quote_token}: {quote_amount:.6f} SOL (50%)\n"
+                f"    {self.base_token}: 稍后换币获得 (50%)"
             )
 
-            return allocated_base, allocated_quote
+            return base_amount, quote_amount
 
         except Exception as e:
             self.logger().error(f"获取代币数量失败: {e}", exc_info=True)
@@ -1165,7 +1198,13 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
         return (base_amount * current_price) + quote_amount
 
     async def execute_stop_loss(self, reason: str):
-        """执行止损"""
+        """执行止损 - 简化版（强制换SOL模式）
+
+        逻辑：
+        1. 关闭LP仓位
+        2. 如果启用 stop_loss_to_sol，强制将 base_token 全部换成 SOL
+        3. 进入固定冷却期（3分钟）
+        """
         try:
             self.logger().warning("=" * 60)
             self.logger().warning(f"🛑 执行止损: {reason}")
@@ -1173,85 +1212,61 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
 
             # 1. 关闭LP仓位
             await self.close_position()
-
             self.stop_loss_count_today += 1
 
-            # 2. 判断是否需要换币到SOL（防止继续持有下跌的meme币）
-            if self.config.enable_swap_on_stop_loss and self.swap_manager:
-                # 检查是否满足换币条件
-                current_price = await self.get_current_price()
-
-                if current_price and self.open_price:
-                    should_swap = should_swap_to_sol(
-                        current_price=current_price,
-                        entry_price=self.open_price,
-                        reason=reason,
-                        threshold_pct=Decimal("3")  # 下跌超过3%才换
+            # 2. 强制换币到SOL（保护本金，防止继续下跌）
+            if self.config.stop_loss_to_sol:
+                if not self.swap_manager:
+                    self.logger().error("❌ SwapManager 未初始化，无法换币")
+                else:
+                    self.logger().warning(
+                        f"⚠️  止损触发，强制将 {self.base_token} 换成 SOL 以保护本金"
                     )
 
-                    if should_swap:
-                        self.logger().warning(
-                            f"⚠️  下跌止损触发，准备将 {self.base_token} 换成 SOL 以避免进一步损失"
+                    # 等待链上确认完成（确保余额已更新）
+                    await asyncio.sleep(3)
+                    await self.swap_connector.update_balances(on_interval=False)
+                    await asyncio.sleep(1)
+
+                    # 获取当前 base_token 余额
+                    base_balance = self.swap_connector.get_available_balance(self.base_token)
+
+                    if base_balance > 0:
+                        self.logger().info(f"  {self.base_token} 当前余额: {base_balance:.6f}")
+
+                        # 执行换币
+                        success, sol_amount, error_msg = await self.swap_manager.swap_all_to_sol(
+                            token=self.base_token,
+                            slippage_pct=self.config.stop_loss_slippage_pct,
+                            reason="STOP_LOSS",
+                            retry_count=2
                         )
 
-                        # 等待链上确认完成（确保余额已更新）
-                        await asyncio.sleep(3)
-                        await self.swap_connector.update_balances(on_interval=False)
-                        await asyncio.sleep(1)
-
-                        # 获取当前 base_token 余额
-                        base_balance = self.swap_connector.get_available_balance(self.base_token)
-
-                        if base_balance > 0:
-                            self.logger().info(f"  {self.base_token} 当前余额: {base_balance:.6f}")
-
-                            # 执行换币
-                            success, sol_amount, error_msg = await self.swap_manager.swap_all_to_sol(
-                                token=self.base_token,
-                                slippage_pct=self.config.swap_slippage_pct,
-                                reason="STOP_LOSS",
-                                retry_count=2
+                        if success:
+                            self.logger().info(
+                                f"✅ 成功将 {self.base_token} 换成 SOL\n"
+                                f"  换得 SOL: {sol_amount:.6f}"
                             )
-
-                            if success:
-                                self.logger().info(
-                                    f"✅ 成功将 {self.base_token} 换成 SOL\n"
-                                    f"  换得 SOL: {sol_amount:.6f}"
-                                )
-
-                                # 使用更长的冷却期（下跌止损）
-                                cooldown_seconds = self.config.downside_cooldown_seconds
-                            else:
-                                self.logger().error(
-                                    f"❌ 换币失败: {error_msg}\n"
-                                    f"  {self.base_token} 仍在钱包中，请手动处理"
-                                )
-                                cooldown_seconds = self.config.downside_cooldown_seconds
                         else:
-                            self.logger().info(f"  {self.base_token} 余额为0，无需换币")
-                            cooldown_seconds = self.config.downside_cooldown_seconds
+                            self.logger().error(
+                                f"❌ 换币失败: {error_msg}\n"
+                                f"  {self.base_token} 仍在钱包中，请手动处理"
+                            )
                     else:
-                        self.logger().info(
-                            f"  价格未大幅下跌（{((current_price - self.open_price) / self.open_price * 100):+.2f}%），"
-                            f"保留 {self.base_token}"
-                        )
-                        cooldown_seconds = 60  # 短冷却期
-                else:
-                    self.logger().warning("  无法获取价格信息，跳过换币逻辑")
-                    cooldown_seconds = self.config.downside_cooldown_seconds
+                        self.logger().info(f"  {self.base_token} 余额为0，无需换币")
             else:
-                # 未启用换币，使用短冷却期
-                cooldown_seconds = 60
-                if not self.config.enable_swap_on_stop_loss:
-                    self.logger().info("  换币功能未启用（enable_swap_on_stop_loss=False）")
+                self.logger().warning(
+                    f"⚠️  换币功能已禁用（stop_loss_to_sol=False），"
+                    f"持有 {self.base_token}（风险自负）"
+                )
 
-            # 3. 进入冷却期
-            cooldown_minutes = cooldown_seconds / 60
-            self.logger().info(f"止损冷静期：{cooldown_minutes:.1f} 分钟")
+            # 3. 进入固定冷却期（3分钟）
+            cooldown_seconds = 180
+            self.logger().info(f"💤 止损冷却期: {cooldown_seconds / 60:.1f} 分钟")
             await asyncio.sleep(cooldown_seconds)
 
         except Exception as e:
-            self.logger().error(f"止损失败: {e}", exc_info=True)
+            self.logger().error(f"执行止损失败: {e}", exc_info=True)
 
     async def execute_high_frequency_rebalance(self, current_price: Decimal):
         """执行高频再平衡"""

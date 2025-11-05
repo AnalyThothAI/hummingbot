@@ -1,29 +1,54 @@
+
+# Meteora DLMM 高频做市策略配置 - 简化版（SOL 统一计价）
+
+# ========== 基础配置 ==========
 script_file_name: meteora_dlmm_hft_meme_v2.py
 connector: meteora/clmm
 swap_connector: jupiter/router
 trading_pair: ACE-SOL
 pool_address: '4osuQeRfBdtZnCtoPEH1k4vWonyXuW8uiD9bx4fbdxgi'
-price_range_pct: '10.0'
-enable_asymmetric_range: true
-asymmetric_ratio_strong: '3.0'
-asymmetric_ratio_medium: '2.0'
-stop_loss_price: 0.000032
-stop_loss_below_range_pct: null
-stop_loss_pct: '5.0'
-stop_loss_confirmation_seconds: 60
-max_position_hold_hours: '8.0'
-rebalance_threshold_pct: '85.0'
-rebalance_cooldown_seconds: 180
-out_of_range_timeout_seconds: 60
-min_profit_for_rebalance: '2.0'
-enable_swap_on_stop_loss: true
-swap_threshold_pct: '3.0'
-swap_slippage_pct: '2.0'
-base_token_amount: '0.0'
-quote_token_amount: '0.0'
-wallet_allocation_pct: '90.0'
-enable_auto_swap: true
-auto_swap_slippage_pct: '3.0'
-enable_state_persistence: true
-state_db_path: data/meteora_hft_state.db
-check_interval_seconds: 20
+
+# ========== 仓位大小配置（新：极简版）==========
+position_size_sol: '0.3'      # 投入 1 SOL 做 LP（清晰明确！）
+sol_for_gas_reserve: '0.1'   # 预留 0.1 SOL 用于 gas
+
+# 说明：
+# - 总共需要: 1.0 SOL
+# - 实际用于 LP: 0.9 SOL（1.0 - 0.1）
+# - 分配方式: 0.45 SOL + 换成 0.45 SOL 等值的 ACE
+# - 最终仓位价值约: 0.9 SOL
+
+# ========== 区间配置 ==========
+price_range_pct: '10.0'              # ±10% 区间宽度
+
+# 非对称区间（可选，适合趋势行情）
+enable_asymmetric_range: false        # 暂不启用
+asymmetric_ratio_strong: '3.0'       # 强趋势 3:1
+asymmetric_ratio_medium: '2.0'       # 中等趋势 2:1
+
+# ========== 止损触发配置 ==========
+stop_loss_price: null                       # 绝对止损价格（如 0.00004）
+stop_loss_pct: '5.0'                       # 开仓价止损 -5%
+stop_loss_on_out_of_range: true            # 超出区间即止损
+stop_loss_confirmation_seconds: 60         # 60秒防插针
+out_of_range_confirmation_seconds: 60      # 超出区间确认 60 秒
+
+# ========== 止损执行配置（强制换SOL模式）==========
+stop_loss_to_sol: true                     # 止损后强制换成 SOL
+stop_loss_slippage_pct: '2.0'              # 换币滑点 2%
+
+# ========== 再平衡配置 ==========
+rebalance_threshold_pct: '85.0'            # 距上界 < 15% 时再平衡
+rebalance_cooldown_seconds: 180            # 冷却期 3 分钟
+min_profit_for_rebalance: '2.0'            # 手续费达标阈值 2%
+
+# ========== 开仓准备配置 ==========
+auto_prepare_tokens: true                  # 启用自动换币准备
+prepare_slippage_pct: '2.0'                # 准备代币滑点容忍 3%
+
+# ========== 状态持久化 ==========
+enable_state_persistence: true             # 启用状态保存
+state_db_path: data/meteora_hft_state.db   # 数据库路径
+
+# ========== 监控配置 ==========
+check_interval_seconds: 20                 # 检查间隔 20 秒
