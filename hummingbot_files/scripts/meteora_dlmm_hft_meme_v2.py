@@ -265,7 +265,6 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
         self.pending_open_order_id: Optional[str] = None  # 追踪开仓订单ID
         self.pending_order_start_time: Optional[float] = None  # 订单提交时间戳
         self.open_retry_count: int = 0  # 开仓重试计数
-        self.tokens_prepared = False
 
         # 仓位信息
         self.position_id: Optional[str] = None
@@ -612,14 +611,12 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
 
             self.logger().info(f"准备开仓，当前价格: {current_price}")
 
-            # 开仓前必须准备双边代币（简化逻辑，不再可选）
-            if not self.tokens_prepared:
-                self.logger().info("检查并准备双边代币...")
-                success = await self.prepare_tokens_for_position(current_price)
-                if not success:
-                    self.logger().warning("代币准备失败，跳过本次开仓")
-                    return
-                self.tokens_prepared = True
+            # 开仓前必须准备双边代币（统一逻辑：每次都检查）
+            self.logger().info("检查并准备双边代币...")
+            success = await self.prepare_tokens_for_position(current_price)
+            if not success:
+                self.logger().error("❌ 代币准备失败，跳过本次开仓")
+                return
 
             await self.open_position(current_price)
 
@@ -1330,13 +1327,22 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             # 1. 关闭旧仓位
             await self.close_position()
 
-            # 2. 等待
+            # 2. 等待链上确认
             await asyncio.sleep(3)
 
-            # 3. 在新价格立即开仓（紧跟价格）
+            # 3. 重新平衡代币（关键！）
+            # 移除流动性后，代币比例可能是 80% ACE + 20% SOL
+            # 需要重新换成 50:50 才能按配置开仓
+            self.logger().info("准备代币（再平衡后需要重新分配）...")
+            success = await self.prepare_tokens_for_position(current_price)
+            if not success:
+                self.logger().error("❌ 再平衡后代币准备失败")
+                return
+
+            # 4. 在新价格立即开仓（紧跟价格）
             await self.open_position(current_price)
 
-            # 4. 标记执行
+            # 5. 标记执行
             self.rebalance_engine.mark_rebalance_executed()
             self.rebalance_count_today += 1
 
@@ -1363,7 +1369,6 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             self.position_opened = False
             self.position_id = None
             self.position_info = None
-            self.tokens_prepared = False  # 重置token准备标志
             self.position_info_last_update = None  # 重置仓位信息更新时间
             self.open_price = None  # 重置开仓价格
             self.initial_investment = Decimal("0")  # 重置初始投资
