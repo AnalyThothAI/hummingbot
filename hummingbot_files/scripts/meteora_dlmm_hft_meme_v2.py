@@ -189,16 +189,8 @@ class MeteoraDlmmHftMemeConfig(BaseClientModel):
         Decimal("1.0"),
         gt=Decimal("0.1"),
         json_schema_extra={
-            "prompt": "投入多少 SOL 做 LP（包含 gas 费，建议 >= 0.5）",
+            "prompt": "投入多少 SOL 做 LP（建议 >= 0.2）",
             "prompt_on_new": True
-        }
-    )
-
-    sol_for_gas_reserve: Decimal = Field(
-        Decimal("0.1"),
-        json_schema_extra={
-            "prompt": "预留多少 SOL 用于 gas 费（建议 0.1-0.2）",
-            "prompt_on_new": False
         }
     )
 
@@ -341,7 +333,7 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                         self.logger().info(f"✅ 恢复开仓价格: {self.open_price:.10f}")
 
             # 初始化换币管理器
-            if self.config.enable_swap_on_stop_loss:
+            if self.config.stop_loss_to_sol:
                 self.swap_manager = SwapManager(
                     connector=self.swap_connector,  # ✅ 使用 Jupiter swap connector
                     logger=self.logger()
@@ -620,7 +612,8 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
 
             self.logger().info(f"准备开仓，当前价格: {current_price}")
 
-            if self.config.auto_prepare_tokens and not self.tokens_prepared:
+            # 开仓前必须准备双边代币（简化逻辑，不再可选）
+            if not self.tokens_prepared:
                 self.logger().info("检查并准备双边代币...")
                 success = await self.prepare_tokens_for_position(current_price)
                 if not success:
@@ -712,19 +705,16 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             # 刷新余额
             await self.swap_connector.update_balances(on_interval=False)
 
-            # 1. 获取配置的投入金额
-            required_sol = self.config.position_size_sol
-            available_sol = required_sol - self.config.sol_for_gas_reserve
+            # 1. 获取配置的投入金额（不再预留 gas，用户配置多少就是多少）
+            total_sol = self.config.position_size_sol
 
             # 2. 50% SOL 换成 base token
-            sol_to_swap = available_sol * Decimal("0.5")
+            sol_to_swap = total_sol * Decimal("0.5")
             base_amount_needed = sol_to_swap / current_price
 
             self.logger().info(
                 f"📊 准备代币（SOL 统一计价）:\n"
-                f"  总投入: {required_sol} SOL\n"
-                f"  预留 gas: {self.config.sol_for_gas_reserve} SOL\n"
-                f"  可用资金: {available_sol} SOL\n"
+                f"  总投入: {total_sol} SOL\n"
                 f"  \n"
                 f"  换币计划:\n"
                 f"    用 {sol_to_swap:.6f} SOL\n"
@@ -948,120 +938,162 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
             (base_amount, quote_amount)
 
         逻辑：
-        1. 检查钱包 SOL 余额是否足够
-        2. 返回需要的 quote (SOL) 数量（50%）
-        3. base token 数量返回 0（将在 prepare_tokens 中换币获得）
+        1. 根据配置计算目标投入数量（严格按配置）
+        2. 验证钱包余额是否足够
+        3. 返回目标数量（确保投入金额准确）
+
+        注意：
+        - 必须在 prepare_tokens_for_position() 之后调用
+        - 返回的是目标数量，不是全部钱包余额
+        - 确保实际投入 = 配置金额
         """
         try:
-            # 强制刷新余额
-            self.logger().info("检查 SOL 余额...")
+            # 刷新余额
+            self.logger().info("读取钱包余额...")
             await self._refresh_balances(self.connector)
 
-            # 获取 SOL 余额
-            sol_balance = self.connector.get_available_balance(self.quote_token)
-            required_sol = self.config.position_size_sol
+            # 获取实际余额
+            base_balance = self.connector.get_available_balance(self.base_token)
+            quote_balance = self.connector.get_available_balance(self.quote_token)
 
-            self.logger().info(
-                f"📊 仓位大小检查:\n"
-                f"  配置投入: {required_sol} SOL\n"
-                f"  钱包余额: {sol_balance} SOL\n"
-                f"  预留 gas: {self.config.sol_for_gas_reserve} SOL"
-            )
+            # 计算目标数量（严格按配置）
+            total_sol = self.config.position_size_sol
+            target_quote = total_sol * Decimal("0.5")
 
-            # 检查余额是否足够
-            if sol_balance < required_sol:
-                self.logger().error(
-                    f"❌ SOL 余额不足\n"
-                    f"   需要: {required_sol} SOL\n"
-                    f"   当前: {sol_balance} SOL\n"
-                    f"   缺少: {required_sol - sol_balance} SOL"
-                )
+            # 获取当前价格计算目标 base 数量
+            current_price = await self.get_current_price()
+            if not current_price:
+                self.logger().error("无法获取当前价格")
                 return Decimal("0"), Decimal("0")
 
-            # 计算可用 SOL（扣除 gas 预留）
-            available_sol = required_sol - self.config.sol_for_gas_reserve
-
-            if available_sol <= 0:
-                self.logger().error(
-                    f"❌ 配置错误: position_size_sol 太小\n"
-                    f"   position_size_sol: {required_sol} SOL\n"
-                    f"   sol_for_gas_reserve: {self.config.sol_for_gas_reserve} SOL\n"
-                    f"   可用资金: {available_sol} SOL (≤ 0)\n"
-                    f"   建议: 增加 position_size_sol 至少到 {self.config.sol_for_gas_reserve + Decimal('0.2')} SOL"
-                )
-                return Decimal("0"), Decimal("0")
-
-            # 50% 用于 quote token (SOL)
-            quote_amount = available_sol * Decimal("0.5")
-
-            # base token 暂时返回 0（将在 prepare_tokens 中通过换币获得）
-            base_amount = Decimal("0")
+            target_base = target_quote / current_price
 
             self.logger().info(
-                f"✅ 资金分配计划:\n"
-                f"  总投入: {required_sol} SOL\n"
-                f"  预留 gas: {self.config.sol_for_gas_reserve} SOL\n"
-                f"  可用资金: {available_sol} SOL\n"
+                f"📊 余额检查:\n"
+                f"  钱包余额:\n"
+                f"    {self.base_token}: {base_balance:.6f}\n"
+                f"    {self.quote_token}: {quote_balance:.6f}\n"
                 f"  \n"
-                f"  开仓分配:\n"
-                f"    {self.quote_token}: {quote_amount:.6f} SOL (50%)\n"
-                f"    {self.base_token}: 稍后换币获得 (50%)"
+                f"  目标开仓数量（按配置 {total_sol} SOL）:\n"
+                f"    {self.base_token}: {target_base:.6f}\n"
+                f"    {self.quote_token}: {target_quote:.6f}"
             )
 
-            return base_amount, quote_amount
+            # 验证余额是否足够
+            if base_balance < target_base:
+                self.logger().error(
+                    f"❌ {self.base_token} 余额不足\n"
+                    f"   需要: {target_base:.6f}\n"
+                    f"   实际: {base_balance:.6f}\n"
+                    f"   缺少: {target_base - base_balance:.6f}"
+                )
+                return Decimal("0"), Decimal("0")
+
+            if quote_balance < target_quote:
+                self.logger().error(
+                    f"❌ {self.quote_token} 余额不足\n"
+                    f"   需要: {target_quote:.6f}\n"
+                    f"   实际: {quote_balance:.6f}\n"
+                    f"   缺少: {target_quote - quote_balance:.6f}"
+                )
+                return Decimal("0"), Decimal("0")
+
+            # 返回目标数量（严格按配置，不使用全部余额）
+            self.logger().info(
+                f"✅ 开仓数量（严格按配置）:\n"
+                f"  {self.base_token}: {target_base:.6f}\n"
+                f"  {self.quote_token}: {target_quote:.6f}\n"
+                f"  总价值: {total_sol:.6f} SOL"
+            )
+
+            return target_base, target_quote
 
         except Exception as e:
             self.logger().error(f"获取代币数量失败: {e}", exc_info=True)
             return Decimal("0"), Decimal("0")
 
     async def check_existing_positions(self):
-        """检查现有仓位"""
+        """检查现有仓位（带重试机制）"""
         try:
             pool_address = await self.get_pool_address()
             if not pool_address:
                 self.logger().warning("无法获取池子地址")
                 return
 
-            # 尝试获取仓位，先尝试传 pool_address 过滤
-            try:
-                positions = await self.connector.get_user_positions(pool_address=pool_address)
-            except Exception as e:
-                # 如果失败，尝试不传 pool_address（获取所有仓位）
-                self.logger().warning(f"使用 pool_address 获取仓位失败，尝试获取所有仓位: {e}")
-                positions = await self.connector.get_user_positions()
+            # 重试机制：最多重试 3 次
+            positions = None
+            for attempt in range(3):
+                try:
+                    positions = await self.connector.get_user_positions(pool_address=pool_address)
+                    self.logger().debug(
+                        f"获取仓位成功（按 pool_address，尝试 {attempt + 1}/3）: "
+                        f"{len(positions) if positions else 0} 个"
+                    )
+
+                    # 如果返回了数据（即使是空列表），就跳出重试
+                    if positions is not None:
+                        break
+
+                except Exception as e:
+                    if attempt < 2:  # 不是最后一次尝试
+                        self.logger().debug(f"获取仓位失败（尝试 {attempt + 1}/3）: {e}")
+                        await asyncio.sleep(0.5)  # 等待 0.5 秒后重试
+                    else:
+                        # 最后一次尝试失败，尝试不传 pool_address
+                        self.logger().warning(f"使用 pool_address 获取仓位失败，尝试获取所有仓位: {e}")
+                        try:
+                            positions = await self.connector.get_user_positions()
+                            self.logger().debug(f"获取仓位成功（全部）: {len(positions) if positions else 0} 个")
+                        except Exception as e2:
+                            self.logger().error(f"获取所有仓位也失败: {e2}")
+                            positions = None
 
             if positions and len(positions) > 0:
-                position_info = positions[0]
+                # 过滤出有效仓位（流动性 > 0）
+                valid_positions = []
+                for pos in positions:
+                    base_amt = Decimal(str(pos.base_token_amount))
+                    quote_amt = Decimal(str(pos.quote_token_amount))
+                    if base_amt > Decimal("0.000001") or quote_amt > Decimal("0.000001"):
+                        valid_positions.append(pos)
 
-                # ✅ 关键修复：检查仓位是否实际有流动性
-                base_amount = Decimal(str(position_info.base_token_amount))
-                quote_amount = Decimal(str(position_info.quote_token_amount))
-
-                # 仓位存在但流动性为 0，视为已关闭
-                if base_amount <= Decimal("0.000001") and quote_amount <= Decimal("0.000001"):
-                    self.logger().warning(
-                        f"⚠️ 发现空仓位（已关闭）:\n"
-                        f"   地址: {position_info.address}\n"
-                        f"   Base: {base_amount}\n"
-                        f"   Quote: {quote_amount}\n"
-                        f"   视为无仓位状态"
-                    )
+                if not valid_positions:
+                    self.logger().info(f"发现 {len(positions)} 个仓位，但都已关闭（流动性为0）")
                     self.position_opened = False
                     self.position_id = None
                     self.position_info = None
-                else:
-                    # 仓位有效
-                    self.position_info = position_info
-                    self.position_id = position_info.address
-                    self.position_opened = True
+                    return
 
-                    # 设置开仓价格（如果尚未从状态恢复）
-                    if not self.open_price and self.pool_info:
-                        self.open_price = Decimal(str(self.pool_info.price))
+                # 选择仓位：优先使用已记录的 position_id，否则取第一个
+                if self.position_id:
+                    position_info = next((p for p in valid_positions if p.address == self.position_id), None)
+                    if not position_info:
                         self.logger().warning(
-                            f"⚠️ 未找到历史开仓价格，使用当前价格: {self.open_price:.10f}"
+                            f"⚠️ 已记录的仓位 {self.position_id} 未找到，使用第一个有效仓位"
                         )
+                        position_info = valid_positions[0]
+                else:
+                    position_info = valid_positions[0]
 
+                # 检查仓位是否实际有流动性
+                base_amount = Decimal(str(position_info.base_token_amount))
+                quote_amount = Decimal(str(position_info.quote_token_amount))
+
+                # 仓位有效
+                self.position_info = position_info
+                self.position_id = position_info.address
+                self.position_opened = True
+
+                # 设置开仓价格（如果尚未从状态恢复）
+                if not self.open_price and self.pool_info:
+                    self.open_price = Decimal(str(self.pool_info.price))
+                    self.logger().warning(
+                        f"⚠️ 未找到历史开仓价格，使用当前价格: {self.open_price:.10f}"
+                    )
+
+                # 只在状态变化时打印详细信息（避免重复日志）
+                if not self.position_opened or self.position_id != position_info.address:
+                    # 新发现仓位或仓位变化
                     log_msg = (
                         f"✅ 发现有效仓位:\n"
                         f"   地址: {self.position_id}\n"
@@ -1069,17 +1101,37 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                         f"   Quote: {quote_amount:.6f}\n"
                         f"   区间: {position_info.lower_price:.10f} - {position_info.upper_price:.10f}"
                     )
+                    if len(valid_positions) > 1:
+                        log_msg += f"\n   （共 {len(valid_positions)} 个有效仓位）"
                     if self.open_price:
                         log_msg += f"\n   开仓价格: {self.open_price:.10f}"
                     self.logger().info(log_msg)
+                else:
+                    # 仓位未变化，只在 debug 级别记录
+                    self.logger().debug(
+                        f"仓位状态确认: {self.position_id} "
+                        f"(Base: {base_amount:.2f}, Quote: {quote_amount:.6f})"
+                    )
             else:
-                self.position_opened = False
-                self.position_id = None
-                self.position_info = None
-                self.logger().info("未发现现有仓位")
+                # 返回 0 个仓位：可能是真的没有，也可能是接口暂时失败
+                if self.position_opened and self.position_id:
+                    # 上次有仓位，这次返回 0 个 → 可能是接口不稳定
+                    self.logger().warning(
+                        f"⚠️ 接口返回 0 个仓位，但上次有仓位 {self.position_id}\n"
+                        f"   可能是接口暂时失败，保持上次状态\n"
+                        f"   如果仓位确实关闭，下次检查会更新"
+                    )
+                    # 保持上次的状态，不修改
+                else:
+                    # 上次也没仓位，确实是空的
+                    self.position_opened = False
+                    self.position_id = None
+                    self.position_info = None
+                    self.logger().info(f"未发现现有仓位（返回 {len(positions) if positions else 0} 个仓位）")
         except Exception as e:
-            self.logger().error(f"检查仓位失败: {e}", exc_info=True)
-            # 不重新抛出异常，让调用者自行处理
+            self.logger().error(f"检查仓位失败（异常）: {e}", exc_info=True)
+            # 不修改状态，保持上次的值
+            # 这样可以避免因为临时网络问题导致误判
 
     # ========================================
     # 高频监控和止损逻辑（核心）
@@ -1596,12 +1648,11 @@ class MeteoraDlmmHftMeme(ScriptStrategyBase):
                     lines.append(f"  ✅ Level 3 - 持仓时长: {hold_hours:.1f}h / {max_hold_hours:.1f}h (剩余: {remaining_hours:.1f}h)")
 
             # 换币到 SOL 的条件说明
-            lines.append(f"\n💱 换币保护:")
-            if self.config.enable_swap_on_stop_loss:
-                lines.append(f"  ✅ 启用 - 下跌触发硬止损时自动换成 SOL")
-                lines.append(f"  条件: 下跌 > 3% 且触发止损")
-                lines.append(f"  目的: 防止继续持有贬值的 {self.base_token}")
-                lines.append(f"  滑点容忍: {self.config.swap_slippage_pct}%")
+            lines.append(f"\n💱 止损换币:")
+            if self.config.stop_loss_to_sol:
+                lines.append(f"  ✅ 启用 - 止损触发时强制换成 SOL")
+                lines.append(f"  目的: 保护本金，防止继续持有贬值的 {self.base_token}")
+                lines.append(f"  滑点容忍: {self.config.stop_loss_slippage_pct}%")
             else:
                 lines.append(f"  ❌ 未启用 - 止损后保留 {self.base_token}")
 

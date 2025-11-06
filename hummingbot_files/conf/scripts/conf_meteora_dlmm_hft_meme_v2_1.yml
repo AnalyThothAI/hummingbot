@@ -8,18 +8,16 @@ swap_connector: jupiter/router
 trading_pair: ACE-SOL
 pool_address: '4osuQeRfBdtZnCtoPEH1k4vWonyXuW8uiD9bx4fbdxgi'
 
-# ========== 仓位大小配置（新：极简版）==========
-position_size_sol: '0.3'      # 投入 1 SOL 做 LP（清晰明确！）
-sol_for_gas_reserve: '0.1'   # 预留 0.1 SOL 用于 gas
+# ========== 仓位大小配置（极简版）==========
+position_size_sol: '0.6'      # 投入 0.3 SOL 做 LP
 
 # 说明：
-# - 总共需要: 1.0 SOL
-# - 实际用于 LP: 0.9 SOL（1.0 - 0.1）
-# - 分配方式: 0.45 SOL + 换成 0.45 SOL 等值的 ACE
-# - 最终仓位价值约: 0.9 SOL
+# - 配置多少就投入多少（不再预留 gas）
+# - 分配方式: 50% SOL + 50% SOL 等值的 ACE
+# - 例如: 0.3 SOL → 0.15 SOL + 0.15 SOL 换成的 ACE
 
 # ========== 区间配置 ==========
-price_range_pct: '10.0'              # ±10% 区间宽度
+price_range_pct: '4'              # ±10% 区间宽度
 
 # 非对称区间（可选，适合趋势行情）
 enable_asymmetric_range: false        # 暂不启用
@@ -51,4 +49,4 @@ enable_state_persistence: true             # 启用状态保存
 state_db_path: data/meteora_hft_state.db   # 数据库路径
 
 # ========== 监控配置 ==========
-check_interval_seconds: 20                 # 检查间隔 20 秒
+check_interval_seconds: 50                 # 检查间隔 50 秒
