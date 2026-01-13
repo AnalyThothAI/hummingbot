@@ -97,6 +97,7 @@ class LpPositionManager(ScriptStrategyBase):
         ])
 
         # State tracking
+        self.pool_address: Optional[str] = None  # Cached pool address (doesn't change)
         self.pool_info: Optional[CLMMPoolInfo] = None
         self.position_info: Optional[CLMMPositionInfo] = None
         self.current_position_id: Optional[str] = None
@@ -110,6 +111,10 @@ class LpPositionManager(ScriptStrategyBase):
 
         # Rebalance tracking
         self._closed_position_balances: Optional[Dict] = None
+
+        # Update throttling
+        self._last_position_update_time: float = 0
+        self._position_update_interval: int = 10  # Update position info every 10 seconds
 
         # Log startup information
         self.log_with_clock(logging.INFO,
@@ -195,13 +200,14 @@ class LpPositionManager(ScriptStrategyBase):
 
             connector = self.connectors[self.exchange]
 
-            # Get pool address from trading pair
-            pool_address = await connector.get_pool_address(self.trading_pair)
-            if not pool_address:
-                self.logger().error(f"Pool address not found for {self.trading_pair}. Please add pool via 'gateway pool' command first")
-                return False
+            # Get pool address from trading pair (cache it for reuse)
+            if not self.pool_address:
+                self.pool_address = await connector.get_pool_address(self.trading_pair)
+                if not self.pool_address:
+                    self.logger().error(f"Pool address not found for {self.trading_pair}. Please add pool via 'gateway pool' command first")
+                    return False
 
-            positions = await connector.get_user_positions(pool_address=pool_address)
+            positions = await connector.get_user_positions(pool_address=self.pool_address)
 
             if positions and len(positions) > 0:
                 # Use the first position found
@@ -290,8 +296,13 @@ class LpPositionManager(ScriptStrategyBase):
             return
 
         try:
-            # Update position and pool info
-            await self.update_position_info()
+            # Throttle position info updates to reduce unnecessary fetches
+            current_time = time.time()
+            if current_time - self._last_position_update_time >= self._position_update_interval:
+                await self.update_position_info()
+                self._last_position_update_time = current_time
+
+            # Always fetch pool info for current price
             await self.fetch_pool_info()
 
             if not self.pool_info or not self.position_info:
@@ -470,13 +481,14 @@ class LpPositionManager(ScriptStrategyBase):
 
             connector = self.connectors[self.exchange]
 
-            # Get pool address from trading pair
-            pool_address = await connector.get_pool_address(self.trading_pair)
-            if not pool_address:
-                self.logger().error(f"Pool address not found for {self.trading_pair}")
-                return
+            # Use cached pool address (already fetched during initialization)
+            if not self.pool_address:
+                self.pool_address = await connector.get_pool_address(self.trading_pair)
+                if not self.pool_address:
+                    self.logger().error(f"Pool address not found for {self.trading_pair}")
+                    return
 
-            positions = await connector.get_user_positions(pool_address=pool_address)
+            positions = await connector.get_user_positions(pool_address=self.pool_address)
 
             if positions:
                 # Get the most recent position
