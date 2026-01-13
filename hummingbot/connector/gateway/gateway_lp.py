@@ -5,8 +5,16 @@ from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 from hummingbot.connector.gateway.common_types import ConnectorType, get_connector_type
+from hummingbot.connector.gateway.gateway_in_flight_order import GatewayInFlightOrder
 from hummingbot.connector.gateway.gateway_swap import GatewaySwap
 from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.in_flight_order import OrderState
+from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
+from hummingbot.core.event.events import (
+    MarketEvent,
+    RangePositionLiquidityAddedEvent,
+    RangePositionLiquidityRemovedEvent,
+)
 from hummingbot.core.utils import async_ttl_cache
 from hummingbot.core.utils.async_utils import safe_ensure_future
 
@@ -75,6 +83,136 @@ class GatewayLp(GatewaySwap):
     Handles AMM and CLMM liquidity provision functionality including fetching pool info and adding/removing liquidity.
     Maintains order tracking and wallet interactions in the base class.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Store LP operation metadata for triggering proper events
+        self._lp_orders_metadata: Dict[str, Dict] = {}
+
+    def _trigger_lp_events_if_needed(self, order_id: str, transaction_hash: str):
+        """
+        Helper to trigger LP-specific events when an order completes.
+        This is called by both fast monitoring and slow polling to avoid duplication.
+        """
+        # Check if already triggered (metadata would be deleted)
+        if order_id not in self._lp_orders_metadata:
+            return
+
+        tracked_order = self._order_tracker.fetch_order(order_id)
+        if not tracked_order or tracked_order.trade_type != TradeType.RANGE:
+            return
+
+        metadata = self._lp_orders_metadata[order_id]
+
+        # Trigger appropriate event based on transaction result
+        if tracked_order.current_state == OrderState.FILLED:
+            # Transaction successful - trigger LP-specific events
+            if metadata["operation"] == "add":
+                self._trigger_add_liquidity_event(
+                    order_id=order_id,
+                    exchange_order_id=transaction_hash,
+                    trading_pair=tracked_order.trading_pair,
+                    lower_price=metadata["lower_price"],
+                    upper_price=metadata["upper_price"],
+                    amount=metadata["amount"],
+                    fee_tier=metadata["fee_tier"],
+                    creation_timestamp=tracked_order.creation_timestamp,
+                    trade_fee=TradeFeeBase.new_spot_fee(
+                        fee_schema=self.trade_fee_schema(),
+                        trade_type=tracked_order.trade_type,
+                        flat_fees=[TokenAmount(amount=tracked_order.gas_price, token=self._native_currency)]
+                    ),
+                )
+            elif metadata["operation"] == "remove":
+                self._trigger_remove_liquidity_event(
+                    order_id=order_id,
+                    exchange_order_id=transaction_hash,
+                    trading_pair=tracked_order.trading_pair,
+                    token_id=metadata["position_address"],
+                    creation_timestamp=tracked_order.creation_timestamp,
+                    trade_fee=TradeFeeBase.new_spot_fee(
+                        fee_schema=self.trade_fee_schema(),
+                        trade_type=tracked_order.trade_type,
+                        flat_fees=[TokenAmount(amount=tracked_order.gas_price, token=self._native_currency)]
+                    ),
+                )
+        elif tracked_order.current_state == OrderState.FAILED:
+            # Transaction failed - parent class already triggered TransactionFailure event
+            operation_type = "add" if metadata["operation"] == "add" else "remove"
+            self.logger().error(
+                f"LP {operation_type} liquidity transaction failed for order {order_id} (tx: {transaction_hash})"
+            )
+
+        # Clean up metadata (prevents double-triggering)
+        del self._lp_orders_metadata[order_id]
+
+    async def update_order_status(self, tracked_orders: List[GatewayInFlightOrder]):
+        """
+        Override to trigger RangePosition events after LP transactions complete (batch polling).
+        """
+        # Call parent implementation
+        await super().update_order_status(tracked_orders)
+
+        # Trigger LP events for any completed LP operations
+        for tracked_order in tracked_orders:
+            if tracked_order.trade_type == TradeType.RANGE:
+                # Get transaction hash
+                try:
+                    tx_hash = await tracked_order.get_exchange_order_id()
+                    self._trigger_lp_events_if_needed(tracked_order.client_order_id, tx_hash)
+                except Exception as e:
+                    self.logger().debug(f"Could not get tx hash for {tracked_order.client_order_id}: {e}")
+
+    def _trigger_add_liquidity_event(
+        self,
+        order_id: str,
+        exchange_order_id: str,
+        trading_pair: str,
+        lower_price: Decimal,
+        upper_price: Decimal,
+        amount: Decimal,
+        fee_tier: str,
+        creation_timestamp: float,
+        trade_fee: TradeFeeBase,
+    ):
+        """Trigger RangePositionLiquidityAddedEvent"""
+        event = RangePositionLiquidityAddedEvent(
+            timestamp=self.current_timestamp,
+            order_id=order_id,
+            exchange_order_id=exchange_order_id,
+            trading_pair=trading_pair,
+            lower_price=lower_price,
+            upper_price=upper_price,
+            amount=amount,
+            fee_tier=fee_tier,
+            creation_timestamp=creation_timestamp,
+            trade_fee=trade_fee,
+            token_id=0,
+        )
+        self.trigger_event(MarketEvent.RangePositionLiquidityAdded, event)
+        self.logger().info(f"Triggered RangePositionLiquidityAddedEvent for order {order_id}")
+
+    def _trigger_remove_liquidity_event(
+        self,
+        order_id: str,
+        exchange_order_id: str,
+        trading_pair: str,
+        token_id: str,
+        creation_timestamp: float,
+        trade_fee: TradeFeeBase,
+    ):
+        """Trigger RangePositionLiquidityRemovedEvent"""
+        event = RangePositionLiquidityRemovedEvent(
+            timestamp=self.current_timestamp,
+            order_id=order_id,
+            exchange_order_id=exchange_order_id,
+            trading_pair=trading_pair,
+            token_id=token_id,
+            trade_fee=trade_fee,
+            creation_timestamp=creation_timestamp,
+        )
+        self.trigger_event(MarketEvent.RangePositionLiquidityRemoved, event)
+        self.logger().info(f"Triggered RangePositionLiquidityRemovedEvent for order {order_id}")
 
     async def get_pool_address(self, trading_pair: str) -> Optional[str]:
         """Get pool address for a trading pair"""
@@ -241,6 +379,15 @@ class GatewayLp(GatewaySwap):
         pool_address = await self.get_pool_address(trading_pair)
         if not pool_address:
             raise ValueError(f"Could not find pool for {trading_pair}")
+
+        # Store metadata for event triggering
+        self._lp_orders_metadata[order_id] = {
+            "operation": "add",
+            "lower_price": Decimal(str(lower_price)),
+            "upper_price": Decimal(str(upper_price)),
+            "amount": Decimal(str(total_amount_in_base)),
+            "fee_tier": pool_address,  # Use pool address as fee tier identifier
+        }
 
         # Open position
         try:
@@ -446,6 +593,13 @@ class GatewayLp(GatewaySwap):
         self.start_tracking_order(order_id=order_id,
                                   trading_pair=trading_pair,
                                   trade_type=trade_type)
+
+        # Store metadata for event triggering
+        self._lp_orders_metadata[order_id] = {
+            "operation": "remove",
+            "position_address": position_address,
+        }
+
         try:
             transaction_result = await self._get_gateway_instance().clmm_remove_liquidity(
                 connector=self.connector_name,

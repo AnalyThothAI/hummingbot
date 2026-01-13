@@ -18,6 +18,7 @@ from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate, TradeFeeBase, TradeUpdate
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
+from hummingbot.core.event.events import MarketEvent, MarketTransactionFailureEvent
 from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
@@ -593,6 +594,15 @@ class GatewayBase(ConnectorBase):
                 )
                 self._order_tracker.process_order_update(order_update)
 
+                # Trigger TransactionFailure event
+                self.trigger_event(
+                    MarketEvent.TransactionFailure,
+                    MarketTransactionFailureEvent(
+                        timestamp=self.current_timestamp,
+                        order_id=tracked_order.client_order_id,
+                    )
+                )
+
     def process_transaction_confirmation_update(self, tracked_order: GatewayInFlightOrder, fee: Decimal):
         fee_asset = tracked_order.fee_asset if tracked_order.fee_asset else self._native_currency
         trade_fee: TradeFeeBase = AddedToCostTradeFee(
@@ -637,75 +647,6 @@ class GatewayBase(ConnectorBase):
             }
         )
         self._order_tracker.process_order_update(order_update)
-
-        # Start monitoring this specific transaction immediately
-        safe_ensure_future(self._monitor_transaction_status(order_id, transaction_hash))
-
-    async def _monitor_transaction_status(self, order_id: str, transaction_hash: str, check_interval: float = 2.0):
-        """
-        Monitor a specific transaction status until it's confirmed or failed.
-        This is useful for quick transactions that complete before the regular polling interval.
-        """
-        tracked_order = self._order_tracker.fetch_order(order_id)
-        if not tracked_order:
-            self.logger().warning(f"Order {order_id} not found in tracker, cannot monitor transaction status")
-            return
-
-        max_attempts = 30  # Maximum 60 seconds of monitoring
-        attempts = 0
-
-        while attempts < max_attempts and tracked_order.current_state not in [OrderState.FILLED, OrderState.FAILED, OrderState.CANCELED]:
-            try:
-                tx_details = await self._get_gateway_instance().get_transaction_status(
-                    self.chain,
-                    self.network,
-                    transaction_hash
-                )
-
-                if "signature" not in tx_details:
-                    self.logger().error(f"No signature field for transaction status of {order_id}: {tx_details}")
-                    break
-
-                tx_status = tx_details.get("txStatus", TransactionStatus.PENDING.value)
-                fee = tx_details.get("fee", 0)
-
-                # Transaction confirmed
-                if tx_status == TransactionStatus.CONFIRMED.value:
-                    self.process_transaction_confirmation_update(tracked_order=tracked_order, fee=Decimal(str(fee or 0)))
-
-                    order_update = OrderUpdate(
-                        client_order_id=order_id,
-                        trading_pair=tracked_order.trading_pair,
-                        update_timestamp=self.current_timestamp,
-                        new_state=OrderState.FILLED,
-                    )
-                    self._order_tracker.process_order_update(order_update)
-
-                    self.logger().info(f"Transaction {transaction_hash} confirmed for order {order_id}")
-                    break
-
-                # Transaction failed
-                elif tx_status == TransactionStatus.FAILED.value:
-                    self.logger().error(f"Transaction {transaction_hash} failed for order {order_id}")
-                    order_update = OrderUpdate(
-                        client_order_id=order_id,
-                        trading_pair=tracked_order.trading_pair,
-                        update_timestamp=self.current_timestamp,
-                        new_state=OrderState.FAILED
-                    )
-                    self._order_tracker.process_order_update(order_update)
-                    break
-
-                # Still pending, wait and try again
-                await asyncio.sleep(check_interval)
-                attempts += 1
-
-            except Exception as e:
-                self.logger().error(f"Error monitoring transaction status for {order_id}: {str(e)}", exc_info=True)
-                break
-
-        if attempts >= max_attempts:
-            self.logger().warning(f"Transaction monitoring timed out for order {order_id}, transaction {transaction_hash}")
 
     def get_balance(self, currency: str) -> Decimal:
         """

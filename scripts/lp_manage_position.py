@@ -5,7 +5,7 @@ CLMM LP position manager that automatically rebalances positions.
 
 BEHAVIOR
 --------
-- If an existing position exists in the pool, monitors it (does NOT auto-create a new one)
+- Monitors existing position in the specified pool
 - Monitors price vs. active position's price bounds
 - When price is out-of-bounds for >= rebalance_seconds, fully closes the position and re-enters
 - First position can be double-sided (if both base_amount and quote_amount provided)
@@ -15,8 +15,7 @@ BEHAVIOR
 PARAMETERS
 ----------
 - connector: CLMM connector in format 'name/type' (e.g. raydium/clmm, meteora/clmm)
-- trading_pair: Trading pair (e.g. SOL-USDC)
-- pool_address: Optional pool address (will fetch automatically if not provided)
+- pool_address: Pool address to manage positions in
 - base_amount: Initial base token amount (0 for quote-only position)
 - quote_amount: Initial quote token amount (0 for base-only position)
   * If both are 0 and no existing position: monitoring only
@@ -29,6 +28,7 @@ NOTES
 -----
 - All tick rounding and amount calculations delegated to Gateway
 - After first rebalance, automatically switches to single-sided positions
+- Uses actual wallet balances for rebalancing (not config amounts)
 """
 
 import asyncio
@@ -44,18 +44,17 @@ from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.gateway.common_types import ConnectorType, get_connector_type
 from hummingbot.connector.gateway.gateway_lp import CLMMPoolInfo, CLMMPositionInfo
+from hummingbot.core.event.events import RangePositionLiquidityAddedEvent, RangePositionLiquidityRemovedEvent
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 
 class LpPositionManagerConfig(BaseClientModel):
     script_file_name: str = os.path.basename(__file__)
-    connector: str = Field("raydium/clmm", json_schema_extra={
+    connector: str = Field("meteora/clmm", json_schema_extra={
         "prompt": "CLMM connector in format 'name/type' (e.g. raydium/clmm, meteora/clmm)", "prompt_on_new": True})
-    trading_pair: str = Field("SOL-USDC", json_schema_extra={
-        "prompt": "Trading pair (e.g. SOL-USDC)", "prompt_on_new": True})
     pool_address: str = Field("", json_schema_extra={
-        "prompt": "Pool address (optional - will fetch automatically if not provided)", "prompt_on_new": False})
+        "prompt": "Pool address to manage positions in", "prompt_on_new": True})
     base_amount: Decimal = Field(Decimal("0"), json_schema_extra={
         "prompt": "Initial base token amount (0 for quote-only initial position)", "prompt_on_new": True})
     quote_amount: Decimal = Field(Decimal("0"), json_schema_extra={
@@ -73,53 +72,65 @@ class LpPositionManager(ScriptStrategyBase):
 
     @classmethod
     def init_markets(cls, config: LpPositionManagerConfig):
-        cls.markets = {config.connector: {config.trading_pair}}
+        # We'll derive trading_pair from pool info at runtime
+        cls.markets = {}
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: LpPositionManagerConfig):
         super().__init__(connectors)
         self.config = config
         self.exchange = config.connector
         self.connector_type = get_connector_type(config.connector)
-        self.base_token, self.quote_token = self.config.trading_pair.split("-")
 
         # Verify this is a CLMM connector
         if self.connector_type != ConnectorType.CLMM:
             raise ValueError(f"This script only supports CLMM connectors. Got: {config.connector}")
+
+        # Token symbols (will be populated from pool info)
+        self.base_token: Optional[str] = None
+        self.quote_token: Optional[str] = None
+        self.trading_pair: Optional[str] = None
 
         # State tracking
         self.pool_info: Optional[CLMMPoolInfo] = None
         self.position_info: Optional[CLMMPositionInfo] = None
         self.current_position_id: Optional[str] = None
         self.out_of_bounds_since: Optional[float] = None
-        self.has_rebalanced_once: bool = False  # Track if we've done first rebalance
+        self.has_rebalanced_once: bool = False
 
         # Order tracking
         self.pending_open_order_id: Optional[str] = None
         self.pending_close_order_id: Optional[str] = None
         self.pending_operation: Optional[str] = None  # "opening", "closing"
 
+        # Rebalance tracking
+        self._closed_position_balances: Optional[Dict] = None
+
         # Log startup information
         self.log_with_clock(logging.INFO,
-                            f"LP Position Manager initialized for {self.config.trading_pair} on {self.exchange}\n"
+                            f"LP Position Manager initialized for pool {self.config.pool_address} on {self.exchange}\n"
                             f"Position width: ±{float(self.config.position_width_pct) / 2:.2f}% around mid price\n"
                             f"Rebalance threshold: {self.config.rebalance_seconds} seconds out-of-bounds")
 
         if self.config.base_amount > 0 or self.config.quote_amount > 0:
             self.log_with_clock(logging.INFO,
-                                f"Initial amounts: {self.config.base_amount} {self.base_token} / "
-                                f"{self.config.quote_amount} {self.quote_token}")
+                                f"Initial amounts: {self.config.base_amount} base / "
+                                f"{self.config.quote_amount} quote tokens")
         else:
             self.log_with_clock(logging.INFO, "No initial amounts - will only monitor existing positions")
 
-        # Check for existing positions on startup
+        # Initialize position on startup
         safe_ensure_future(self.initialize_position())
 
     async def initialize_position(self):
         """Check for existing positions or create initial position on startup"""
         await asyncio.sleep(3)  # Wait for connector to initialize
 
-        # Fetch pool info first
+        # Fetch pool info first to get token symbols
         await self.fetch_pool_info()
+
+        if not self.trading_pair:
+            self.logger().error("Could not determine trading pair from pool info")
+            return
 
         # Check if user has existing position in this pool
         if await self.check_existing_positions():
@@ -147,37 +158,52 @@ class LpPositionManager(ScriptStrategyBase):
             safe_ensure_future(self.fetch_pool_info())
 
     async def fetch_pool_info(self):
-        """Fetch pool information to get current price"""
+        """Fetch pool information to get current price and token symbols"""
         try:
-            self.pool_info = await self.connectors[self.exchange].get_pool_info(
-                trading_pair=self.config.trading_pair
-            )
-            return self.pool_info
-        except Exception as e:
-            self.logger().error(f"Error fetching pool info: {str(e)}")
-            return None
-
-    async def get_pool_address(self) -> Optional[str]:
-        """Get pool address from config or fetch from connector"""
-        if self.config.pool_address:
-            return self.config.pool_address
-        else:
             connector = self.connectors[self.exchange]
-            return await connector.get_pool_address(self.config.trading_pair)
+
+            # Get pool info directly by address via gateway
+            gateway = connector._get_gateway_instance()
+            resp = await gateway.pool_info(
+                connector=self.exchange,
+                network=connector.network,
+                pool_address=self.config.pool_address,
+            )
+
+            if resp:
+                self.pool_info = CLMMPoolInfo(**resp)
+
+                # Get token symbols from addresses
+                if not self.base_token or not self.quote_token:
+                    base_token_info = connector.get_token_by_address(self.pool_info.base_token_address)
+                    quote_token_info = connector.get_token_by_address(self.pool_info.quote_token_address)
+
+                    self.base_token = base_token_info.get("symbol") if base_token_info else None
+                    self.quote_token = quote_token_info.get("symbol") if quote_token_info else None
+
+                    if self.base_token and self.quote_token:
+                        self.trading_pair = f"{self.base_token}-{self.quote_token}"
+                        self.logger().info(f"Derived trading pair: {self.trading_pair}")
+                    else:
+                        self.logger().warning("Could not resolve token symbols from addresses")
+
+                return self.pool_info
+            else:
+                self.logger().error("Empty response from pool_info")
+                return None
+
+        except Exception as e:
+            self.logger().error(f"Error fetching pool info: {str(e)}", exc_info=True)
+            return None
 
     async def check_existing_positions(self) -> bool:
         """Check if user has existing positions in this pool"""
         try:
             connector = self.connectors[self.exchange]
-            pool_address = await self.get_pool_address()
-
-            if not pool_address:
-                return False
-
-            positions = await connector.get_user_positions(pool_address=pool_address)
+            positions = await connector.get_user_positions(pool_address=self.config.pool_address)
 
             if positions and len(positions) > 0:
-                # Use the first position found (could be enhanced to let user choose)
+                # Use the first position found
                 self.position_info = positions[0]
                 self.current_position_id = self.position_info.address
                 self.logger().info(f"Found existing position: {self.current_position_id}")
@@ -190,30 +216,28 @@ class LpPositionManager(ScriptStrategyBase):
 
     async def update_position_info(self):
         """Fetch the latest position information"""
-        if not self.current_position_id:
+        if not self.current_position_id or not self.trading_pair:
             return
 
         try:
             self.position_info = await self.connectors[self.exchange].get_position_info(
-                trading_pair=self.config.trading_pair,
+                trading_pair=self.trading_pair,
                 position_address=self.current_position_id
             )
 
-            # Log position details
             if self.position_info:
                 self.logger().info(
-                    f"{self.exchange} {self.config.trading_pair} position: {self.current_position_id[:8]}... "
+                    f"{self.exchange} {self.trading_pair} position: {self.current_position_id[:8]}... "
                     f"(price: {self.position_info.price:.2f}, "
                     f"range: {self.position_info.lower_price:.2f}-{self.position_info.upper_price:.2f})"
                 )
 
-            self.logger().debug(f"Updated position info: {self.position_info}")
         except Exception as e:
             self.logger().error(f"Error updating position info: {str(e)}")
 
     async def create_initial_position(self):
         """Create initial position (can be double-sided or single-sided)"""
-        if self.pending_operation:
+        if self.pending_operation or not self.trading_pair:
             return
 
         try:
@@ -243,7 +267,7 @@ class LpPositionManager(ScriptStrategyBase):
                 return
 
             order_id = self.connectors[self.exchange].add_liquidity(
-                trading_pair=self.config.trading_pair,
+                trading_pair=self.trading_pair,
                 price=current_price,
                 upper_width_pct=upper_pct,
                 lower_width_pct=lower_pct,
@@ -309,29 +333,33 @@ class LpPositionManager(ScriptStrategyBase):
             self.logger().error(f"Error in monitor_and_rebalance: {str(e)}")
 
     async def rebalance_position(self, current_price: Decimal, old_lower: Decimal, old_upper: Decimal):
-        """Close current position and open new single-sided position"""
-        if self.pending_operation:
+        """Close current position and prepare to open new single-sided position"""
+        if self.pending_operation or not self.trading_pair:
             return
 
         try:
             self.logger().info("Starting rebalance: closing current position...")
 
-            # First, close the current position
+            # Store current balances before closing
+            self._closed_position_balances = {
+                "base_amount": self.position_info.base_token_amount if self.position_info else 0.0,
+                "quote_amount": self.position_info.quote_token_amount if self.position_info else 0.0,
+                "base_fee": self.position_info.base_fee_amount if self.position_info else 0.0,
+                "quote_fee": self.position_info.quote_fee_amount if self.position_info else 0.0,
+                "current_price": current_price,
+                "old_lower": old_lower,
+                "old_upper": old_upper,
+            }
+
+            # Close the current position
             order_id = self.connectors[self.exchange].remove_liquidity(
-                trading_pair=self.config.trading_pair,
+                trading_pair=self.trading_pair,
                 position_address=self.current_position_id
             )
 
             self.pending_close_order_id = order_id
             self.pending_operation = "closing"
             self.logger().info(f"Position close order submitted with ID: {order_id}")
-
-            # Store rebalance info for when close completes
-            self._rebalance_info = {
-                "current_price": current_price,
-                "old_lower": old_lower,
-                "old_upper": old_upper,
-            }
 
         except Exception as e:
             self.logger().error(f"Error starting rebalance: {str(e)}")
@@ -340,14 +368,25 @@ class LpPositionManager(ScriptStrategyBase):
     async def open_rebalanced_position(self):
         """Open new single-sided position after closing old one"""
         try:
-            if not hasattr(self, '_rebalance_info'):
-                self.logger().error("No rebalance info available")
+            if not self._closed_position_balances:
+                self.logger().error("No closed position balance info available")
                 return
 
-            info = self._rebalance_info
+            if not self.trading_pair:
+                self.logger().error("Trading pair not set")
+                return
+
+            info = self._closed_position_balances
             current_price = info["current_price"]
             old_lower = info["old_lower"]
             old_upper = info["old_upper"]
+
+            # Get current wallet balances (tokens + fees collected)
+            connector = self.connectors[self.exchange]
+            base_balance = connector.get_available_balance(self.base_token)
+            quote_balance = connector.get_available_balance(self.quote_token)
+
+            self.logger().info(f"Available balances: {base_balance} {self.base_token}, {quote_balance} {self.quote_token}")
 
             # Determine which side to enter based on where price is relative to old range
             side = self._determine_side(current_price, old_lower, old_upper)
@@ -362,20 +401,26 @@ class LpPositionManager(ScriptStrategyBase):
             lower_pct, upper_pct = self._compute_width_percentages()
 
             # For single-sided position, provide amount for only one side
+            # Use actual wallet balances, not config amounts
             if side == "base":
                 # Price is below range, provide base token only
-                # Use all available base tokens (would need to check balance in real implementation)
-                base_amt = float(self.config.base_amount)
+                base_amt = float(base_balance) if base_balance > 0 else 0.0
                 quote_amt = 0.0
-                self.logger().info(f"Opening base-only position at {new_mid_price:.6f} (price below previous bounds)")
+                self.logger().info(f"Opening base-only position at {new_mid_price:.6f} with {base_amt} {self.base_token} (price below previous bounds)")
             else:  # quote side
                 # Price is above bounds, provide quote token only
                 base_amt = 0.0
-                quote_amt = float(self.config.quote_amount)
-                self.logger().info(f"Opening quote-only position at {new_mid_price:.6f} (price above previous bounds)")
+                quote_amt = float(quote_balance) if quote_balance > 0 else 0.0
+                self.logger().info(f"Opening quote-only position at {new_mid_price:.6f} with {quote_amt} {self.quote_token} (price above previous bounds)")
+
+            if base_amt == 0 and quote_amt == 0:
+                self.logger().error("No tokens available to open position")
+                self.pending_operation = None
+                self._closed_position_balances = None
+                return
 
             order_id = self.connectors[self.exchange].add_liquidity(
-                trading_pair=self.config.trading_pair,
+                trading_pair=self.trading_pair,
                 price=new_mid_price,
                 upper_width_pct=upper_pct,
                 lower_width_pct=lower_pct,
@@ -388,8 +433,8 @@ class LpPositionManager(ScriptStrategyBase):
             self.has_rebalanced_once = True
             self.logger().info(f"Rebalanced {side}-only position order submitted with ID: {order_id}")
 
-            # Clean up rebalance info
-            delattr(self, '_rebalance_info')
+            # Clean up balance info
+            self._closed_position_balances = None
 
         except Exception as e:
             self.logger().error(f"Error opening rebalanced position: {str(e)}")
@@ -417,43 +462,42 @@ class LpPositionManager(ScriptStrategyBase):
             # Should not happen when rebalancing, but default to base
             return "base"
 
-    async def fetch_position_info_after_fill(self):
+    async def fetch_position_info_after_add(self):
         """Fetch position info after position is created"""
         try:
-            await asyncio.sleep(2)  # Wait for position to be created on-chain
+            await asyncio.sleep(3)  # Wait for position to be created on-chain
 
             connector = self.connectors[self.exchange]
-            pool_address = await self.get_pool_address()
+            positions = await connector.get_user_positions(pool_address=self.config.pool_address)
 
-            if pool_address:
-                positions = await connector.get_user_positions(pool_address=pool_address)
-                if positions:
-                    # Get the most recent position
-                    self.position_info = positions[-1]
-                    self.current_position_id = self.position_info.address
-                    self.logger().info(f"Position info fetched: {self.current_position_id}")
+            if positions:
+                # Get the most recent position
+                self.position_info = positions[-1]
+                self.current_position_id = self.position_info.address
+                self.logger().info(f"Position info fetched: {self.current_position_id}")
         except Exception as e:
-            self.logger().error(f"Error fetching position info after fill: {str(e)}")
+            self.logger().error(f"Error fetching position info after add: {str(e)}")
 
-    def did_fill_order(self, event):
-        """Called when an order is filled"""
-        # Check if this is our position opening order
+    # Event handlers for LP operations - These are now properly triggered by gateway_lp.py
+    def did_add_liquidity(self, event: RangePositionLiquidityAddedEvent):
+        """Called when liquidity is added to a position"""
         if hasattr(event, 'order_id') and event.order_id == self.pending_open_order_id:
             self.logger().info(f"Position opening order {event.order_id} confirmed!")
 
             # Fetch the new position info
-            safe_ensure_future(self.fetch_position_info_after_fill())
+            safe_ensure_future(self.fetch_position_info_after_add())
 
             # Clear pending state
             self.pending_open_order_id = None
             self.pending_operation = None
-            self.out_of_bounds_since = None  # Reset out-of-bounds timer
+            self.out_of_bounds_since = None
 
             msg = f"LP position opened on {self.exchange}"
             self.notify_hb_app_with_timestamp(msg)
 
-        # Check if this is our position closing order
-        elif hasattr(event, 'order_id') and event.order_id == self.pending_close_order_id:
+    def did_remove_liquidity(self, event: RangePositionLiquidityRemovedEvent):
+        """Called when liquidity is removed from a position"""
+        if hasattr(event, 'order_id') and event.order_id == self.pending_close_order_id:
             self.logger().info(f"Position closing order {event.order_id} confirmed!")
 
             # Clear current position
@@ -467,7 +511,7 @@ class LpPositionManager(ScriptStrategyBase):
             self.notify_hb_app_with_timestamp(msg)
 
             # If this was a rebalance, open the new position
-            if hasattr(self, '_rebalance_info'):
+            if self._closed_position_balances:
                 self.logger().info("Position closed, opening rebalanced position...")
                 safe_ensure_future(self.open_rebalanced_position())
 
@@ -506,17 +550,6 @@ class LpPositionManager(ScriptStrategyBase):
 
         return '\n'.join(viz_lines)
 
-    def _calculate_token_distribution(self, base_amount: Decimal, quote_amount: Decimal) -> str:
-        """Calculate token distribution percentages"""
-        total_value = base_amount + quote_amount
-        if total_value > 0:
-            base_pct = float(base_amount / total_value * 100)
-            quote_pct = float(quote_amount / total_value * 100)
-        else:
-            base_pct = quote_pct = 50.0
-
-        return f"Token Distribution: {base_pct:.1f}% {self.base_token} / {quote_pct:.1f}% {self.quote_token}"
-
     def format_status(self) -> str:
         """Format status message for display"""
         lines = []
@@ -530,14 +563,7 @@ class LpPositionManager(ScriptStrategyBase):
         elif self.current_position_id and self.position_info:
             # Active position
             lines.append(f"Position: {self.current_position_id}")
-
-            # Pool info with address
-            pool_address = self.position_info.pool_address if hasattr(self.position_info, 'pool_address') else self.config.pool_address
-            if pool_address:
-                lines.append(f"Pool: {self.config.trading_pair} ({pool_address})")
-            else:
-                lines.append(f"Pool: {self.config.trading_pair}")
-
+            lines.append(f"Pool: {self.trading_pair} ({self.config.pool_address})")
             lines.append(f"Connector: {self.exchange}")
 
             # Tokens and value section
@@ -601,12 +627,14 @@ class LpPositionManager(ScriptStrategyBase):
                 lines.append(f"Out of bounds for: {elapsed:.0f}/{self.config.rebalance_seconds} seconds")
 
         else:
-            lines.append(f"Monitoring {self.config.trading_pair} on {self.exchange}")
+            lines.append(f"Monitoring pool {self.config.pool_address} on {self.exchange}")
+            if self.trading_pair:
+                lines.append(f"Trading pair: {self.trading_pair}")
             lines.append("Status: ⏳ No active position")
 
             if self.config.base_amount > 0 or self.config.quote_amount > 0:
-                lines.append(f"Will create position with: {self.config.base_amount} {self.base_token} / "
-                             f"{self.config.quote_amount} {self.quote_token}")
+                lines.append(f"Will create position with: {self.config.base_amount} base / "
+                             f"{self.config.quote_amount} quote tokens")
 
             if self.pool_info:
                 lines.append(f"Current Price: {self.pool_info.price:.6f}")
