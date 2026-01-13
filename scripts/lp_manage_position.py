@@ -319,6 +319,9 @@ class LpPositionManager(ScriptStrategyBase):
                 # Price is in bounds
                 if self.out_of_bounds_since is not None:
                     self.logger().info("Price moved back into position bounds, resetting timer")
+                    # Notify user that position is back in range
+                    msg = f"✅ {self.trading_pair} position back in range on {self.exchange}. Rebalance timer reset."
+                    self.notify_hb_app_with_timestamp(msg)
                     self.out_of_bounds_since = None
             else:
                 # Price is out of bounds
@@ -328,10 +331,20 @@ class LpPositionManager(ScriptStrategyBase):
                     self.out_of_bounds_since = current_time
                     if float(current_price) < float(lower_price):
                         deviation = (float(lower_price) - float(current_price)) / float(lower_price) * 100
+                        direction = "below"
+                        bound = lower_price
                         self.logger().info(f"Price {current_price:.6f} moved below lower bound {lower_price:.6f} by {deviation:.2f}%")
                     else:
                         deviation = (float(current_price) - float(upper_price)) / float(upper_price) * 100
+                        direction = "above"
+                        bound = upper_price
                         self.logger().info(f"Price {current_price:.6f} moved above upper bound {upper_price:.6f} by {deviation:.2f}%")
+
+                    # Notify user that position is out of range
+                    msg = (f"⚠️ {self.trading_pair} position out of range on {self.exchange}: "
+                           f"Price {float(current_price):.6f} moved {direction} bound {float(bound):.6f} by {deviation:.2f}%. "
+                           f"Will rebalance after {self.config.rebalance_seconds}s")
+                    self.notify_hb_app_with_timestamp(msg)
 
                 elapsed_seconds = current_time - self.out_of_bounds_since
 
@@ -351,6 +364,20 @@ class LpPositionManager(ScriptStrategyBase):
 
         try:
             self.logger().info("Starting rebalance: closing current position...")
+
+            # Determine position direction
+            if float(current_price) < float(old_lower):
+                direction = "below"
+                deviation = (float(old_lower) - float(current_price)) / float(old_lower) * 100
+            else:
+                direction = "above"
+                deviation = (float(current_price) - float(old_upper)) / float(old_upper) * 100
+
+            # Notify user about rebalance trigger
+            msg = (f"🔄 Rebalancing {self.trading_pair} position on {self.exchange}: "
+                   f"Price {float(current_price):.6f} moved {direction} range "
+                   f"[{float(old_lower):.6f}-{float(old_upper):.6f}] by {deviation:.2f}%")
+            self.notify_hb_app_with_timestamp(msg)
 
             # Store current balances before closing
             self._closed_position_balances = {
