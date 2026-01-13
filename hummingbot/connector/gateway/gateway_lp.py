@@ -96,13 +96,16 @@ class GatewayLp(GatewaySwap):
         """
         # Check if already triggered (metadata would be deleted)
         if order_id not in self._lp_orders_metadata:
+            self.logger().info(f"LP metadata not found for {order_id} - event likely already triggered")
             return
 
         tracked_order = self._order_tracker.fetch_order(order_id)
         if not tracked_order or tracked_order.trade_type != TradeType.RANGE:
+            self.logger().warning(f"Order {order_id} not found or not RANGE type")
             return
 
         metadata = self._lp_orders_metadata[order_id]
+        self.logger().info(f"LP event check for {order_id}: state={tracked_order.current_state}, operation={metadata['operation']}")
 
         # Trigger appropriate event based on transaction result
         if tracked_order.current_state == OrderState.FILLED:
@@ -159,9 +162,10 @@ class GatewayLp(GatewaySwap):
                 # Get transaction hash
                 try:
                     tx_hash = await tracked_order.get_exchange_order_id()
+                    self.logger().info(f"Checking LP event trigger for {tracked_order.client_order_id}, state={tracked_order.current_state}, tx={tx_hash}")
                     self._trigger_lp_events_if_needed(tracked_order.client_order_id, tx_hash)
                 except Exception as e:
-                    self.logger().debug(f"Could not get tx hash for {tracked_order.client_order_id}: {e}")
+                    self.logger().warning(f"Error triggering LP event for {tracked_order.client_order_id}: {e}", exc_info=True)
 
     def _trigger_add_liquidity_event(
         self,
