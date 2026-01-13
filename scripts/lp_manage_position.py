@@ -196,7 +196,7 @@ class LpPositionManager(ScriptStrategyBase):
             connector = self.connectors[self.exchange]
 
             # Get pool address from trading pair
-            pool_address = connector.get_pool_address(self.trading_pair)
+            pool_address = await connector.get_pool_address(self.trading_pair)
             if not pool_address:
                 self.logger().error(f"Pool address not found for {self.trading_pair}. Please add pool via 'gateway pool' command first")
                 return False
@@ -471,7 +471,7 @@ class LpPositionManager(ScriptStrategyBase):
             connector = self.connectors[self.exchange]
 
             # Get pool address from trading pair
-            pool_address = connector.get_pool_address(self.trading_pair)
+            pool_address = await connector.get_pool_address(self.trading_pair)
             if not pool_address:
                 self.logger().error(f"Pool address not found for {self.trading_pair}")
                 return
