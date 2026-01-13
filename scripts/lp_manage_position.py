@@ -160,6 +160,10 @@ class LpPositionManager(ScriptStrategyBase):
     async def fetch_pool_info(self):
         """Fetch pool information to get current price and token symbols"""
         try:
+            # Wait for connector to be ready
+            if self.exchange not in self.connectors:
+                return None
+
             connector = self.connectors[self.exchange]
 
             # Get pool info directly by address via gateway
@@ -199,6 +203,10 @@ class LpPositionManager(ScriptStrategyBase):
     async def check_existing_positions(self) -> bool:
         """Check if user has existing positions in this pool"""
         try:
+            # Wait for connector to be ready
+            if self.exchange not in self.connectors:
+                return False
+
             connector = self.connectors[self.exchange]
             positions = await connector.get_user_positions(pool_address=self.config.pool_address)
 
