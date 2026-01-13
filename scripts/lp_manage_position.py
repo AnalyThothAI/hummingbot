@@ -46,7 +46,9 @@ from hummingbot.connector.gateway.common_types import ConnectorType, get_connect
 from hummingbot.connector.gateway.gateway_lp import CLMMPoolInfo, CLMMPositionInfo
 from hummingbot.core.event.events import RangePositionLiquidityAddedEvent, RangePositionLiquidityRemovedEvent
 from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 
 
 class LpPositionManagerConfig(BaseClientModel):
@@ -87,6 +89,12 @@ class LpPositionManager(ScriptStrategyBase):
 
         # Token symbols (will be populated from pool info)
         self.base_token, self.quote_token = self.trading_pair.split("-")
+
+        # Initialize market data provider for rate oracle (required for PNL tracking)
+        self.market_data_provider = MarketDataProvider(connectors)
+        self.market_data_provider.initialize_rate_sources([
+            ConnectorPair(connector_name=config.connector, trading_pair=config.trading_pair)
+        ])
 
         # State tracking
         self.pool_info: Optional[CLMMPoolInfo] = None
