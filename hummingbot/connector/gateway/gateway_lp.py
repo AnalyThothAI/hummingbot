@@ -8,7 +8,6 @@ from hummingbot.connector.gateway.common_types import ConnectorType, get_connect
 from hummingbot.connector.gateway.gateway_in_flight_order import GatewayInFlightOrder
 from hummingbot.connector.gateway.gateway_swap import GatewaySwap
 from hummingbot.core.data_type.common import TradeType
-from hummingbot.core.data_type.in_flight_order import OrderState
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.event.events import (
     MarketEvent,
@@ -105,10 +104,13 @@ class GatewayLp(GatewaySwap):
             return
 
         metadata = self._lp_orders_metadata[order_id]
-        self.logger().info(f"LP event check for {order_id}: state={tracked_order.current_state}, operation={metadata['operation']}")
+        self.logger().info(f"LP event check for {order_id}: state={tracked_order.current_state}, is_done={tracked_order.is_done}, operation={metadata['operation']}")
 
         # Trigger appropriate event based on transaction result
-        if tracked_order.current_state == OrderState.FILLED:
+        # For LP operations (RANGE orders), state stays OPEN even when done, so check is_done
+        is_successful = tracked_order.is_done and not tracked_order.is_failure and not tracked_order.is_cancelled
+
+        if is_successful:
             # Transaction successful - trigger LP-specific events
             if metadata["operation"] == "add":
                 self._trigger_add_liquidity_event(
@@ -139,11 +141,17 @@ class GatewayLp(GatewaySwap):
                         flat_fees=[TokenAmount(amount=tracked_order.gas_price, token=self._native_currency)]
                     ),
                 )
-        elif tracked_order.current_state == OrderState.FAILED:
+        elif tracked_order.is_failure:
             # Transaction failed - parent class already triggered TransactionFailure event
             operation_type = "add" if metadata["operation"] == "add" else "remove"
             self.logger().error(
                 f"LP {operation_type} liquidity transaction failed for order {order_id} (tx: {transaction_hash})"
+            )
+        elif tracked_order.is_cancelled:
+            # Transaction cancelled
+            operation_type = "add" if metadata["operation"] == "add" else "remove"
+            self.logger().warning(
+                f"LP {operation_type} liquidity transaction cancelled for order {order_id} (tx: {transaction_hash})"
             )
 
         # Clean up metadata (prevents double-triggering)
