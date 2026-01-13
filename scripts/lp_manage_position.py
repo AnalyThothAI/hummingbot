@@ -15,7 +15,7 @@ BEHAVIOR
 PARAMETERS
 ----------
 - connector: CLMM connector in format 'name/type' (e.g. raydium/clmm, meteora/clmm)
-- pool_address: Pool address to manage positions in
+- trading_pair: Trading pair (e.g. META-SOL). Pool must be added via 'gateway pool' command first
 - base_amount: Initial base token amount (0 for quote-only position)
 - quote_amount: Initial quote token amount (0 for base-only position)
   * If both are 0 and no existing position: monitoring only
@@ -53,8 +53,8 @@ class LpPositionManagerConfig(BaseClientModel):
     script_file_name: str = os.path.basename(__file__)
     connector: str = Field("meteora/clmm", json_schema_extra={
         "prompt": "CLMM connector in format 'name/type' (e.g. raydium/clmm, meteora/clmm)", "prompt_on_new": True})
-    pool_address: str = Field("", json_schema_extra={
-        "prompt": "Pool address to manage positions in", "prompt_on_new": True})
+    trading_pair: str = Field("", json_schema_extra={
+        "prompt": "Trading pair (e.g. META-SOL). Pool must be added via 'gateway pool' first", "prompt_on_new": True})
     base_amount: Decimal = Field(Decimal("0"), json_schema_extra={
         "prompt": "Initial base token amount (0 for quote-only initial position)", "prompt_on_new": True})
     quote_amount: Decimal = Field(Decimal("0"), json_schema_extra={
@@ -72,13 +72,13 @@ class LpPositionManager(ScriptStrategyBase):
 
     @classmethod
     def init_markets(cls, config: LpPositionManagerConfig):
-        # We'll derive trading_pair from pool info at runtime
-        cls.markets = {}
+        cls.markets = {config.connector: {config.trading_pair}}
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: LpPositionManagerConfig):
         super().__init__(connectors)
         self.config = config
         self.exchange = config.connector
+        self.trading_pair = config.trading_pair
         self.connector_type = get_connector_type(config.connector)
 
         # Verify this is a CLMM connector
@@ -86,9 +86,7 @@ class LpPositionManager(ScriptStrategyBase):
             raise ValueError(f"This script only supports CLMM connectors. Got: {config.connector}")
 
         # Token symbols (will be populated from pool info)
-        self.base_token: Optional[str] = None
-        self.quote_token: Optional[str] = None
-        self.trading_pair: Optional[str] = None
+        self.base_token, self.quote_token = self.trading_pair.split("-")
 
         # State tracking
         self.pool_info: Optional[CLMMPoolInfo] = None
@@ -107,7 +105,7 @@ class LpPositionManager(ScriptStrategyBase):
 
         # Log startup information
         self.log_with_clock(logging.INFO,
-                            f"LP Position Manager initialized for pool {self.config.pool_address} on {self.exchange}\n"
+                            f"LP Position Manager initialized for {self.trading_pair} on {self.exchange}\n"
                             f"Position width: ±{float(self.config.position_width_pct) / 2:.2f}% around mid price\n"
                             f"Rebalance threshold: {self.config.rebalance_seconds} seconds out-of-bounds")
 
@@ -125,11 +123,11 @@ class LpPositionManager(ScriptStrategyBase):
         """Check for existing positions or create initial position on startup"""
         await asyncio.sleep(3)  # Wait for connector to initialize
 
-        # Fetch pool info first to get token symbols
+        # Fetch pool info to get pool address and current price
         await self.fetch_pool_info()
 
-        if not self.trading_pair:
-            self.logger().error("Could not determine trading pair from pool info")
+        if not self.pool_info:
+            self.logger().error(f"Pool not found for {self.trading_pair}. Please add pool via 'gateway pool' command first")
             return
 
         # Check if user has existing position in this pool
@@ -158,7 +156,7 @@ class LpPositionManager(ScriptStrategyBase):
             safe_ensure_future(self.fetch_pool_info())
 
     async def fetch_pool_info(self):
-        """Fetch pool information to get current price and token symbols"""
+        """Fetch pool information to get current price"""
         try:
             # Wait for connector to be ready
             if self.exchange not in self.connectors:
@@ -166,34 +164,14 @@ class LpPositionManager(ScriptStrategyBase):
 
             connector = self.connectors[self.exchange]
 
-            # Get pool info directly by address via gateway
-            gateway = connector._get_gateway_instance()
-            resp = await gateway.pool_info(
-                connector=self.exchange,
-                network=connector.network,
-                pool_address=self.config.pool_address,
-            )
+            # Get pool info using trading pair
+            pool_info_result = await connector.get_pool_info(self.trading_pair)
 
-            if resp:
-                self.pool_info = CLMMPoolInfo(**resp)
-
-                # Get token symbols from addresses
-                if not self.base_token or not self.quote_token:
-                    base_token_info = connector.get_token_by_address(self.pool_info.base_token_address)
-                    quote_token_info = connector.get_token_by_address(self.pool_info.quote_token_address)
-
-                    self.base_token = base_token_info.get("symbol") if base_token_info else None
-                    self.quote_token = quote_token_info.get("symbol") if quote_token_info else None
-
-                    if self.base_token and self.quote_token:
-                        self.trading_pair = f"{self.base_token}-{self.quote_token}"
-                        self.logger().info(f"Derived trading pair: {self.trading_pair}")
-                    else:
-                        self.logger().warning("Could not resolve token symbols from addresses")
-
+            if pool_info_result:
+                self.pool_info = pool_info_result
                 return self.pool_info
             else:
-                self.logger().error("Empty response from pool_info")
+                self.logger().error(f"Pool not found for {self.trading_pair}. Please add pool via 'gateway pool' command first")
                 return None
 
         except Exception as e:
@@ -208,7 +186,14 @@ class LpPositionManager(ScriptStrategyBase):
                 return False
 
             connector = self.connectors[self.exchange]
-            positions = await connector.get_user_positions(pool_address=self.config.pool_address)
+
+            # Get pool address from trading pair
+            pool_address = connector.get_pool_address(self.trading_pair)
+            if not pool_address:
+                self.logger().error(f"Pool address not found for {self.trading_pair}. Please add pool via 'gateway pool' command first")
+                return False
+
+            positions = await connector.get_user_positions(pool_address=pool_address)
 
             if positions and len(positions) > 0:
                 # Use the first position found
@@ -476,7 +461,14 @@ class LpPositionManager(ScriptStrategyBase):
             await asyncio.sleep(3)  # Wait for position to be created on-chain
 
             connector = self.connectors[self.exchange]
-            positions = await connector.get_user_positions(pool_address=self.config.pool_address)
+
+            # Get pool address from trading pair
+            pool_address = connector.get_pool_address(self.trading_pair)
+            if not pool_address:
+                self.logger().error(f"Pool address not found for {self.trading_pair}")
+                return
+
+            positions = await connector.get_user_positions(pool_address=pool_address)
 
             if positions:
                 # Get the most recent position
@@ -571,7 +563,7 @@ class LpPositionManager(ScriptStrategyBase):
         elif self.current_position_id and self.position_info:
             # Active position
             lines.append(f"Position: {self.current_position_id}")
-            lines.append(f"Pool: {self.trading_pair} ({self.config.pool_address})")
+            lines.append(f"Pool: {self.trading_pair}")
             lines.append(f"Connector: {self.exchange}")
 
             # Tokens and value section
@@ -635,9 +627,7 @@ class LpPositionManager(ScriptStrategyBase):
                 lines.append(f"Out of bounds for: {elapsed:.0f}/{self.config.rebalance_seconds} seconds")
 
         else:
-            lines.append(f"Monitoring pool {self.config.pool_address} on {self.exchange}")
-            if self.trading_pair:
-                lines.append(f"Trading pair: {self.trading_pair}")
+            lines.append(f"Monitoring {self.trading_pair} on {self.exchange}")
             lines.append("Status: ⏳ No active position")
 
             if self.config.base_amount > 0 or self.config.quote_amount > 0:
