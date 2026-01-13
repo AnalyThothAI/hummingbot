@@ -242,6 +242,11 @@ class LpPositionManager(ScriptStrategyBase):
             return
 
         try:
+            # Safety check: verify no existing position before creating new one
+            if await self.check_existing_positions():
+                self.logger().info(f"Found existing position {self.current_position_id}, will manage it instead of creating new one")
+                return
+
             if not self.pool_info:
                 await self.fetch_pool_info()
 
