@@ -458,7 +458,10 @@ class GatewayHttpClient:
                     self.log_error_codes(parsed_response)
 
                     if "error" in parsed_response:
-                        raise ValueError(f"Error on {method.upper()} {url} Error: {parsed_response['error']}")
+                        # Include error code if present (e.g., TRANSACTION_TIMEOUT)
+                        error_code = parsed_response.get('code', '')
+                        code_suffix = f" [code: {error_code}]" if error_code else ""
+                        raise ValueError(f"Error on {method.upper()} {url} Error: {parsed_response['error']}{code_suffix}")
                     else:
                         raise ValueError(f"Error on {method.upper()} {url} Error: {parsed_response}")
 

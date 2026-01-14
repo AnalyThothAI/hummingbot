@@ -214,7 +214,7 @@ class LpPositionManager(ScriptStrategyBase):
                 f"LP Position Manager configured:\n"
                 f"  Trading Pair: {self.trading_pair}\n"
                 f"  Pool Address: {self.pool_address}\n"
-                f"  Position width: ±{float(self.config.position_width_pct) / 2:.2f}% around mid price\n"
+                f"  Position width: {float(self.config.position_width_pct):.2f}% (position_width_pct)\n"
                 f"  Rebalance threshold: {self.config.rebalance_seconds} seconds out-of-bounds\n"
                 f"  Check interval: {self.config.check_seconds} seconds"
             )
@@ -1157,7 +1157,7 @@ class LpPositionManager(ScriptStrategyBase):
                 self.logger().warning("Position closed but no rebalance info available!")
 
     def did_fail_lp_update(self, event: RangePositionUpdateFailureEvent):
-        """Called when an LP operation fails - retry the operation"""
+        """Called when an LP operation fails due to transaction timeout - retry the operation"""
         # Check if this failure is for our pending operation
         is_open_failure = hasattr(event, 'order_id') and event.order_id == self.pending_open_order_id
         is_close_failure = hasattr(event, 'order_id') and event.order_id == self.pending_close_order_id
@@ -1166,10 +1166,13 @@ class LpPositionManager(ScriptStrategyBase):
             return  # Not our order
 
         operation_type = "open" if event.order_action == LPType.ADD else "close"
-        self.logger().warning(f"LP {operation_type} operation failed for order {event.order_id}, will retry...")
+        self.logger().warning(
+            f"Transaction timeout for {self.trading_pair} {operation_type} (order: {event.order_id}). "
+            f"Chain may be congested. Will retry..."
+        )
 
-        # Notify user
-        msg = f"⚠️ {self.trading_pair} {operation_type} failed, retrying..."
+        # Notify user about timeout and retry
+        msg = f"⏱️ {self.trading_pair} {operation_type} timed out (chain congestion), retrying..."
         self.notify_hb_app_with_timestamp(msg)
 
         if is_open_failure:
@@ -1180,11 +1183,13 @@ class LpPositionManager(ScriptStrategyBase):
             # Retry opening position
             if self._closed_position_balances:
                 # This was a rebalance open - retry with saved balances
-                self.logger().info("Retrying rebalanced position open...")
+                self.logger().info(f"Retrying rebalanced position open for {self.trading_pair}...")
+                self.notify_hb_app_with_timestamp(f"🔄 Retrying {self.trading_pair} position open...")
                 safe_ensure_future(self.open_rebalanced_position())
             elif self._opening_position_amounts:
                 # This was an initial position open - retry
-                self.logger().info("Retrying initial position open...")
+                self.logger().info(f"Retrying initial position open for {self.trading_pair}...")
+                self.notify_hb_app_with_timestamp(f"🔄 Retrying {self.trading_pair} position open...")
                 safe_ensure_future(self.create_initial_position())
 
         elif is_close_failure:
@@ -1194,7 +1199,8 @@ class LpPositionManager(ScriptStrategyBase):
 
             # Retry closing position
             if self.current_position_id:
-                self.logger().info("Retrying position close...")
+                self.logger().info(f"Retrying position close for {self.trading_pair}...")
+                self.notify_hb_app_with_timestamp(f"🔄 Retrying {self.trading_pair} position close...")
                 safe_ensure_future(self.retry_close_position())
 
     async def retry_close_position(self):
@@ -1246,12 +1252,6 @@ class LpPositionManager(ScriptStrategyBase):
         total_fees_base_value = sum(p.get("base_fees", 0) * p.get("mid_price", 0) for p in closes)
         total_fees_value = total_fees_base_value + total_fees_quote
 
-        # Calculate averages for price ranges
-        avg_open_lower = sum(p["lower_price"] for p in opens) / len(opens) if opens else 0
-        avg_open_upper = sum(p["upper_price"] for p in opens) / len(opens) if opens else 0
-        avg_close_lower = sum(p["lower_price"] for p in closes) / len(closes) if closes else 0
-        avg_close_upper = sum(p["upper_price"] for p in closes) / len(closes) if closes else 0
-
         # Calculate position P&L: Total Close Value + Total Fees - Total Open Value
         position_pnl = (total_close_value + total_fees_value - total_open_value) if closes else 0
         position_roi_pct = (position_pnl / total_open_value * 100) if total_open_value > 0 else 0
@@ -1286,11 +1286,6 @@ class LpPositionManager(ScriptStrategyBase):
             "total_fees_base_value": total_fees_base_value,
             "total_fees_quote": total_fees_quote,
             "total_fees_value": total_fees_value,
-            # Price ranges
-            "avg_open_lower": avg_open_lower,
-            "avg_open_upper": avg_open_upper,
-            "avg_close_lower": avg_close_lower,
-            "avg_close_upper": avg_close_upper,
             # P&L
             "position_pnl": position_pnl,
             "position_roi_pct": position_roi_pct,
@@ -1388,8 +1383,6 @@ class LpPositionManager(ScriptStrategyBase):
         lower_str = f'{float(lower_price):.6f}'
         upper_str = f'{float(upper_price):.6f}'
         viz_lines.append(lower_str + ' ' * (bar_width - len(lower_str) - len(upper_str)) + upper_str)
-        viz_lines.append('')  # Spacer
-        viz_lines.append(f'Price: {float(current_price):.6f}')
 
         return '\n'.join(viz_lines)
 
@@ -1537,23 +1530,26 @@ class LpPositionManager(ScriptStrategyBase):
             if self.pool_info:
                 current_price = Decimal(str(self.pool_info.price))
 
+                # Price range visualization
+                lines.append("Position Range:")
+                lines.append(self._create_price_range_visualization(lower_price, current_price, upper_price))
+
                 # Distribution visualization (Meteora only, only for positions created by script)
                 if self.has_rebalanced_once:
                     is_base_only = base_amount > 0 and quote_amount == 0
                     dist_viz = self._create_distribution_visualization(is_base_only)
                     if dist_viz:
+                        lines.append("")  # Spacer before distribution
                         lines.append(dist_viz)
-                        lines.append("")  # Spacer after distribution
 
-                # Price range visualization
-                lines.append("Position Range:")
-                lines.append(self._create_price_range_visualization(lower_price, current_price, upper_price))
-
+                # Price and status
+                lines.append("")
+                lines.append(f"Price: {float(current_price):.6f}")
                 if self._price_in_bounds(current_price, lower_price, upper_price):
-                    lines.append("Status: ✅ In Bounds")
+                    lines.append("Status: ✅  In Range")
                 else:
                     arrow = "⬇️" if current_price < lower_price else "⬆️"
-                    lines.append(f"Status: {arrow} Out of Bounds")
+                    lines.append(f"Status: {arrow}  Out of Range")
 
                 lines.append("")  # Spacer after position range
 
@@ -1563,10 +1559,6 @@ class LpPositionManager(ScriptStrategyBase):
                     lines.append(limits_viz)
             else:
                 lines.append(f"Position Range: {lower_price:.6f} - {upper_price:.6f}")
-
-            if self.out_of_bounds_since:
-                elapsed = time.time() - self.out_of_bounds_since
-                lines.append(f"Out of bounds for: {elapsed:.0f}/{self.config.rebalance_seconds} seconds")
 
         else:
             lines.append(f"Monitoring {self.trading_pair} on {self.exchange}")
@@ -1591,24 +1583,18 @@ class LpPositionManager(ScriptStrategyBase):
         if pnl_summary is None:
             pnl_summary = self._calculate_pnl_summary()
         lines.append("")
-        lines.append("=" * 50)
         lines.append("LP Performance Summary:")
-        lines.append(f"  Positions Opened: {pnl_summary['opens_count']}")
-        lines.append(f"  Positions Closed: {pnl_summary['closes_count']}")
 
         if pnl_summary["closes_count"] > 0:
             base = self.base_token or (self.base_token_address[:8] + "..." if self.base_token_address else "BASE")
             quote = self.quote_token or (self.quote_token_address[:8] + "..." if self.quote_token_address else "QUOTE")
             lines.append("")
-            lines.append(f"  Avg Open Prices: Lower {pnl_summary['avg_open_lower']:.6f} - Upper {pnl_summary['avg_open_upper']:.6f}")
-            lines.append(f"  Avg Close Prices: Lower {pnl_summary['avg_close_lower']:.6f} - Upper {pnl_summary['avg_close_upper']:.6f}")
-            lines.append("")
-            lines.append("  Total Opened:")
+            lines.append(f"  Positions Opened: {pnl_summary['opens_count']}")
             lines.append(f"    {base}: {pnl_summary['total_open_base']:.6f} ({pnl_summary['total_open_base_value']:.6f} {quote})")
             lines.append(f"    {quote}: {pnl_summary['total_open_quote']:.6f}")
             lines.append(f"    Value: {pnl_summary['total_open_value']:.6f} {quote}")
             lines.append("")
-            lines.append("  Total Closed:")
+            lines.append(f"  Positions Closed: {pnl_summary['closes_count']}")
             lines.append(f"    {base}: {pnl_summary['total_close_base']:.6f} ({pnl_summary['total_close_base_value']:.6f} {quote})")
             lines.append(f"    {quote}: {pnl_summary['total_close_quote']:.6f}")
             lines.append(f"    Value: {pnl_summary['total_close_value']:.6f} {quote}")
@@ -1620,6 +1606,9 @@ class LpPositionManager(ScriptStrategyBase):
             lines.append("")
             pnl_sign = "+" if pnl_summary["position_pnl"] >= 0 else ""
             lines.append(f"  P&L: {pnl_sign}{pnl_summary['position_pnl']:.6f} {quote} ({pnl_sign}{pnl_summary['position_roi_pct']:.2f}%)")
+        else:
+            lines.append(f"  Positions Opened: {pnl_summary['opens_count']}")
+            lines.append(f"  Positions Closed: {pnl_summary['closes_count']}")
 
         lines.append("")
         lines.append("Wallet SOL:")

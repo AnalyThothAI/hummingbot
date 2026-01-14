@@ -181,6 +181,44 @@ class GatewayLp(GatewaySwap):
                 except Exception as e:
                     self.logger().warning(f"Error triggering LP event for {tracked_order.client_order_id}: {e}", exc_info=True)
 
+    # Error code from gateway for transaction confirmation timeout
+    TRANSACTION_TIMEOUT_CODE = "TRANSACTION_TIMEOUT"
+
+    def _handle_operation_failure(self, order_id: str, trading_pair: str, operation_name: str, error: Exception):
+        """
+        Override to trigger RangePositionUpdateFailureEvent for LP operations.
+        Only triggers retry for transaction confirmation timeouts (code: TRANSACTION_TIMEOUT).
+        """
+        # Call parent implementation
+        super()._handle_operation_failure(order_id, trading_pair, operation_name, error)
+
+        # Check if this is a transaction timeout error (retryable)
+        # Gateway returns error with code "TRANSACTION_TIMEOUT" for tx confirmation timeouts
+        error_str = str(error)
+        is_timeout_error = self.TRANSACTION_TIMEOUT_CODE in error_str
+
+        if is_timeout_error and order_id in self._lp_orders_metadata:
+            metadata = self._lp_orders_metadata[order_id]
+            operation = metadata.get("operation", "")
+            self.logger().warning(
+                f"Transaction timeout detected for LP {operation} order {order_id} on {trading_pair}. "
+                f"Chain may be congested. Triggering retry event..."
+            )
+            self.trigger_event(
+                MarketEvent.RangePositionUpdateFailure,
+                RangePositionUpdateFailureEvent(
+                    timestamp=self.current_timestamp,
+                    order_id=order_id,
+                    order_action=LPType.ADD if operation == "add" else LPType.REMOVE,
+                )
+            )
+            # Clean up metadata
+            del self._lp_orders_metadata[order_id]
+        elif order_id in self._lp_orders_metadata:
+            # Non-retryable error, just clean up metadata
+            self.logger().warning(f"Non-retryable error for {order_id}: {error_str[:100]}")
+            del self._lp_orders_metadata[order_id]
+
     def _trigger_add_liquidity_event(
         self,
         order_id: str,
