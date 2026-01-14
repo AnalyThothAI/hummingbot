@@ -9,7 +9,7 @@ BEHAVIOR
 - Monitors price vs. active position's price bounds
 - When price is out-of-bounds for >= rebalance_seconds, fully closes the position and re-enters
 - First position can be double-sided (if both base_amount and quote_amount provided)
-- After first rebalance, all subsequent positions are SINGLE-SIDED (more capital efficient)
+- After first rebalance, all subsequent positions are SINGLE-SIDED
 - Single-sided positions provide only the token needed based on where price moved
 
 PARAMETERS
@@ -60,7 +60,12 @@ from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.gateway.common_types import ConnectorType, get_connector_type
 from hummingbot.connector.gateway.gateway_lp import CLMMPoolInfo, CLMMPositionInfo
-from hummingbot.core.event.events import RangePositionLiquidityAddedEvent, RangePositionLiquidityRemovedEvent
+from hummingbot.core.data_type.common import LPType
+from hummingbot.core.event.events import (
+    RangePositionLiquidityAddedEvent,
+    RangePositionLiquidityRemovedEvent,
+    RangePositionUpdateFailureEvent,
+)
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
@@ -69,8 +74,9 @@ from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 
 class LpPositionManagerConfig(BaseClientModel):
     script_file_name: str = os.path.basename(__file__)
+    config_file_name: Optional[str] = None  # Set by trading_core with the config file name
     connector: str = Field("meteora/clmm", json_schema_extra={
-        "prompt": "CLMM connector in format 'name/type' (e.g. raydium/clmm, meteora/clmm)", "prompt_on_new": True})
+        "prompt": "CLMM connector in format 'name/type' (e.g. meteora/clmm, uniswap/clmm)", "prompt_on_new": True})
     pool_address: str = Field("", json_schema_extra={
         "prompt": "Pool address (e.g. 2sf5NYcY4zUPXUSmG6f66mskb24t5F8S11pC1Nz5nQT3)", "prompt_on_new": True})
     base_amount: Decimal = Field(Decimal("0"), json_schema_extra={
@@ -81,8 +87,8 @@ class LpPositionManagerConfig(BaseClientModel):
         "prompt": "TOTAL position width as percentage (e.g. 2.0 for ±1% around mid price)", "prompt_on_new": True})
     rebalance_seconds: int = Field(60, json_schema_extra={
         "prompt": "Seconds price must stay out-of-bounds before rebalancing", "prompt_on_new": True})
-    check_seconds: int = Field(30, json_schema_extra={
-        "prompt": "Seconds between position status checks (important for rate limits)", "prompt_on_new": True})
+    check_seconds: int = Field(10, json_schema_extra={
+        "prompt": "Seconds between position status checks (configure based on node rate limits)", "prompt_on_new": True})
     lower_price_limit: Optional[Decimal] = Field(None, json_schema_extra={
         "prompt": "Lower price limit (optional, never provide liquidity below this price)", "prompt_on_new": False})
     upper_price_limit: Optional[Decimal] = Field(None, json_schema_extra={
@@ -154,8 +160,14 @@ class LpPositionManager(ScriptStrategyBase):
         self._last_position_update_time: float = 0
         self._last_pool_info_fetch_time: float = 0
 
-        # P&L tracking
-        self._tracking_file_path = Path("data") / f"lp_position_history_{self.pool_address[:8]}.json"
+        # P&L tracking - use config file name if available, otherwise script name
+        if config.config_file_name:
+            # Remove .yml extension if present
+            tracking_name = config.config_file_name.replace('.yml', '').replace('.yaml', '')
+        else:
+            # Fallback to script name without .py extension
+            tracking_name = config.script_file_name.replace('.py', '')
+        self._tracking_file_path = Path("data") / f"{tracking_name}.json"
         self._tracking_data: Dict = self._load_tracking_data()
 
         # Log initial startup (will log more details after resolving trading pair)
@@ -204,7 +216,7 @@ class LpPositionManager(ScriptStrategyBase):
                 f"  Pool Address: {self.pool_address}\n"
                 f"  Position width: ±{float(self.config.position_width_pct) / 2:.2f}% around mid price\n"
                 f"  Rebalance threshold: {self.config.rebalance_seconds} seconds out-of-bounds\n"
-                f"  Check interval: {self.config.check_seconds} seconds (rate limiting)"
+                f"  Check interval: {self.config.check_seconds} seconds"
             )
 
             if self.config.lower_price_limit or self.config.upper_price_limit:
@@ -288,6 +300,9 @@ class LpPositionManager(ScriptStrategyBase):
 
         # Initialize new tracking data (SOL balance will be set later when connector is ready)
         return {
+            "config_file": self.config.config_file_name,
+            "pool_address": self.pool_address,
+            "connector": self.exchange,
             "initial_sol_balance": 0.0,
             "tracking_started": int(time.time()),
             "positions": []
@@ -414,7 +429,7 @@ class LpPositionManager(ScriptStrategyBase):
         self._last_check_time = current_time
 
         if self.pending_operation:
-            # Operation in progress, wait for confirmation
+            # Operation in progress, connector handles timeout
             return
 
         if self.current_position_id:
@@ -493,7 +508,8 @@ class LpPositionManager(ScriptStrategyBase):
 
             if not in_bounds:
                 # Position is already out of range - start the rebalance countdown
-                self.out_of_bounds_since = self.current_timestamp
+                # Use time.time() for consistency with monitor_and_rebalance
+                self.out_of_bounds_since = time.time()
 
                 # Calculate deviation using helper
                 deviation, direction, bound = self._calculate_price_deviation(current_price, lower_price, upper_price)
@@ -504,9 +520,11 @@ class LpPositionManager(ScriptStrategyBase):
 
                 msg = (f"{arrow} Out of range: {float(current_price):.6f} {text_arrow} {direction} "
                        f"{float(bound):.6f} ({deviation:.2f}%). Rebalance in {self.config.rebalance_seconds}s")
-
                 self.logger().warning(msg)
                 self.notify_hb_app_with_timestamp(msg)
+
+                # Schedule immediate rebalance check (handles rebalance_seconds=0 case)
+                safe_ensure_future(self.monitor_and_rebalance())
             else:
                 self.logger().info(f"Position is in range at startup (price: {float(current_price):.6f}, "
                                    f"range: {float(lower_price):.6f} - {float(upper_price):.6f})")
@@ -1096,11 +1114,11 @@ class LpPositionManager(ScriptStrategyBase):
             if self._opening_position_amounts:
                 base_amt = self._opening_position_amounts["base_amount"]
                 quote_amt = self._opening_position_amounts["quote_amount"]
-                msg = (f"✅ Opened {self.trading_pair}: "
+                msg = (f"✓ Opened {self.trading_pair}: "
                        f"Added {base_amt:.6f} {self.base_token} + {quote_amt:.6f} {self.quote_token}")
                 self._opening_position_amounts = None  # Clear after use
             else:
-                msg = f"✅ Opened {self.trading_pair}"
+                msg = f"✓ Opened {self.trading_pair}"
 
             self.notify_hb_app_with_timestamp(msg)
 
@@ -1124,10 +1142,10 @@ class LpPositionManager(ScriptStrategyBase):
             if self._closed_position_balances:
                 total_base = self._closed_position_balances["total_base_removed"]
                 total_quote = self._closed_position_balances["total_quote_removed"]
-                msg = (f"✅ Closed {self.trading_pair}: "
+                msg = (f"✓ Closed {self.trading_pair}: "
                        f"Removed {total_base:.6f} {self.base_token} + {total_quote:.6f} {self.quote_token}")
             else:
-                msg = f"✅ Closed {self.trading_pair}"
+                msg = f"✓ Closed {self.trading_pair}"
 
             self.notify_hb_app_with_timestamp(msg)
 
@@ -1138,6 +1156,68 @@ class LpPositionManager(ScriptStrategyBase):
             else:
                 self.logger().warning("Position closed but no rebalance info available!")
 
+    def did_fail_lp_update(self, event: RangePositionUpdateFailureEvent):
+        """Called when an LP operation fails - retry the operation"""
+        # Check if this failure is for our pending operation
+        is_open_failure = hasattr(event, 'order_id') and event.order_id == self.pending_open_order_id
+        is_close_failure = hasattr(event, 'order_id') and event.order_id == self.pending_close_order_id
+
+        if not is_open_failure and not is_close_failure:
+            return  # Not our order
+
+        operation_type = "open" if event.order_action == LPType.ADD else "close"
+        self.logger().warning(f"LP {operation_type} operation failed for order {event.order_id}, will retry...")
+
+        # Notify user
+        msg = f"⚠️ {self.trading_pair} {operation_type} failed, retrying..."
+        self.notify_hb_app_with_timestamp(msg)
+
+        if is_open_failure:
+            # Clear pending state for open
+            self.pending_open_order_id = None
+            self.pending_operation = None
+
+            # Retry opening position
+            if self._closed_position_balances:
+                # This was a rebalance open - retry with saved balances
+                self.logger().info("Retrying rebalanced position open...")
+                safe_ensure_future(self.open_rebalanced_position())
+            elif self._opening_position_amounts:
+                # This was an initial position open - retry
+                self.logger().info("Retrying initial position open...")
+                safe_ensure_future(self.create_initial_position())
+
+        elif is_close_failure:
+            # Clear pending state for close
+            self.pending_close_order_id = None
+            self.pending_operation = None
+
+            # Retry closing position
+            if self.current_position_id:
+                self.logger().info("Retrying position close...")
+                safe_ensure_future(self.retry_close_position())
+
+    async def retry_close_position(self):
+        """Retry closing the current position"""
+        if self.pending_operation or not self.trading_pair or not self.current_position_id:
+            return
+
+        try:
+            self.logger().info(f"Retrying close for position {self.current_position_id}")
+
+            order_id = self.connectors[self.exchange].remove_liquidity(
+                trading_pair=self.trading_pair,
+                position_address=self.current_position_id
+            )
+
+            self.pending_close_order_id = order_id
+            self.pending_operation = "closing"
+            self.logger().info(f"Position close retry submitted with ID: {order_id}")
+
+        except Exception as e:
+            self.logger().error(f"Error retrying position close: {str(e)}")
+            self.pending_operation = None
+
     def _calculate_pnl_summary(self) -> Dict:
         """Calculate P&L summary from position history"""
         positions = self._tracking_data.get("positions", [])
@@ -1145,15 +1225,36 @@ class LpPositionManager(ScriptStrategyBase):
         opens = [p for p in positions if p["type"] == "open"]
         closes = [p for p in positions if p["type"] == "close"]
 
-        # Calculate averages
-        avg_open_value = sum(p["value_in_quote"] for p in opens) / len(opens) if opens else 0
-        avg_close_value = sum(p["value_in_quote"] for p in closes) / len(closes) if closes else 0
-        avg_open_price = sum(p["mid_price"] for p in opens) / len(opens) if opens else 0
-        avg_close_price = sum(p["mid_price"] for p in closes) / len(closes) if closes else 0
+        # Calculate totals for opens
+        total_open_base = sum(p.get("base_amount", 0) for p in opens)
+        total_open_quote = sum(p.get("quote_amount", 0) for p in opens)
+        # Base value = base_amount * mid_price at open time
+        total_open_base_value = sum(p.get("base_amount", 0) * p.get("mid_price", 0) for p in opens)
+        total_open_value = total_open_base_value + total_open_quote
 
-        # Calculate position P&L (only from closed positions)
-        position_pnl = avg_close_value - avg_open_value if closes else 0
-        position_roi_pct = (position_pnl / avg_open_value * 100) if avg_open_value > 0 else 0
+        # Calculate totals for closes
+        total_close_base = sum(p.get("base_amount", 0) for p in closes)
+        total_close_quote = sum(p.get("quote_amount", 0) for p in closes)
+        # Base value = base_amount * mid_price at close time
+        total_close_base_value = sum(p.get("base_amount", 0) * p.get("mid_price", 0) for p in closes)
+        total_close_value = total_close_base_value + total_close_quote
+
+        # Calculate total fees collected (in quote)
+        total_fees_base = sum(p.get("base_fees", 0) for p in closes)
+        total_fees_quote = sum(p.get("quote_fees", 0) for p in closes)
+        # Convert base fees to quote using mid_price at close time
+        total_fees_base_value = sum(p.get("base_fees", 0) * p.get("mid_price", 0) for p in closes)
+        total_fees_value = total_fees_base_value + total_fees_quote
+
+        # Calculate averages for price ranges
+        avg_open_lower = sum(p["lower_price"] for p in opens) / len(opens) if opens else 0
+        avg_open_upper = sum(p["upper_price"] for p in opens) / len(opens) if opens else 0
+        avg_close_lower = sum(p["lower_price"] for p in closes) / len(closes) if closes else 0
+        avg_close_upper = sum(p["upper_price"] for p in closes) / len(closes) if closes else 0
+
+        # Calculate position P&L: Total Close Value + Total Fees - Total Open Value
+        position_pnl = (total_close_value + total_fees_value - total_open_value) if closes else 0
+        position_roi_pct = (position_pnl / total_open_value * 100) if total_open_value > 0 else 0
 
         # Get current position open timestamp if open
         current_position_open_time = None
@@ -1170,13 +1271,31 @@ class LpPositionManager(ScriptStrategyBase):
         return {
             "opens_count": len(opens),
             "closes_count": len(closes),
-            "avg_open_value": avg_open_value,
-            "avg_close_value": avg_close_value,
-            "avg_open_price": avg_open_price,
-            "avg_close_price": avg_close_price,
+            # Open totals
+            "total_open_base": total_open_base,
+            "total_open_base_value": total_open_base_value,
+            "total_open_quote": total_open_quote,
+            "total_open_value": total_open_value,
+            # Close totals
+            "total_close_base": total_close_base,
+            "total_close_base_value": total_close_base_value,
+            "total_close_quote": total_close_quote,
+            "total_close_value": total_close_value,
+            # Fees
+            "total_fees_base": total_fees_base,
+            "total_fees_base_value": total_fees_base_value,
+            "total_fees_quote": total_fees_quote,
+            "total_fees_value": total_fees_value,
+            # Price ranges
+            "avg_open_lower": avg_open_lower,
+            "avg_open_upper": avg_open_upper,
+            "avg_close_lower": avg_close_lower,
+            "avg_close_upper": avg_close_upper,
+            # P&L
             "position_pnl": position_pnl,
             "position_roi_pct": position_roi_pct,
             "current_position_open_time": current_position_open_time,
+            # SOL tracking
             "initial_sol": initial_sol,
             "current_sol": current_sol,
             "sol_change": sol_change
@@ -1269,6 +1388,7 @@ class LpPositionManager(ScriptStrategyBase):
         lower_str = f'{float(lower_price):.6f}'
         upper_str = f'{float(upper_price):.6f}'
         viz_lines.append(lower_str + ' ' * (bar_width - len(lower_str) - len(upper_str)) + upper_str)
+        viz_lines.append('')  # Spacer
         viz_lines.append(f'Price: {float(current_price):.6f}')
 
         return '\n'.join(viz_lines)
@@ -1336,6 +1456,7 @@ class LpPositionManager(ScriptStrategyBase):
     def format_status(self) -> str:
         """Format status message for display"""
         lines = []
+        pnl_summary = None  # Will be calculated when needed
 
         if self.pending_operation == "opening":
             lines.append(f"⏳ Opening position (order ID: {self.pending_open_order_id})")
@@ -1344,6 +1465,9 @@ class LpPositionManager(ScriptStrategyBase):
             lines.append(f"⏳ Closing position (order ID: {self.pending_close_order_id})")
             lines.append("Awaiting transaction confirmation...")
         elif self.current_position_id and self.position_info:
+            # Calculate P&L summary early for use in display
+            pnl_summary = self._calculate_pnl_summary()
+
             # Active position
             lines.append(f"Position: {self.current_position_id}")
             lines.append(f"Pool: {self.trading_pair}")
@@ -1380,11 +1504,29 @@ class LpPositionManager(ScriptStrategyBase):
 
                 if base_fee > 0 or quote_fee > 0:
                     lines.append(f"Fees: {base_fee:.6f} {self.base_token} / {quote_fee:.6f} {self.quote_token} ({fee_pct:.2f}%)")
+
+                # Show duration for current position
+                if pnl_summary["current_position_open_time"] is not None:
+                    from datetime import datetime
+                    open_dt = datetime.fromtimestamp(pnl_summary["current_position_open_time"])
+                    elapsed = int(time.time() - pnl_summary["current_position_open_time"])
+                    elapsed_m = elapsed // 60
+                    elapsed_s = elapsed % 60
+                    lines.append(f"Duration: {open_dt.strftime('%Y-%m-%d %H:%M:%S')} ({elapsed_m}m {elapsed_s}s)")
             else:
                 lines.append(f"Tokens: {base_amount:.6f} {self.base_token} / {quote_amount:.6f} {self.quote_token}")
 
                 if base_fee > 0 or quote_fee > 0:
                     lines.append(f"Fees: {base_fee:.6f} {self.base_token} / {quote_fee:.6f} {self.quote_token}")
+
+                # Show duration for current position
+                if pnl_summary["current_position_open_time"] is not None:
+                    from datetime import datetime
+                    open_dt = datetime.fromtimestamp(pnl_summary["current_position_open_time"])
+                    elapsed = int(time.time() - pnl_summary["current_position_open_time"])
+                    elapsed_m = elapsed // 60
+                    elapsed_s = elapsed % 60
+                    lines.append(f"Duration: {open_dt.strftime('%Y-%m-%d %H:%M:%S')} ({elapsed_m}m {elapsed_s}s)")
 
             lines.append("")  # Spacer
 
@@ -1401,6 +1543,7 @@ class LpPositionManager(ScriptStrategyBase):
                     dist_viz = self._create_distribution_visualization(is_base_only)
                     if dist_viz:
                         lines.append(dist_viz)
+                        lines.append("")  # Spacer after distribution
 
                 # Price range visualization
                 lines.append("Position Range:")
@@ -1412,10 +1555,11 @@ class LpPositionManager(ScriptStrategyBase):
                     arrow = "⬇️" if current_price < lower_price else "⬆️"
                     lines.append(f"Status: {arrow} Out of Bounds")
 
+                lines.append("")  # Spacer after position range
+
                 # Add price limits visualization
                 limits_viz = self._create_price_limits_visualization(current_price)
                 if limits_viz:
-                    lines.append("")
                     lines.append(limits_viz)
             else:
                 lines.append(f"Position Range: {lower_price:.6f} - {upper_price:.6f}")
@@ -1442,36 +1586,46 @@ class LpPositionManager(ScriptStrategyBase):
                     lines.append("")
                     lines.append(limits_viz)
 
-        # Add P&L Summary
-        pnl_summary = self._calculate_pnl_summary()
-        if pnl_summary["opens_count"] > 0 or pnl_summary["closes_count"] > 0:
+        # Add P&L Summary (always show)
+        # Calculate pnl_summary if not already calculated in position display
+        if pnl_summary is None:
+            pnl_summary = self._calculate_pnl_summary()
+        lines.append("")
+        lines.append("=" * 50)
+        lines.append("LP Performance Summary:")
+        lines.append(f"  Positions Opened: {pnl_summary['opens_count']}")
+        lines.append(f"  Positions Closed: {pnl_summary['closes_count']}")
+
+        if pnl_summary["closes_count"] > 0:
+            base = self.base_token or (self.base_token_address[:8] + "..." if self.base_token_address else "BASE")
+            quote = self.quote_token or (self.quote_token_address[:8] + "..." if self.quote_token_address else "QUOTE")
             lines.append("")
-            lines.append("=" * 50)
-            lines.append("LP Performance Summary:")
-            lines.append(f"  Positions Opened: {pnl_summary['opens_count']}")
-            lines.append(f"  Positions Closed: {pnl_summary['closes_count']}")
-
-            if pnl_summary["closes_count"] > 0:
-                lines.append("")
-                lines.append(f"  Avg Open:  {pnl_summary['avg_open_value']:.6f} {self.quote_token} (avg price: {pnl_summary['avg_open_price']:.6f})")
-                lines.append(f"  Avg Close: {pnl_summary['avg_close_value']:.6f} {self.quote_token} (avg price: {pnl_summary['avg_close_price']:.6f})")
-                pnl_sign = "+" if pnl_summary["position_pnl"] >= 0 else ""
-                lines.append(f"  Position P&L: {pnl_sign}{pnl_summary['position_pnl']:.6f} {self.quote_token} ({pnl_sign}{pnl_summary['position_roi_pct']:.2f}%)")
-
-            if pnl_summary["current_position_open_time"] is not None:
-                from datetime import datetime
-                open_dt = datetime.fromtimestamp(pnl_summary["current_position_open_time"])
-                elapsed = int(time.time() - pnl_summary["current_position_open_time"])
-                elapsed_m = elapsed // 60
-                elapsed_s = elapsed % 60
-                lines.append("")
-                lines.append(f"  Current: OPEN since {open_dt.strftime('%Y-%m-%d %H:%M:%S')} ({elapsed_m}m {elapsed_s}s)")
-
+            lines.append(f"  Avg Open Prices: Lower {pnl_summary['avg_open_lower']:.6f} - Upper {pnl_summary['avg_open_upper']:.6f}")
+            lines.append(f"  Avg Close Prices: Lower {pnl_summary['avg_close_lower']:.6f} - Upper {pnl_summary['avg_close_upper']:.6f}")
             lines.append("")
-            lines.append("Wallet SOL:")
-            lines.append(f"  Initial:  {pnl_summary['initial_sol']:.4f} SOL")
-            lines.append(f"  Current:  {pnl_summary['current_sol']:.4f} SOL")
-            sol_change_sign = "+" if pnl_summary["sol_change"] >= 0 else ""
-            lines.append(f"  Change:   {sol_change_sign}{pnl_summary['sol_change']:.4f} SOL")
+            lines.append("  Total Opened:")
+            lines.append(f"    {base}: {pnl_summary['total_open_base']:.6f} ({pnl_summary['total_open_base_value']:.6f} {quote})")
+            lines.append(f"    {quote}: {pnl_summary['total_open_quote']:.6f}")
+            lines.append(f"    Value: {pnl_summary['total_open_value']:.6f} {quote}")
+            lines.append("")
+            lines.append("  Total Closed:")
+            lines.append(f"    {base}: {pnl_summary['total_close_base']:.6f} ({pnl_summary['total_close_base_value']:.6f} {quote})")
+            lines.append(f"    {quote}: {pnl_summary['total_close_quote']:.6f}")
+            lines.append(f"    Value: {pnl_summary['total_close_value']:.6f} {quote}")
+            lines.append("")
+            lines.append("  Total Fees:")
+            lines.append(f"    {base}: {pnl_summary['total_fees_base']:.6f} ({pnl_summary['total_fees_base_value']:.6f} {quote})")
+            lines.append(f"    {quote}: {pnl_summary['total_fees_quote']:.6f}")
+            lines.append(f"    Value: {pnl_summary['total_fees_value']:.6f} {quote}")
+            lines.append("")
+            pnl_sign = "+" if pnl_summary["position_pnl"] >= 0 else ""
+            lines.append(f"  P&L: {pnl_sign}{pnl_summary['position_pnl']:.6f} {quote} ({pnl_sign}{pnl_summary['position_roi_pct']:.2f}%)")
+
+        lines.append("")
+        lines.append("Wallet SOL:")
+        lines.append(f"  Initial:  {pnl_summary['initial_sol']:.4f} SOL")
+        lines.append(f"  Current:  {pnl_summary['current_sol']:.4f} SOL")
+        sol_change_sign = "+" if pnl_summary["sol_change"] >= 0 else ""
+        lines.append(f"  Change:   {sol_change_sign}{pnl_summary['sol_change']:.4f} SOL")
 
         return "\n".join(lines)

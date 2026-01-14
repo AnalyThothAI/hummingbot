@@ -7,12 +7,13 @@ from pydantic import BaseModel, Field
 from hummingbot.connector.gateway.common_types import ConnectorType, get_connector_type
 from hummingbot.connector.gateway.gateway_in_flight_order import GatewayInFlightOrder
 from hummingbot.connector.gateway.gateway_swap import GatewaySwap
-from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.common import LPType, TradeType
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.event.events import (
     MarketEvent,
     RangePositionLiquidityAddedEvent,
     RangePositionLiquidityRemovedEvent,
+    RangePositionUpdateFailureEvent,
 )
 from hummingbot.core.utils import async_ttl_cache
 from hummingbot.core.utils.async_utils import safe_ensure_future
@@ -139,10 +140,19 @@ class GatewayLp(GatewaySwap):
                     ),
                 )
         elif tracked_order.is_failure:
-            # Transaction failed - parent class already triggered TransactionFailure event
+            # Transaction failed - trigger LP-specific failure event for strategy handling
             operation_type = "add" if metadata["operation"] == "add" else "remove"
             self.logger().error(
                 f"LP {operation_type} liquidity transaction failed for order {order_id} (tx: {transaction_hash})"
+            )
+            # Trigger RangePositionUpdateFailureEvent so strategies can retry
+            self.trigger_event(
+                MarketEvent.RangePositionUpdateFailure,
+                RangePositionUpdateFailureEvent(
+                    timestamp=self.current_timestamp,
+                    order_id=order_id,
+                    order_action=LPType.ADD if metadata["operation"] == "add" else LPType.REMOVE,
+                )
             )
         elif tracked_order.is_cancelled:
             # Transaction cancelled
@@ -158,7 +168,7 @@ class GatewayLp(GatewaySwap):
         """
         Override to trigger RangePosition events after LP transactions complete (batch polling).
         """
-        # Call parent implementation
+        # Call parent implementation (handles timeout checking)
         await super().update_order_status(tracked_orders)
 
         # Trigger LP events for any completed LP operations
