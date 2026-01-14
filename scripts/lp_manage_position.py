@@ -120,6 +120,7 @@ class LpPositionManager(ScriptStrategyBase):
 
         # Rebalance tracking
         self._closed_position_balances: Optional[Dict] = None
+        self._opening_position_amounts: Optional[Dict] = None  # Track amounts when opening position
 
         # Check throttling (for rate limiting)
         self._last_check_time: float = 0
@@ -451,6 +452,12 @@ class LpPositionManager(ScriptStrategyBase):
             )
             self.logger().info(f"Using pool address: {self.pool_address}")
 
+            # Store amounts being added for notification
+            self._opening_position_amounts = {
+                "base_amount": base_amt,
+                "quote_amount": quote_amt
+            }
+
             order_id = self.connectors[self.exchange].add_liquidity(
                 trading_pair=self.trading_pair,
                 price=current_price,
@@ -558,12 +565,23 @@ class LpPositionManager(ScriptStrategyBase):
                    f"[{float(old_lower):.6f}-{float(old_upper):.6f}] by {deviation:.2f}%")
             self.notify_hb_app_with_timestamp(msg)
 
-            # Store current balances before closing
+            # Store amounts being removed from position (including fees)
+            base_in_position = self.position_info.base_token_amount if self.position_info else 0.0
+            quote_in_position = self.position_info.quote_token_amount if self.position_info else 0.0
+            base_fees = self.position_info.base_fee_amount if self.position_info else 0.0
+            quote_fees = self.position_info.quote_fee_amount if self.position_info else 0.0
+
+            # Total amounts that will be returned to wallet
+            total_base_removed = base_in_position + base_fees
+            total_quote_removed = quote_in_position + quote_fees
+
             self._closed_position_balances = {
-                "base_amount": self.position_info.base_token_amount if self.position_info else 0.0,
-                "quote_amount": self.position_info.quote_token_amount if self.position_info else 0.0,
-                "base_fee": self.position_info.base_fee_amount if self.position_info else 0.0,
-                "quote_fee": self.position_info.quote_fee_amount if self.position_info else 0.0,
+                "base_amount": base_in_position,
+                "quote_amount": quote_in_position,
+                "base_fee": base_fees,
+                "quote_fee": quote_fees,
+                "total_base_removed": total_base_removed,
+                "total_quote_removed": total_quote_removed,
                 "current_price": current_price,
                 "old_lower": old_lower,
                 "old_upper": old_upper,
@@ -602,13 +620,14 @@ class LpPositionManager(ScriptStrategyBase):
             old_lower = info["old_lower"]
             old_upper = info["old_upper"]
 
-            # Get current wallet balances (tokens + fees collected)
-            # Fetch balances using token addresses from pool info
-            connector = self.connectors[self.exchange]
-            base_balance = float(await connector.get_balance_by_address(self.base_token_address))
-            quote_balance = float(await connector.get_balance_by_address(self.quote_token_address))
+            # Use only the amounts removed from the closed position
+            total_base_removed = info["total_base_removed"]
+            total_quote_removed = info["total_quote_removed"]
 
-            self.logger().info(f"Available balances: {base_balance} {self.base_token}, {quote_balance} {self.quote_token}")
+            self.logger().info(
+                f"Tokens received from closed position: {total_base_removed:.6f} {self.base_token}, "
+                f"{total_quote_removed:.6f} {self.quote_token}"
+            )
 
             # Determine which side to enter based on where price is relative to old range
             side = self._determine_side(current_price, old_lower, old_upper)
@@ -621,21 +640,20 @@ class LpPositionManager(ScriptStrategyBase):
 
             new_mid_price = float(self.pool_info.price)
 
-            # For single-sided position, provide amount for only one side
-            # Use actual wallet balances, not config amounts
+            # For single-sided position, use only amounts from closed position
             if side == "base":
                 # Price is below range, provide base token only
-                base_amt = float(base_balance) if base_balance > 0 else 0.0
+                base_amt = total_base_removed
                 quote_amt = 0.0
             else:  # quote side
                 # Price is above bounds, provide quote token only
                 base_amt = 0.0
-                quote_amt = float(quote_balance) if quote_balance > 0 else 0.0
+                quote_amt = total_quote_removed
 
             if base_amt == 0 and quote_amt == 0:
                 self.logger().error(
                     f"Insufficient balance to open rebalanced position! "
-                    f"Available: {float(base_balance)} {self.base_token}, {float(quote_balance)} {self.quote_token}"
+                    f"Received: {total_base_removed:.6f} {self.base_token}, {total_quote_removed:.6f} {self.quote_token}"
                 )
                 self.pending_operation = None
                 self._closed_position_balances = None
@@ -681,6 +699,12 @@ class LpPositionManager(ScriptStrategyBase):
                 )
 
             self.logger().info(f"Using pool address: {self.pool_address}")
+
+            # Store amounts being added for notification
+            self._opening_position_amounts = {
+                "base_amount": base_amt,
+                "quote_amount": quote_amt
+            }
 
             order_id = self.connectors[self.exchange].add_liquidity(
                 trading_pair=self.trading_pair,
@@ -783,7 +807,16 @@ class LpPositionManager(ScriptStrategyBase):
             self.pending_operation = None
             self.out_of_bounds_since = None
 
-            msg = f"LP position opened on {self.exchange}"
+            # Build notification message with amounts added
+            if self._opening_position_amounts:
+                base_amt = self._opening_position_amounts["base_amount"]
+                quote_amt = self._opening_position_amounts["quote_amount"]
+                msg = (f"✓ Position opened on {self.exchange}: "
+                       f"Added {base_amt:.6f} {self.base_token} + {quote_amt:.6f} {self.quote_token}")
+                self._opening_position_amounts = None  # Clear after use
+            else:
+                msg = f"✓ Position opened on {self.exchange}"
+
             self.notify_hb_app_with_timestamp(msg)
 
     def did_remove_liquidity(self, event: RangePositionLiquidityRemovedEvent):
@@ -802,7 +835,15 @@ class LpPositionManager(ScriptStrategyBase):
             self.pending_operation = None
             self.out_of_bounds_since = None
 
-            msg = f"LP position closed on {self.exchange}"
+            # Build notification message with amounts removed
+            if self._closed_position_balances:
+                total_base = self._closed_position_balances["total_base_removed"]
+                total_quote = self._closed_position_balances["total_quote_removed"]
+                msg = (f"✓ Position closed on {self.exchange}: "
+                       f"Removed {total_base:.6f} {self.base_token} + {total_quote:.6f} {self.quote_token}")
+            else:
+                msg = f"✓ Position closed on {self.exchange}"
+
             self.notify_hb_app_with_timestamp(msg)
 
             # If this was a rebalance, open the new position
