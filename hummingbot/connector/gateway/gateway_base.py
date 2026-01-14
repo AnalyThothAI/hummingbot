@@ -692,6 +692,9 @@ class GatewayBase(ConnectorBase):
         Get balance for a token by its contract address.
         Fetches directly from Gateway using the token address.
 
+        Gateway automatically converts addresses to symbols in the response
+        (e.g., wrapped SOL address returns balance keyed by "SOL").
+
         :param token_address: The token contract address
         :return: Balance for the token
         """
@@ -700,15 +703,30 @@ class GatewayBase(ConnectorBase):
                 chain=self.chain,
                 network=self.network,
                 address=self.address,
-                token_symbols=[token_address]  # Gateway accepts addresses too
+                token_symbols=[token_address]
             )
 
-            if "balances" in resp_json and token_address in resp_json["balances"]:
-                balance = Decimal(str(resp_json["balances"][token_address]))
-                self.logger().debug(f"Fetched balance for token {token_address[:8]}...: {balance}")
-                return balance
+            if "balances" in resp_json:
+                balances = resp_json["balances"]
+
+                # First try the address as key
+                if token_address in balances:
+                    balance = Decimal(str(balances[token_address]))
+                    self.logger().debug(f"Fetched balance for {token_address[:8]}...: {balance}")
+                    return balance
+
+                # Gateway may return balance keyed by symbol instead of address
+                # Since we requested one token, take the first (and only) balance
+                elif len(balances) == 1:
+                    symbol, balance_str = next(iter(balances.items()))
+                    balance = Decimal(str(balance_str))
+                    self.logger().debug(f"Fetched balance for {token_address[:8]}... (returned as {symbol}): {balance}")
+                    return balance
+                else:
+                    self.logger().warning(f"No balance returned for token address {token_address[:8]}...")
+                    return s_decimal_0
             else:
-                self.logger().warning(f"No balance returned for token address {token_address}")
+                self.logger().warning(f"No balances in response for token address {token_address[:8]}...")
                 return s_decimal_0
         except Exception as e:
             self.logger().error(f"Error fetching balance for token address {token_address}: {str(e)}", exc_info=True)
