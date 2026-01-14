@@ -23,6 +23,7 @@ PARAMETERS
   * After rebalance: only one token provided based on price direction
 - position_width_pct: TOTAL position width as percentage of mid price (e.g. 2.0 = ±1%)
 - rebalance_seconds: Seconds price must stay out-of-bounds before rebalancing
+- strategy_type: (Optional) Meteora-specific strategy type (0=Spot, 1=Curve, None=use default)
 
 NOTES
 -----
@@ -67,6 +68,8 @@ class LpPositionManagerConfig(BaseClientModel):
         "prompt": "Seconds price must stay out-of-bounds before rebalancing", "prompt_on_new": True})
     check_seconds: int = Field(30, json_schema_extra={
         "prompt": "Seconds between position status checks (important for rate limits)", "prompt_on_new": True})
+    strategy_type: Optional[int] = Field(None, json_schema_extra={
+        "prompt": "Strategy type for Meteora (0=Spot, 1=Curve, None=use default)", "prompt_on_new": False})
 
 
 class LpPositionManager(ScriptStrategyBase):
@@ -422,6 +425,9 @@ class LpPositionManager(ScriptStrategyBase):
                 "quote_amount": quote_amt
             }
 
+            # Build connector-specific parameters
+            extra_params = self._build_extra_params()
+
             order_id = self.connectors[self.exchange].add_liquidity(
                 trading_pair=self.trading_pair,
                 price=current_price,
@@ -430,6 +436,7 @@ class LpPositionManager(ScriptStrategyBase):
                 base_token_amount=base_amt,
                 quote_token_amount=quote_amt,
                 pool_address=self.pool_address,
+                extra_params=extra_params,
             )
 
             self.pending_open_order_id = order_id
@@ -659,6 +666,9 @@ class LpPositionManager(ScriptStrategyBase):
                 "quote_amount": quote_amt
             }
 
+            # Build connector-specific parameters
+            extra_params = self._build_extra_params()
+
             order_id = self.connectors[self.exchange].add_liquidity(
                 trading_pair=self.trading_pair,
                 price=new_mid_price,
@@ -667,6 +677,7 @@ class LpPositionManager(ScriptStrategyBase):
                 base_token_amount=base_amt,
                 quote_token_amount=quote_amt,
                 pool_address=self.pool_address,
+                extra_params=extra_params,
             )
 
             self.pending_open_order_id = order_id
@@ -740,6 +751,18 @@ class LpPositionManager(ScriptStrategyBase):
             bound = upper_price
 
         return deviation, direction, bound
+
+    def _build_extra_params(self) -> Optional[Dict]:
+        """
+        Build connector-specific extra parameters.
+        Currently supports Meteora's strategyType parameter.
+
+        :return: Dictionary of extra parameters or None
+        """
+        # Only add extra_params for Meteora connector
+        if "meteora" in self.config.connector.lower() and self.config.strategy_type is not None:
+            return {"strategyType": self.config.strategy_type}
+        return None
 
     async def _validate_position_amounts(self, base_amt: float, quote_amt: float) -> bool:
         """
