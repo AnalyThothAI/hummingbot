@@ -445,25 +445,24 @@ class GatewayHttpClient:
                 response = await client.delete(url, json=params)
             else:
                 raise ValueError(f"Unsupported request method {method}")
-            if not fail_silently and response.status == 504:
-                self.logger().network(f"The network call to {url} has timed out.")
-            else:
-                try:
-                    parsed_response = await response.json()
-                except ContentTypeError:
-                    parsed_response = await response.text()
-                if response.status != 200 and \
-                   not fail_silently and \
-                   not self.is_timeout_error(parsed_response):
-                    self.log_error_codes(parsed_response)
+            # Always parse the response
+            try:
+                parsed_response = await response.json()
+            except ContentTypeError:
+                parsed_response = await response.text()
 
-                    if "error" in parsed_response:
-                        # Include error code if present (e.g., TRANSACTION_TIMEOUT)
-                        error_code = parsed_response.get('code', '')
-                        code_suffix = f" [code: {error_code}]" if error_code else ""
-                        raise ValueError(f"Error on {method.upper()} {url} Error: {parsed_response['error']}{code_suffix}")
-                    else:
-                        raise ValueError(f"Error on {method.upper()} {url} Error: {parsed_response}")
+            # Handle non-200 responses
+            if response.status != 200 and not fail_silently:
+                self.log_error_codes(parsed_response)
+
+                if "error" in parsed_response or "message" in parsed_response:
+                    # Include error code if present (e.g., TRANSACTION_TIMEOUT)
+                    error_code = parsed_response.get('code', '')
+                    error_msg = parsed_response.get('error') or parsed_response.get('message', 'Unknown error')
+                    code_suffix = f" [code: {error_code}]" if error_code else ""
+                    raise ValueError(f"Error on {method.upper()} {url} Error: {error_msg}{code_suffix}")
+                else:
+                    raise ValueError(f"Error on {method.upper()} {url} Error: {parsed_response}")
 
         except Exception as e:
             if not fail_silently:
