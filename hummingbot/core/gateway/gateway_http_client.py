@@ -970,10 +970,13 @@ class GatewayHttpClient:
         base_token_amount: Optional[float] = None,
         quote_token_amount: Optional[float] = None,
         slippage_pct: Optional[float] = None,
+        extra_params: Optional[Dict[str, Any]] = None,
         fail_silently: bool = False
     ) -> Dict[str, Any]:
         """
         Opens a new concentrated liquidity position
+
+        :param extra_params: Optional connector-specific parameters (e.g., {"strategyType": 0} for Meteora)
         """
         request_payload = {
             "network": network,
@@ -988,6 +991,10 @@ class GatewayHttpClient:
             request_payload["quoteTokenAmount"] = quote_token_amount
         if slippage_pct is not None:
             request_payload["slippagePct"] = slippage_pct
+
+        # Add connector-specific parameters
+        if extra_params:
+            request_payload.update(extra_params)
 
         # Parse connector to get name and type
         connector_name, connector_type = connector.split("/", 1)
@@ -1037,10 +1044,13 @@ class GatewayHttpClient:
         base_token_amount: Optional[float] = None,
         quote_token_amount: Optional[float] = None,
         slippage_pct: Optional[float] = None,
+        extra_params: Optional[Dict[str, Any]] = None,
         fail_silently: bool = False
     ) -> Dict[str, Any]:
         """
         Add liquidity to an existing concentrated liquidity position
+
+        :param extra_params: Optional connector-specific parameters (e.g., {"strategyType": 0} for Meteora)
         """
         request_payload = {
             "network": network,
@@ -1053,6 +1063,10 @@ class GatewayHttpClient:
             request_payload["quoteTokenAmount"] = quote_token_amount
         if slippage_pct is not None:
             request_payload["slippagePct"] = slippage_pct
+
+        # Add connector-specific parameters
+        if extra_params:
+            request_payload.update(extra_params)
 
         # Parse connector to get name and type
         connector_name, connector_type = connector.split("/", 1)

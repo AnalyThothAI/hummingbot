@@ -420,6 +420,7 @@ class GatewayLp(GatewaySwap):
         quote_token_amount: Optional[float] = None,
         slippage_pct: Optional[float] = None,
         pool_address: Optional[str] = None,
+        extra_params: Optional[Dict[str, Any]] = None,
     ):
         """
         Opens a concentrated liquidity position with explicit price range or calculated from percentages.
@@ -436,6 +437,7 @@ class GatewayLp(GatewaySwap):
         :param quote_token_amount: Amount of quote token to add (optional)
         :param slippage_pct: Maximum allowed slippage percentage
         :param pool_address: Explicit pool address (optional, will lookup by trading_pair if not provided)
+        :param extra_params: Optional connector-specific parameters (e.g., {"strategyType": 0} for Meteora)
         :return: Response from the gateway API
         """
         # Check connector type is CLMM
@@ -501,7 +503,8 @@ class GatewayLp(GatewaySwap):
                 upper_price=upper_price,
                 base_token_amount=base_token_amount,
                 quote_token_amount=quote_token_amount,
-                slippage_pct=slippage_pct
+                slippage_pct=slippage_pct,
+                extra_params=extra_params
             )
             transaction_hash: Optional[str] = transaction_result.get("signature")
             if transaction_hash is not None and transaction_hash != "":
