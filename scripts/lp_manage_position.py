@@ -1227,31 +1227,31 @@ class LpPositionManager(ScriptStrategyBase):
             self.pending_operation = None
 
     def _calculate_pnl_summary(self) -> Dict:
-        """Calculate P&L summary from position history"""
+        """Calculate P&L summary from position history using current price"""
         positions = self._tracking_data.get("positions", [])
 
         opens = [p for p in positions if p["type"] == "open"]
         closes = [p for p in positions if p["type"] == "close"]
 
-        # Calculate totals for opens
+        # Get current price for all value calculations
+        current_price = float(self.pool_info.price) if self.pool_info else 0
+
+        # Calculate totals for opens (using current price for base value)
         total_open_base = sum(p.get("base_amount", 0) for p in opens)
         total_open_quote = sum(p.get("quote_amount", 0) for p in opens)
-        # Base value = base_amount * mid_price at open time
-        total_open_base_value = sum(p.get("base_amount", 0) * p.get("mid_price", 0) for p in opens)
+        total_open_base_value = total_open_base * current_price
         total_open_value = total_open_base_value + total_open_quote
 
-        # Calculate totals for closes
+        # Calculate totals for closes (using current price for base value)
         total_close_base = sum(p.get("base_amount", 0) for p in closes)
         total_close_quote = sum(p.get("quote_amount", 0) for p in closes)
-        # Base value = base_amount * mid_price at close time
-        total_close_base_value = sum(p.get("base_amount", 0) * p.get("mid_price", 0) for p in closes)
+        total_close_base_value = total_close_base * current_price
         total_close_value = total_close_base_value + total_close_quote
 
-        # Calculate total fees collected (in quote)
+        # Calculate total fees collected (using current price for base fees)
         total_fees_base = sum(p.get("base_fees", 0) for p in closes)
         total_fees_quote = sum(p.get("quote_fees", 0) for p in closes)
-        # Convert base fees to quote using mid_price at close time
-        total_fees_base_value = sum(p.get("base_fees", 0) * p.get("mid_price", 0) for p in closes)
+        total_fees_base_value = total_fees_base * current_price
         total_fees_value = total_fees_base_value + total_fees_quote
 
         # Calculate current position value (only if script created the initial position)
