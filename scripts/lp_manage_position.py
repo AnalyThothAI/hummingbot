@@ -55,8 +55,8 @@ class LpPositionManagerConfig(BaseClientModel):
     script_file_name: str = os.path.basename(__file__)
     connector: str = Field("meteora/clmm", json_schema_extra={
         "prompt": "CLMM connector in format 'name/type' (e.g. raydium/clmm, meteora/clmm)", "prompt_on_new": True})
-    trading_pair: str = Field("", json_schema_extra={
-        "prompt": "Trading pair (e.g. META-SOL). Pool must be added via 'gateway pool' first", "prompt_on_new": True})
+    pool_address: str = Field("", json_schema_extra={
+        "prompt": "Pool address (e.g. 2sf5NYcY4zUPXUSmG6f66mskb24t5F8S11pC1Nz5nQT3)", "prompt_on_new": True})
     base_amount: Decimal = Field(Decimal("0"), json_schema_extra={
         "prompt": "Initial base token amount (0 for quote-only initial position)", "prompt_on_new": True})
     quote_amount: Decimal = Field(Decimal("0"), json_schema_extra={
@@ -65,6 +65,8 @@ class LpPositionManagerConfig(BaseClientModel):
         "prompt": "TOTAL position width as percentage (e.g. 2.0 for ±1% around mid price)", "prompt_on_new": True})
     rebalance_seconds: int = Field(60, json_schema_extra={
         "prompt": "Seconds price must stay out-of-bounds before rebalancing", "prompt_on_new": True})
+    check_seconds: int = Field(30, json_schema_extra={
+        "prompt": "Seconds between position status checks (important for rate limits)", "prompt_on_new": True})
 
 
 class LpPositionManager(ScriptStrategyBase):
@@ -74,30 +76,37 @@ class LpPositionManager(ScriptStrategyBase):
 
     @classmethod
     def init_markets(cls, config: LpPositionManagerConfig):
-        cls.markets = {config.connector: {config.trading_pair}}
+        # Use placeholder for trading pair since we'll resolve it from pool_address
+        cls.markets = {config.connector: {"UNKNOWN-UNKNOWN"}}
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: LpPositionManagerConfig):
         super().__init__(connectors)
         self.config = config
         self.exchange = config.connector
-        self.trading_pair = config.trading_pair
         self.connector_type = get_connector_type(config.connector)
 
         # Verify this is a CLMM connector
         if self.connector_type != ConnectorType.CLMM:
             raise ValueError(f"This script only supports CLMM connectors. Got: {config.connector}")
 
-        # Token symbols (will be populated from pool info)
-        self.base_token, self.quote_token = self.trading_pair.split("-")
+        # Pool address is the primary identifier
+        self.pool_address: str = config.pool_address
+        if not self.pool_address:
+            raise ValueError("pool_address is required")
+
+        # Trading pair will be resolved from pool info
+        self.trading_pair: Optional[str] = None
+        self.base_token: Optional[str] = None
+        self.quote_token: Optional[str] = None
+        self.base_token_address: Optional[str] = None
+        self.quote_token_address: Optional[str] = None
+        self._trading_pair_resolved = False
 
         # Initialize market data provider for rate oracle (required for PNL tracking)
+        # We'll initialize rate sources after resolving trading_pair
         self.market_data_provider = MarketDataProvider(connectors)
-        self.market_data_provider.initialize_rate_sources([
-            ConnectorPair(connector_name=config.connector, trading_pair=config.trading_pair)
-        ])
 
         # State tracking
-        self.pool_address: Optional[str] = None  # Cached pool address (doesn't change)
         self.pool_info: Optional[CLMMPoolInfo] = None
         self.position_info: Optional[CLMMPositionInfo] = None
         self.current_position_id: Optional[str] = None
@@ -112,29 +121,95 @@ class LpPositionManager(ScriptStrategyBase):
         # Rebalance tracking
         self._closed_position_balances: Optional[Dict] = None
 
+        # Check throttling (for rate limiting)
+        self._last_check_time: float = 0
+
         # Update throttling
         self._last_position_update_time: float = 0
         self._position_update_interval: int = 10  # Update position info every 10 seconds
 
-        # Log startup information
+        # Log initial startup (will log more details after resolving trading pair)
         self.log_with_clock(logging.INFO,
-                            f"LP Position Manager initialized for {self.trading_pair} on {self.exchange}\n"
-                            f"Position width: ±{float(self.config.position_width_pct) / 2:.2f}% around mid price\n"
-                            f"Rebalance threshold: {self.config.rebalance_seconds} seconds out-of-bounds")
+                            f"LP Position Manager initializing for pool {self.pool_address[:8]}... on {self.exchange}")
 
-        if self.config.base_amount > 0 or self.config.quote_amount > 0:
-            self.log_with_clock(logging.INFO,
-                                f"Initial amounts: {self.config.base_amount} base / "
-                                f"{self.config.quote_amount} quote tokens")
-        else:
-            self.log_with_clock(logging.INFO, "No initial amounts - will only monitor existing positions")
-
-        # Initialize position on startup
+        # Initialize position on startup (will resolve trading pair first)
         safe_ensure_future(self.initialize_position())
+
+    async def resolve_trading_pair_from_pool(self):
+        """Resolve trading pair from pool address by fetching pool info"""
+        if self._trading_pair_resolved:
+            return
+
+        try:
+            connector = self.connectors[self.exchange]
+
+            # Fetch pool info directly using pool address
+            pool_info = await connector._get_gateway_instance().pool_info(
+                connector=self.exchange,
+                network=connector.network,
+                pool_address=self.pool_address
+            )
+
+            if not pool_info:
+                raise ValueError(f"Could not fetch pool info for pool address {self.pool_address}")
+
+            # Get token addresses from pool info
+            base_token_address = pool_info.get("baseTokenAddress")
+            quote_token_address = pool_info.get("quoteTokenAddress")
+
+            if not base_token_address or not quote_token_address:
+                raise ValueError(f"Pool info missing token addresses: {pool_info}")
+
+            # Store token addresses (needed for balance lookups)
+            self.base_token_address = base_token_address
+            self.quote_token_address = quote_token_address
+
+            # Try to get token symbols
+            base_token_info = connector.get_token_by_address(base_token_address)
+            quote_token_info = connector.get_token_by_address(quote_token_address)
+
+            base_symbol = base_token_info.get("symbol") if base_token_info else base_token_address
+            quote_symbol = quote_token_info.get("symbol") if quote_token_info else quote_token_address
+
+            # Set trading pair and tokens
+            self.base_token = base_symbol
+            self.quote_token = quote_symbol
+            self.trading_pair = f"{base_symbol}-{quote_symbol}"
+            self._trading_pair_resolved = True
+
+            self.logger().info(f"Resolved trading pair from pool: {self.trading_pair}")
+
+            # Initialize rate sources now that we have the trading pair
+            self.market_data_provider.initialize_rate_sources([
+                ConnectorPair(connector_name=self.exchange, trading_pair=self.trading_pair)
+            ])
+
+            # Log configuration details
+            self.logger().info(
+                f"LP Position Manager configured:\n"
+                f"  Trading Pair: {self.trading_pair}\n"
+                f"  Pool Address: {self.pool_address}\n"
+                f"  Position width: ±{float(self.config.position_width_pct) / 2:.2f}% around mid price\n"
+                f"  Rebalance threshold: {self.config.rebalance_seconds} seconds out-of-bounds\n"
+                f"  Check interval: {self.config.check_seconds} seconds (rate limiting)"
+            )
+
+            if self.config.base_amount > 0 or self.config.quote_amount > 0:
+                self.logger().info(
+                    f"Initial amounts: {self.config.base_amount} {self.base_token} / "
+                    f"{self.config.quote_amount} {self.quote_token}"
+                )
+
+        except Exception as e:
+            self.logger().error(f"Error resolving trading pair from pool: {str(e)}", exc_info=True)
+            raise
 
     async def initialize_position(self):
         """Check for existing positions or create initial position on startup"""
         await asyncio.sleep(3)  # Wait for connector to initialize
+
+        # First, resolve trading pair from pool address
+        await self.resolve_trading_pair_from_pool()
 
         # Fetch pool info to get pool address and current price
         await self.fetch_pool_info()
@@ -146,6 +221,9 @@ class LpPositionManager(ScriptStrategyBase):
         # Check if user has existing position in this pool
         if await self.check_existing_positions():
             self.logger().info(f"Found existing position {self.current_position_id}, will monitor it")
+
+            # Check if the existing position is already out of range
+            await self.check_if_position_out_of_range_on_startup()
             return
 
         # No existing position - create one if user provided amounts
@@ -157,6 +235,13 @@ class LpPositionManager(ScriptStrategyBase):
 
     def on_tick(self):
         """Called on each strategy tick"""
+        # Throttle checks based on check_seconds (for rate limiting)
+        current_time = self.current_timestamp
+        if current_time - self._last_check_time < self.config.check_seconds:
+            return
+
+        self._last_check_time = current_time
+
         if self.pending_operation:
             # Operation in progress, wait for confirmation
             return
@@ -177,14 +262,19 @@ class LpPositionManager(ScriptStrategyBase):
 
             connector = self.connectors[self.exchange]
 
-            # Get pool info using trading pair
-            pool_info_result = await connector.get_pool_info(self.trading_pair)
+            # Fetch pool info directly using pool address
+            pool_info_resp = await connector._get_gateway_instance().pool_info(
+                connector=self.exchange,
+                network=connector.network,
+                pool_address=self.pool_address
+            )
 
-            if pool_info_result:
-                self.pool_info = pool_info_result
+            if pool_info_resp:
+                # Parse into CLMMPoolInfo object
+                self.pool_info = CLMMPoolInfo(**pool_info_resp)
                 return self.pool_info
             else:
-                self.logger().error(f"Pool not found for {self.trading_pair}. Please add pool via 'gateway pool' command first")
+                self.logger().error(f"Pool info not found for pool address {self.pool_address}")
                 return None
 
         except Exception as e:
@@ -200,13 +290,7 @@ class LpPositionManager(ScriptStrategyBase):
 
             connector = self.connectors[self.exchange]
 
-            # Get pool address from trading pair (cache it for reuse)
-            if not self.pool_address:
-                self.pool_address = await connector.get_pool_address(self.trading_pair)
-                if not self.pool_address:
-                    self.logger().error(f"Pool address not found for {self.trading_pair}. Please add pool via 'gateway pool' command first")
-                    return False
-
+            # Fetch positions for this pool (we already have pool_address)
             positions = await connector.get_user_positions(pool_address=self.pool_address)
 
             if positions and len(positions) > 0:
@@ -220,6 +304,46 @@ class LpPositionManager(ScriptStrategyBase):
         except Exception as e:
             self.logger().debug(f"No existing positions found or error checking: {str(e)}")
             return False
+
+    async def check_if_position_out_of_range_on_startup(self):
+        """Check if existing position is already out of range on startup and begin rebalance countdown"""
+        if not self.position_info or not self.pool_info:
+            return
+
+        try:
+            current_price = Decimal(str(self.pool_info.price))
+            lower_price = Decimal(str(self.position_info.lower_price))
+            upper_price = Decimal(str(self.position_info.upper_price))
+
+            # Check if price is in bounds
+            in_bounds = self._price_in_bounds(current_price, lower_price, upper_price)
+
+            if not in_bounds:
+                # Position is already out of range - start the rebalance countdown
+                self.out_of_bounds_since = self.current_timestamp
+
+                # Calculate deviation
+                if current_price < lower_price:
+                    deviation = abs((float(current_price) - float(lower_price)) / float(lower_price) * 100)
+                    direction = "below lower"
+                    bound = lower_price
+                else:
+                    deviation = abs((float(current_price) - float(upper_price)) / float(upper_price) * 100)
+                    direction = "above upper"
+                    bound = upper_price
+
+                msg = (f"⚠️ Position is already out of range! Price {float(current_price):.6f} is {direction} "
+                       f"bound {float(bound):.6f} by {deviation:.2f}%. Rebalance countdown started "
+                       f"({self.config.rebalance_seconds}s threshold)")
+
+                self.logger().warning(msg)
+                self.notify_hb_app_with_timestamp(msg)
+            else:
+                self.logger().info(f"Position is in range at startup (price: {float(current_price):.6f}, "
+                                   f"range: {float(lower_price):.6f} - {float(upper_price):.6f})")
+
+        except Exception as e:
+            self.logger().error(f"Error checking if position out of range on startup: {str(e)}")
 
     async def update_position_info(self):
         """Fetch the latest position information"""
@@ -256,22 +380,76 @@ class LpPositionManager(ScriptStrategyBase):
                 return
 
             current_price = float(self.pool_info.price)
-            lower_pct, upper_pct = self._compute_width_percentages()
-
             base_amt = float(self.config.base_amount)
             quote_amt = float(self.config.quote_amount)
 
+            # Check balances before attempting to create position
+            # Fetch balances using token addresses from pool info
+            connector = self.connectors[self.exchange]
+            base_balance = float(await connector.get_balance_by_address(self.base_token_address))
+            quote_balance = float(await connector.get_balance_by_address(self.quote_token_address))
+
+            self.logger().info(f"Available balances: {base_balance} {self.base_token}, {quote_balance} {self.quote_token}")
+
+            # Validate sufficient balances
+            if base_amt > 0 and base_balance < base_amt:
+                self.logger().error(
+                    f"Insufficient {self.base_token} balance! Required: {base_amt}, Available: {base_balance}"
+                )
+                return
+
+            if quote_amt > 0 and quote_balance < quote_amt:
+                self.logger().error(
+                    f"Insufficient {self.quote_token} balance! Required: {quote_amt}, Available: {quote_balance}"
+                )
+                return
+
+            # Check for dust amounts (less than 0.0001)
+            min_amount = 0.0001
+            if base_amt > 0 and base_amt < min_amount:
+                self.logger().error(
+                    f"Base amount {base_amt} {self.base_token} is too small (minimum {min_amount}). "
+                    f"Increase base_amount in config."
+                )
+                return
+
+            if quote_amt > 0 and quote_amt < min_amount:
+                self.logger().error(
+                    f"Quote amount {quote_amt} {self.quote_token} is too small (minimum {min_amount}). "
+                    f"Increase quote_amount in config."
+                )
+                return
+
+            # Compute width percentages based on position type
+            lower_pct, upper_pct = self._compute_width_percentages(base_amt, quote_amt)
+
+            # Calculate actual price bounds
+            lower_price = current_price * (1 - lower_pct / 100)
+            upper_price = current_price * (1 + upper_pct / 100)
+
+            # Log position type and range
             if base_amt > 0 and quote_amt > 0:
-                self.logger().info(f"Creating double-sided position at price {current_price:.6f} "
-                                   f"with range -{lower_pct}% to +{upper_pct}%")
+                self.logger().info(
+                    f"Creating double-sided position at price {current_price:.6f} "
+                    f"with range -{lower_pct:.2f}% to +{upper_pct:.2f}%"
+                )
             elif base_amt > 0:
-                self.logger().info(f"Creating base-only position at price {current_price:.6f} "
-                                   f"with {base_amt} {self.base_token}")
+                self.logger().info(
+                    f"Creating base-only position with {base_amt} {self.base_token} at price {current_price:.6f} "
+                    f"(range: +{upper_pct:.2f}% above price)"
+                )
             elif quote_amt > 0:
-                self.logger().info(f"Creating quote-only position at price {current_price:.6f} "
-                                   f"with {quote_amt} {self.quote_token}")
+                self.logger().info(
+                    f"Creating quote-only position with {quote_amt} {self.quote_token} at price {current_price:.6f} "
+                    f"(range: -{lower_pct:.2f}% below price)"
+                )
             else:
                 return
+
+            self.logger().info(
+                f"Submitting position with price range: {lower_price:.6f} - {upper_price:.6f}"
+            )
+            self.logger().info(f"Using pool address: {self.pool_address}")
 
             order_id = self.connectors[self.exchange].add_liquidity(
                 trading_pair=self.trading_pair,
@@ -280,6 +458,7 @@ class LpPositionManager(ScriptStrategyBase):
                 lower_width_pct=lower_pct,
                 base_token_amount=base_amt,
                 quote_token_amount=quote_amt,
+                pool_address=self.pool_address,
             )
 
             self.pending_open_order_id = order_id
@@ -406,10 +585,13 @@ class LpPositionManager(ScriptStrategyBase):
 
     async def open_rebalanced_position(self):
         """Open new single-sided position after closing old one"""
+        self.logger().info("open_rebalanced_position called")
         try:
             if not self._closed_position_balances:
                 self.logger().error("No closed position balance info available")
                 return
+
+            self.logger().info(f"Closed position balances: {self._closed_position_balances}")
 
             if not self.trading_pair:
                 self.logger().error("Trading pair not set")
@@ -421,9 +603,10 @@ class LpPositionManager(ScriptStrategyBase):
             old_upper = info["old_upper"]
 
             # Get current wallet balances (tokens + fees collected)
+            # Fetch balances using token addresses from pool info
             connector = self.connectors[self.exchange]
-            base_balance = connector.get_available_balance(self.base_token)
-            quote_balance = connector.get_available_balance(self.quote_token)
+            base_balance = float(await connector.get_balance_by_address(self.base_token_address))
+            quote_balance = float(await connector.get_balance_by_address(self.quote_token_address))
 
             self.logger().info(f"Available balances: {base_balance} {self.base_token}, {quote_balance} {self.quote_token}")
 
@@ -437,7 +620,6 @@ class LpPositionManager(ScriptStrategyBase):
                 return
 
             new_mid_price = float(self.pool_info.price)
-            lower_pct, upper_pct = self._compute_width_percentages()
 
             # For single-sided position, provide amount for only one side
             # Use actual wallet balances, not config amounts
@@ -445,18 +627,60 @@ class LpPositionManager(ScriptStrategyBase):
                 # Price is below range, provide base token only
                 base_amt = float(base_balance) if base_balance > 0 else 0.0
                 quote_amt = 0.0
-                self.logger().info(f"Opening base-only position at {new_mid_price:.6f} with {base_amt} {self.base_token} (price below previous bounds)")
             else:  # quote side
                 # Price is above bounds, provide quote token only
                 base_amt = 0.0
                 quote_amt = float(quote_balance) if quote_balance > 0 else 0.0
-                self.logger().info(f"Opening quote-only position at {new_mid_price:.6f} with {quote_amt} {self.quote_token} (price above previous bounds)")
 
             if base_amt == 0 and quote_amt == 0:
-                self.logger().error("No tokens available to open position")
+                self.logger().error(
+                    f"Insufficient balance to open rebalanced position! "
+                    f"Available: {float(base_balance)} {self.base_token}, {float(quote_balance)} {self.quote_token}"
+                )
                 self.pending_operation = None
                 self._closed_position_balances = None
                 return
+
+            # Check for dust amounts (less than 0.0001)
+            min_amount = 0.0001
+            if base_amt > 0 and base_amt < min_amount:
+                self.logger().error(
+                    f"Base amount {base_amt} {self.base_token} is too small (minimum {min_amount}). "
+                    f"Cannot open position."
+                )
+                self.pending_operation = None
+                self._closed_position_balances = None
+                return
+
+            if quote_amt > 0 and quote_amt < min_amount:
+                self.logger().error(
+                    f"Quote amount {quote_amt} {self.quote_token} is too small (minimum {min_amount}). "
+                    f"Cannot open position."
+                )
+                self.pending_operation = None
+                self._closed_position_balances = None
+                return
+
+            # Compute width percentages based on position type
+            lower_pct, upper_pct = self._compute_width_percentages(base_amt, quote_amt)
+
+            # Calculate actual price bounds for logging
+            lower_price = new_mid_price * (1 - lower_pct / 100)
+            upper_price = new_mid_price * (1 + upper_pct / 100)
+
+            # Log rebalanced position details
+            if side == "base":
+                self.logger().info(
+                    f"Opening base-only position with {base_amt} {self.base_token} at price {new_mid_price:.6f} "
+                    f"(range: +{upper_pct:.2f}% above price, {lower_price:.6f} - {upper_price:.6f})"
+                )
+            else:
+                self.logger().info(
+                    f"Opening quote-only position with {quote_amt} {self.quote_token} at price {new_mid_price:.6f} "
+                    f"(range: -{lower_pct:.2f}% below price, {lower_price:.6f} - {upper_price:.6f})"
+                )
+
+            self.logger().info(f"Using pool address: {self.pool_address}")
 
             order_id = self.connectors[self.exchange].add_liquidity(
                 trading_pair=self.trading_pair,
@@ -465,6 +689,7 @@ class LpPositionManager(ScriptStrategyBase):
                 lower_width_pct=lower_pct,
                 base_token_amount=base_amt,
                 quote_token_amount=quote_amt,
+                pool_address=self.pool_address,
             )
 
             self.pending_open_order_id = order_id
@@ -479,11 +704,30 @@ class LpPositionManager(ScriptStrategyBase):
             self.logger().error(f"Error opening rebalanced position: {str(e)}")
             self.pending_operation = None
 
-    def _compute_width_percentages(self):
-        """Compute upper and lower width percentages from total position width"""
-        # position_width_pct is TOTAL width, so each side gets half
-        half_width = float(self.config.position_width_pct) / 2.0
-        return half_width, half_width
+    def _compute_width_percentages(self, base_amt: float = 0, quote_amt: float = 0):
+        """
+        Compute upper and lower width percentages from total position width.
+
+        For double-sided positions: split width evenly (±half)
+        For base-only positions: full width ABOVE price (sell base for quote)
+        For quote-only positions: full width BELOW price (buy base with quote)
+        """
+        total_width = float(self.config.position_width_pct)
+
+        if base_amt > 0 and quote_amt > 0:
+            # Double-sided: split width evenly
+            half_width = total_width / 2.0
+            return half_width, half_width
+        elif base_amt > 0:
+            # Base-only: full width ABOVE current price
+            return 0, total_width
+        elif quote_amt > 0:
+            # Quote-only: full width BELOW current price
+            return total_width, 0
+        else:
+            # Default (shouldn't happen)
+            half_width = total_width / 2.0
+            return half_width, half_width
 
     @staticmethod
     def _price_in_bounds(price: Decimal, lower: Decimal, upper: Decimal) -> bool:
@@ -508,13 +752,7 @@ class LpPositionManager(ScriptStrategyBase):
 
             connector = self.connectors[self.exchange]
 
-            # Use cached pool address (already fetched during initialization)
-            if not self.pool_address:
-                self.pool_address = await connector.get_pool_address(self.trading_pair)
-                if not self.pool_address:
-                    self.logger().error(f"Pool address not found for {self.trading_pair}")
-                    return
-
+            # Fetch positions for this pool (pool_address is from config)
             positions = await connector.get_user_positions(pool_address=self.pool_address)
 
             if positions:
@@ -522,6 +760,12 @@ class LpPositionManager(ScriptStrategyBase):
                 self.position_info = positions[-1]
                 self.current_position_id = self.position_info.address
                 self.logger().info(f"Position info fetched: {self.current_position_id}")
+
+                # Log actual price range from the created position
+                self.logger().info(
+                    f"Actual position price range: {float(self.position_info.lower_price):.6f} - "
+                    f"{float(self.position_info.upper_price):.6f}"
+                )
         except Exception as e:
             self.logger().error(f"Error fetching position info after add: {str(e)}")
 
@@ -544,6 +788,10 @@ class LpPositionManager(ScriptStrategyBase):
 
     def did_remove_liquidity(self, event: RangePositionLiquidityRemovedEvent):
         """Called when liquidity is removed from a position"""
+        self.logger().info(f"did_remove_liquidity called with order_id: {event.order_id if hasattr(event, 'order_id') else 'NO ORDER_ID'}")
+        self.logger().info(f"pending_close_order_id: {self.pending_close_order_id}")
+        self.logger().info(f"_closed_position_balances set: {self._closed_position_balances is not None}")
+
         if hasattr(event, 'order_id') and event.order_id == self.pending_close_order_id:
             self.logger().info(f"Position closing order {event.order_id} confirmed!")
 
@@ -561,6 +809,10 @@ class LpPositionManager(ScriptStrategyBase):
             if self._closed_position_balances:
                 self.logger().info("Position closed, opening rebalanced position...")
                 safe_ensure_future(self.open_rebalanced_position())
+            else:
+                self.logger().warning("Position closed but no rebalance info available!")
+        else:
+            self.logger().warning(f"Order ID mismatch or missing: event={event.order_id if hasattr(event, 'order_id') else 'None'}, pending={self.pending_close_order_id}")
 
     def _create_price_range_visualization(self, lower_price: Decimal, current_price: Decimal,
                                           upper_price: Decimal) -> str:

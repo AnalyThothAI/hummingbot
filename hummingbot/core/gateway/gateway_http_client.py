@@ -642,15 +642,25 @@ class GatewayHttpClient:
         chain: str,
         network: str,
         address: str,
-        token_symbols: List[str],
+        token_symbols: List[str],  # Can be symbols or addresses
         fail_silently: bool = False,
     ) -> Dict[str, Any]:
+        """
+        Get token balances for a wallet address.
+
+        :param chain: The blockchain (e.g., "solana", "ethereum")
+        :param network: The network (e.g., "mainnet-beta", "mainnet")
+        :param address: The wallet address
+        :param token_symbols: List of token symbols OR token addresses to fetch balances for
+        :param fail_silently: If True, suppress errors
+        :return: Dictionary with balances
+        """
         if isinstance(token_symbols, list):
             token_symbols = [x for x in token_symbols if isinstance(x, str) and x.strip() != '']
             request_params = {
                 "network": network,
                 "address": address,
-                "tokens": token_symbols,
+                "tokens": token_symbols,  # Gateway accepts both symbols and addresses
             }
             return await self.api_request(
                 method="post",
@@ -1118,18 +1128,21 @@ class GatewayHttpClient:
         connector: str,
         network: str,
         wallet_address: str,
-        pool_address: Optional[str] = None,
+        pool_address: Optional[str] = None,  # Not used by API, kept for compatibility
         fail_silently: bool = False
     ) -> Dict[str, Any]:
         """
-        Get all CLMM positions owned by a wallet, optionally filtered by pool
+        Get all CLMM positions owned by a wallet.
+
+        Note: The Gateway API does not support filtering by pool_address.
+        Filtering must be done client-side.
         """
         query_params = {
             "network": network,
             "walletAddress": wallet_address,
         }
-        if pool_address:
-            query_params["poolAddress"] = pool_address
+        # Note: poolAddress parameter is not supported by Gateway API
+        # Client-side filtering is done in gateway_lp.py
 
         # Parse connector to get name and type
         connector_name, connector_type = connector.split("/", 1)

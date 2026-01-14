@@ -93,13 +93,19 @@ class GatewayLp(GatewaySwap):
         Helper to trigger LP-specific events when an order completes.
         This is called by both fast monitoring and slow polling to avoid duplication.
         """
+        self.logger().info(f"DEBUG _trigger_lp_events_if_needed called for order_id={order_id}, tx={transaction_hash}")
+
         # Check if already triggered (metadata would be deleted)
         if order_id not in self._lp_orders_metadata:
+            self.logger().info(f"DEBUG order_id {order_id} not in metadata (already triggered or not LP order)")
             return
 
         tracked_order = self._order_tracker.fetch_order(order_id)
         if not tracked_order or tracked_order.trade_type != TradeType.RANGE:
+            self.logger().info(f"DEBUG order {order_id} not tracked or not RANGE type")
             return
+
+        self.logger().info(f"DEBUG order {order_id} state: done={tracked_order.is_done}, failed={tracked_order.is_failure}, cancelled={tracked_order.is_cancelled}")
 
         metadata = self._lp_orders_metadata[order_id]
 
@@ -109,6 +115,7 @@ class GatewayLp(GatewaySwap):
 
         if is_successful:
             # Transaction successful - trigger LP-specific events
+            self.logger().info(f"DEBUG order {order_id} is successful, operation={metadata['operation']}")
             if metadata["operation"] == "add":
                 self._trigger_add_liquidity_event(
                     order_id=order_id,
@@ -158,6 +165,10 @@ class GatewayLp(GatewaySwap):
         """
         Override to trigger RangePosition events after LP transactions complete (batch polling).
         """
+        range_orders = [o for o in tracked_orders if o.trade_type == TradeType.RANGE]
+        if range_orders:
+            self.logger().info(f"DEBUG update_order_status: processing {len(range_orders)} RANGE orders")
+
         # Call parent implementation
         await super().update_order_status(tracked_orders)
 
@@ -167,6 +178,7 @@ class GatewayLp(GatewaySwap):
                 # Get transaction hash
                 try:
                     tx_hash = await tracked_order.get_exchange_order_id()
+                    self.logger().info(f"DEBUG Checking LP event trigger for order {tracked_order.client_order_id}, tx={tx_hash}")
                     self._trigger_lp_events_if_needed(tracked_order.client_order_id, tx_hash)
                 except Exception as e:
                     self.logger().warning(f"Error triggering LP event for {tracked_order.client_order_id}: {e}", exc_info=True)
@@ -231,9 +243,10 @@ class GatewayLp(GatewaySwap):
             pool_type = "clmm" if connector_type == ConnectorType.CLMM else "amm"
 
             # Get pool info from gateway using the get_pool method
+            connector_name = self.connector_name.split("/")[0]
             pool_info = await self._get_gateway_instance().get_pool(
                 trading_pair=trading_pair,
-                connector=self.connector_name.split("/")[0],  # Just the name part
+                connector=connector_name,
                 network=self.network,
                 type=pool_type
             )
@@ -326,6 +339,7 @@ class GatewayLp(GatewaySwap):
         base_token_amount: Optional[float] = None,
         quote_token_amount: Optional[float] = None,
         slippage_pct: Optional[float] = None,
+        pool_address: Optional[str] = None,
     ):
         """
         Opens a concentrated liquidity position with explicit price range or calculated from percentages.
@@ -341,6 +355,7 @@ class GatewayLp(GatewaySwap):
         :param base_token_amount: Amount of base token to add (optional)
         :param quote_token_amount: Amount of quote token to add (optional)
         :param slippage_pct: Maximum allowed slippage percentage
+        :param pool_address: Explicit pool address (optional, will lookup by trading_pair if not provided)
         :return: Response from the gateway API
         """
         # Check connector type is CLMM
@@ -380,10 +395,11 @@ class GatewayLp(GatewaySwap):
         else:
             raise ValueError("Must provide either (lower_price and upper_price) or (upper_width_pct and lower_width_pct)")
 
-        # Get pool address for the trading pair
-        pool_address = await self.get_pool_address(trading_pair)
+        # Get pool address - use explicit if provided, otherwise lookup by trading pair
         if not pool_address:
-            raise ValueError(f"Could not find pool for {trading_pair}")
+            pool_address = await self.get_pool_address(trading_pair)
+            if not pool_address:
+                raise ValueError(f"Could not find pool for {trading_pair}")
 
         # Store metadata for event triggering
         self._lp_orders_metadata[order_id] = {
@@ -552,6 +568,13 @@ class GatewayLp(GatewaySwap):
         self.start_tracking_order(order_id=order_id,
                                   trading_pair=trading_pair,
                                   trade_type=trade_type)
+
+        # Store metadata for event triggering
+        self._lp_orders_metadata[order_id] = {
+            "operation": "remove",
+            "position_address": position_address,
+        }
+
         try:
             transaction_result = await self._get_gateway_instance().clmm_close_position(
                 connector=self.connector_name,
@@ -845,11 +868,12 @@ class GatewayLp(GatewaySwap):
 
             if connector_type == ConnectorType.CLMM:
                 # For CLMM, use positions-owned endpoint
+                # Note: Gateway API doesn't support poolAddress filtering, so we filter client-side
                 response = await self._get_gateway_instance().clmm_positions_owned(
                     connector=self.connector_name,
                     network=self.network,
                     wallet_address=self.address,
-                    pool_address=pool_address  # Optional filter by pool
+                    pool_address=None  # Gateway doesn't support this parameter
                 )
             else:
                 # For AMM, we need a pool address
@@ -922,6 +946,13 @@ class GatewayLp(GatewaySwap):
                 except Exception as e:
                     self.logger().error(f"Error parsing position data: {e}", exc_info=True)
                     continue
+
+            # Filter positions by pool_address if specified (client-side filtering)
+            if pool_address and connector_type == ConnectorType.CLMM:
+                positions = [p for p in positions if hasattr(p, 'pool_address') and p.pool_address == pool_address]
+                self.logger().debug(
+                    f"Filtered to {len(positions)} position(s) for pool {pool_address}"
+                )
 
         except Exception as e:
             self.logger().error(f"Error fetching positions: {e}", exc_info=True)

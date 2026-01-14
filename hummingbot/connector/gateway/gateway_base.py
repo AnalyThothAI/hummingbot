@@ -687,6 +687,33 @@ class GatewayBase(ConnectorBase):
         except Exception as e:
             self.logger().error(f"Error updating balance for {currency}: {str(e)}", exc_info=True)
 
+    async def get_balance_by_address(self, token_address: str) -> Decimal:
+        """
+        Get balance for a token by its contract address.
+        Fetches directly from Gateway using the token address.
+
+        :param token_address: The token contract address
+        :return: Balance for the token
+        """
+        try:
+            resp_json: Dict[str, Any] = await self._get_gateway_instance().get_balances(
+                chain=self.chain,
+                network=self.network,
+                address=self.address,
+                token_symbols=[token_address]  # Gateway accepts addresses too
+            )
+
+            if "balances" in resp_json and token_address in resp_json["balances"]:
+                balance = Decimal(str(resp_json["balances"][token_address]))
+                self.logger().debug(f"Fetched balance for token {token_address[:8]}...: {balance}")
+                return balance
+            else:
+                self.logger().warning(f"No balance returned for token address {token_address}")
+                return s_decimal_0
+        except Exception as e:
+            self.logger().error(f"Error fetching balance for token address {token_address}: {str(e)}", exc_info=True)
+            return s_decimal_0
+
     async def approve_token(self, token_symbol: str, spender: Optional[str] = None, amount: Optional[Decimal] = None) -> str:
         """
         Approve tokens for spending by the connector's spender contract.
