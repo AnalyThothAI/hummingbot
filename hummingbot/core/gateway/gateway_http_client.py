@@ -879,20 +879,17 @@ class GatewayHttpClient:
         connector: str,
         network: str,
         pool_address: str,
-        bins: Optional[bool] = None,
         fail_silently: bool = False
     ) -> Dict[str, Any]:
         """
         Gets information about a AMM or CLMM pool
 
-        :param bins: Include bin liquidity data (Meteora only, optional)
+        Note: Meteora pools will automatically include bins in the response
         """
         query_params = {
             "network": network,
             "poolAddress": pool_address
         }
-        if bins is not None:
-            query_params["bins"] = bins
 
         # Parse connector to get name and type
         # Format is always "raydium/amm" with the "/" included
