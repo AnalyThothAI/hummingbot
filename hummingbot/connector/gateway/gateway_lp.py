@@ -262,6 +262,100 @@ class GatewayLp(GatewaySwap):
             return None
 
     @async_ttl_cache(ttl=5, maxsize=10)
+    async def get_pool_info_by_address(
+        self,
+        pool_address: str,
+    ) -> Optional[Union[AMMPoolInfo, CLMMPoolInfo]]:
+        """
+        Retrieves pool information by pool address directly.
+        Uses the appropriate model (AMMPoolInfo or CLMMPoolInfo) based on connector type.
+
+        :param pool_address: The pool contract address
+        :return: Pool info object or None if not found
+        """
+        try:
+            resp: Dict[str, Any] = await self._get_gateway_instance().pool_info(
+                connector=self.connector_name,
+                network=self.network,
+                pool_address=pool_address,
+            )
+
+            if not resp:
+                return None
+
+            # Determine which model to use based on connector type
+            connector_type = get_connector_type(self.connector_name)
+            if connector_type == ConnectorType.CLMM:
+                return CLMMPoolInfo(**resp)
+            elif connector_type == ConnectorType.AMM:
+                return AMMPoolInfo(**resp)
+            else:
+                self.logger().warning(f"Unknown connector type: {connector_type} for {self.connector_name}")
+                return None
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger().network(
+                f"Error fetching pool info for address {pool_address} on {self.connector_name}.",
+                exc_info=True,
+                app_warning_msg=str(e)
+            )
+            return None
+
+    async def resolve_trading_pair_from_pool(
+        self,
+        pool_address: str,
+    ) -> Optional[Dict[str, str]]:
+        """
+        Resolve trading pair information from pool address.
+        Fetches pool info and returns token symbols and addresses.
+
+        :param pool_address: The pool contract address
+        :return: Dictionary with trading_pair, base_token, quote_token, base_token_address, quote_token_address
+                 or None if pool not found
+        """
+        try:
+            # Fetch pool info
+            pool_info_resp = await self._get_gateway_instance().pool_info(
+                connector=self.connector_name,
+                network=self.network,
+                pool_address=pool_address
+            )
+
+            if not pool_info_resp:
+                raise ValueError(f"Could not fetch pool info for pool address {pool_address}")
+
+            # Get token addresses from pool info
+            base_token_address = pool_info_resp.get("baseTokenAddress")
+            quote_token_address = pool_info_resp.get("quoteTokenAddress")
+
+            if not base_token_address or not quote_token_address:
+                raise ValueError(f"Pool info missing token addresses: {pool_info_resp}")
+
+            # Try to get token symbols from connector's token cache
+            base_token_info = self.get_token_by_address(base_token_address)
+            quote_token_info = self.get_token_by_address(quote_token_address)
+
+            base_symbol = base_token_info.get("symbol") if base_token_info else base_token_address
+            quote_symbol = quote_token_info.get("symbol") if quote_token_info else quote_token_address
+
+            trading_pair = f"{base_symbol}-{quote_symbol}"
+
+            return {
+                "trading_pair": trading_pair,
+                "base_token": base_symbol,
+                "quote_token": quote_symbol,
+                "base_token_address": base_token_address,
+                "quote_token_address": quote_token_address,
+            }
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger().error(f"Error resolving trading pair from pool {pool_address}: {str(e)}", exc_info=True)
+            return None
+
     async def get_pool_info(
         self,
         trading_pair: str,
@@ -278,21 +372,7 @@ class GatewayLp(GatewaySwap):
                 self.logger().warning(f"Could not find pool address for {trading_pair}")
                 return None
 
-            resp: Dict[str, Any] = await self._get_gateway_instance().pool_info(
-                connector=self.connector_name,
-                network=self.network,
-                pool_address=pool_address,
-            )
-
-            # Determine which model to use based on connector type
-            connector_type = get_connector_type(self.connector_name)
-            if connector_type == ConnectorType.CLMM:
-                return CLMMPoolInfo(**resp) if resp else None
-            elif connector_type == ConnectorType.AMM:
-                return AMMPoolInfo(**resp) if resp else None
-            else:
-                self.logger().warning(f"Unknown connector type: {connector_type} for {self.connector_name}")
-                return None
+            return await self.get_pool_info_by_address(pool_address)
 
         except asyncio.CancelledError:
             raise
