@@ -928,7 +928,9 @@ class LpPositionManager(ScriptStrategyBase):
 
         viz_lines = []
         viz_lines.append(marker_line)
-        viz_lines.append(f'{float(lower_price):.2f}' + ' ' * (bar_width - len(f'{float(lower_price):.2f}') - len(f'{float(upper_price):.2f}')) + f'{float(upper_price):.2f}')
+        lower_str = f'{float(lower_price):.6f}'
+        upper_str = f'{float(upper_price):.6f}'
+        viz_lines.append(lower_str + ' ' * (bar_width - len(lower_str) - len(upper_str)) + upper_str)
         viz_lines.append(f'Price: {float(current_price):.6f}')
 
         return '\n'.join(viz_lines)
