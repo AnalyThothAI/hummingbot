@@ -333,7 +333,10 @@ class LpPositionManager(ScriptStrategyBase):
                 # Calculate deviation using helper
                 deviation, direction, bound = self._calculate_price_deviation(current_price, lower_price, upper_price)
 
-                msg = (f"⚠️ Position is already out of range! Price {float(current_price):.6f} is {direction} "
+                # Add arrow indicator
+                arrow = "↓" if direction == "below" else "↑"
+
+                msg = (f"⚠️ Position is already out of range! Price {float(current_price):.6f} {arrow} {direction} "
                        f"bound {float(bound):.6f} by {deviation:.2f}%. Rebalance countdown started "
                        f"({self.config.rebalance_seconds}s threshold)")
 
@@ -491,9 +494,12 @@ class LpPositionManager(ScriptStrategyBase):
                     deviation, direction, bound = self._calculate_price_deviation(current_price, lower_price, upper_price)
                     self.logger().info(f"Price {current_price:.6f} moved {direction} bound {bound:.6f} by {deviation:.2f}%")
 
+                    # Add arrow indicator
+                    arrow = "↓" if direction == "below" else "↑"
+
                     # Notify user that position is out of range
                     msg = (f"⚠️ {self.trading_pair} position out of range on {self.exchange}: "
-                           f"Price {float(current_price):.6f} moved {direction} bound {float(bound):.6f} by {deviation:.2f}%. "
+                           f"Price {float(current_price):.6f} {arrow} {direction} bound {float(bound):.6f} by {deviation:.2f}%. "
                            f"Will rebalance after {self.config.rebalance_seconds}s")
                     self.notify_hb_app_with_timestamp(msg)
 
@@ -519,9 +525,12 @@ class LpPositionManager(ScriptStrategyBase):
             # Calculate deviation using helper
             deviation, direction, _ = self._calculate_price_deviation(current_price, old_lower, old_upper)
 
+            # Add arrow indicator
+            arrow = "↓" if direction == "below" else "↑"
+
             # Notify user about rebalance trigger
             msg = (f"🔄 Rebalancing {self.trading_pair} position on {self.exchange}: "
-                   f"Price {float(current_price):.6f} moved {direction} range "
+                   f"Price {float(current_price):.6f} {arrow} {direction} range "
                    f"[{float(old_lower):.6f}-{float(old_upper):.6f}] by {deviation:.2f}%")
             self.notify_hb_app_with_timestamp(msg)
 
