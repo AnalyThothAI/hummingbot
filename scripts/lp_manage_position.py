@@ -23,13 +23,26 @@ PARAMETERS
   * After rebalance: only one token provided based on price direction
 - position_width_pct: TOTAL position width as percentage of mid price (e.g. 2.0 = ±1%)
 - rebalance_seconds: Seconds price must stay out-of-bounds before rebalancing
+- lower_price_limit: (Optional) Never provide liquidity below this price
+  * When price < lower_price_limit: Close position and hold tokens
+  * When price > lower_price_limit: Position's lower bound won't go below this limit
+- upper_price_limit: (Optional) Never provide liquidity above this price
+  * When price > upper_price_limit: Close position and hold tokens
+  * When price < upper_price_limit: Position's upper bound won't go above this limit
 - strategy_type: (Optional) Meteora-specific strategy type (0=Spot, 1=Curve, None=use default)
+
+PRICE LIMITS USE CASES
+-----------------------
+- Lower limit only: Accumulation strategy (buy support, but not below X)
+- Upper limit only: Profit-taking strategy (sell resistance, but not above Y)
+- Both limits: Range-bound strategy (only provide liquidity in channel)
 
 NOTES
 -----
 - All tick rounding and amount calculations delegated to Gateway
 - After first rebalance, automatically switches to single-sided positions
 - Uses actual wallet balances for rebalancing (not config amounts)
+- Price limits are enforced on rebalance and new positions
 """
 
 import asyncio
@@ -70,6 +83,10 @@ class LpPositionManagerConfig(BaseClientModel):
         "prompt": "Seconds price must stay out-of-bounds before rebalancing", "prompt_on_new": True})
     check_seconds: int = Field(30, json_schema_extra={
         "prompt": "Seconds between position status checks (important for rate limits)", "prompt_on_new": True})
+    lower_price_limit: Optional[Decimal] = Field(None, json_schema_extra={
+        "prompt": "Lower price limit (optional, never provide liquidity below this price)", "prompt_on_new": False})
+    upper_price_limit: Optional[Decimal] = Field(None, json_schema_extra={
+        "prompt": "Upper price limit (optional, never provide liquidity above this price)", "prompt_on_new": False})
     strategy_type: Optional[int] = Field(None, json_schema_extra={
         "prompt": "Strategy type for Meteora (0=Spot, 1=Curve, None=use default)", "prompt_on_new": False})
 
@@ -177,8 +194,11 @@ class LpPositionManager(ScriptStrategyBase):
                 ConnectorPair(connector_name=self.exchange, trading_pair=self.trading_pair)
             ])
 
+            # Validate price limits
+            self._validate_price_limits()
+
             # Log configuration details
-            self.logger().info(
+            config_msg = (
                 f"LP Position Manager configured:\n"
                 f"  Trading Pair: {self.trading_pair}\n"
                 f"  Pool Address: {self.pool_address}\n"
@@ -186,6 +206,15 @@ class LpPositionManager(ScriptStrategyBase):
                 f"  Rebalance threshold: {self.config.rebalance_seconds} seconds out-of-bounds\n"
                 f"  Check interval: {self.config.check_seconds} seconds (rate limiting)"
             )
+
+            if self.config.lower_price_limit or self.config.upper_price_limit:
+                config_msg += "\n  Price Limits:"
+                if self.config.lower_price_limit:
+                    config_msg += f"\n    Lower: {float(self.config.lower_price_limit):.6f}"
+                if self.config.upper_price_limit:
+                    config_msg += f"\n    Upper: {float(self.config.upper_price_limit):.6f}"
+
+            self.logger().info(config_msg)
 
             if self.config.base_amount > 0 or self.config.quote_amount > 0:
                 self.logger().info(
@@ -273,6 +302,39 @@ class LpPositionManager(ScriptStrategyBase):
                 self._tracking_data["initial_sol_balance"] = float(initial_sol)
                 self._save_tracking_data()
                 self.logger().info(f"Initialized SOL balance tracking: {initial_sol:.4f} SOL")
+
+    def _validate_price_limits(self):
+        """Validate price limits configuration"""
+        if self.config.lower_price_limit and self.config.upper_price_limit:
+            if self.config.lower_price_limit >= self.config.upper_price_limit:
+                raise ValueError(
+                    f"Invalid price limits: lower ({float(self.config.lower_price_limit):.6f}) "
+                    f"must be < upper ({float(self.config.upper_price_limit):.6f})"
+                )
+
+    def _is_price_within_limits(self, price: Decimal) -> bool:
+        """Check if price is within configured price limits"""
+        if self.config.lower_price_limit and price < self.config.lower_price_limit:
+            return False
+        if self.config.upper_price_limit and price > self.config.upper_price_limit:
+            return False
+        return True
+
+    def _apply_price_limit_constraints(self, lower_bound: Decimal, upper_bound: Decimal) -> Tuple[Decimal, Decimal]:
+        """Apply price limits to position bounds, returns constrained bounds"""
+        if self.config.lower_price_limit:
+            lower_bound = max(lower_bound, self.config.lower_price_limit)
+        if self.config.upper_price_limit:
+            upper_bound = min(upper_bound, self.config.upper_price_limit)
+
+        # Validate result
+        if lower_bound >= upper_bound:
+            self.logger().warning(
+                f"Price limit constraints resulted in invalid bounds: "
+                f"lower={float(lower_bound):.6f} >= upper={float(upper_bound):.6f}"
+            )
+
+        return lower_bound, upper_bound
 
     def _save_tracking_data(self):
         """Save P&L tracking data to JSON file"""
@@ -495,6 +557,19 @@ class LpPositionManager(ScriptStrategyBase):
             lower_price = current_price * (1 - lower_pct / 100)
             upper_price = current_price * (1 + upper_pct / 100)
 
+            # Apply price limit constraints
+            lower_price_decimal = Decimal(str(lower_price))
+            upper_price_decimal = Decimal(str(upper_price))
+            lower_price_decimal, upper_price_decimal = self._apply_price_limit_constraints(lower_price_decimal, upper_price_decimal)
+
+            # Validate bounds after constraints
+            if lower_price_decimal >= upper_price_decimal:
+                self.logger().error("Price limit constraints resulted in invalid bounds, cannot create position")
+                return
+
+            lower_price = float(lower_price_decimal)
+            upper_price = float(upper_price_decimal)
+
             # Log position type and range
             if base_amt > 0 and quote_amt > 0:
                 self.logger().info(
@@ -604,7 +679,25 @@ class LpPositionManager(ScriptStrategyBase):
 
                 if elapsed_seconds >= self.config.rebalance_seconds:
                     self.logger().info(f"Price out of bounds for {elapsed_seconds:.0f} seconds (threshold: {self.config.rebalance_seconds})")
-                    await self.rebalance_position(current_price, lower_price, upper_price)
+
+                    # Check if price is within limits before rebalancing
+                    if not self._is_price_within_limits(current_price):
+                        # Price outside limits - close position and hold
+                        limit_msg = ""
+                        if self.config.lower_price_limit and current_price < self.config.lower_price_limit:
+                            limit_msg = f"below lower price limit {float(self.config.lower_price_limit):.6f}"
+                        elif self.config.upper_price_limit and current_price > self.config.upper_price_limit:
+                            limit_msg = f"above upper price limit {float(self.config.upper_price_limit):.6f}"
+
+                        self.logger().info(f"Price {limit_msg}, closing position without rebalancing")
+                        msg = f"⛔ Price {limit_msg} - closing position and holding tokens"
+                        self.notify_hb_app_with_timestamp(msg)
+
+                        # Close position without opening a new one
+                        await self.close_position_only()
+                    else:
+                        # Normal rebalance
+                        await self.rebalance_position(current_price, lower_price, upper_price)
                 else:
                     self.logger().info(f"Price out of bounds for {elapsed_seconds:.0f}/{self.config.rebalance_seconds} seconds")
 
@@ -665,6 +758,29 @@ class LpPositionManager(ScriptStrategyBase):
 
         except Exception as e:
             self.logger().error(f"Error starting rebalance: {str(e)}")
+            self.pending_operation = None
+
+    async def close_position_only(self):
+        """Close position without rebalancing (used when price is outside limits)"""
+        if self.pending_operation or not self.trading_pair or not self.current_position_id:
+            return
+
+        try:
+            self.logger().info("Closing position without rebalancing (price outside limits)")
+
+            # Don't set _closed_position_balances since we won't rebalance
+            # Close the current position
+            order_id = self.connectors[self.exchange].remove_liquidity(
+                trading_pair=self.trading_pair,
+                position_address=self.current_position_id
+            )
+
+            self.pending_close_order_id = order_id
+            self.pending_operation = "closing"
+            self.logger().info(f"Position close order submitted with ID: {order_id}")
+
+        except Exception as e:
+            self.logger().error(f"Error closing position: {str(e)}")
             self.pending_operation = None
 
     async def open_rebalanced_position(self):
@@ -748,9 +864,24 @@ class LpPositionManager(ScriptStrategyBase):
             # Compute width percentages based on position type
             lower_pct, upper_pct = self._compute_width_percentages(base_amt, quote_amt)
 
-            # Calculate actual price bounds for logging
+            # Calculate actual price bounds
             lower_price = new_mid_price * (1 - lower_pct / 100)
             upper_price = new_mid_price * (1 + upper_pct / 100)
+
+            # Apply price limit constraints
+            lower_price_decimal = Decimal(str(lower_price))
+            upper_price_decimal = Decimal(str(upper_price))
+            lower_price_decimal, upper_price_decimal = self._apply_price_limit_constraints(lower_price_decimal, upper_price_decimal)
+
+            # Validate bounds after constraints
+            if lower_price_decimal >= upper_price_decimal:
+                self.logger().error("Price limit constraints resulted in invalid bounds, cannot rebalance position")
+                self.pending_operation = None
+                self._closed_position_balances = None
+                return
+
+            lower_price = float(lower_price_decimal)
+            upper_price = float(upper_price_decimal)
 
             # Log rebalanced position details
             if side == "base":
@@ -1046,6 +1177,60 @@ class LpPositionManager(ScriptStrategyBase):
             "sol_change": sol_change
         }
 
+    def _create_price_limits_visualization(self, current_price: Decimal) -> Optional[str]:
+        """Create visualization of price limits with current price"""
+        if not self.config.lower_price_limit and not self.config.upper_price_limit:
+            return None
+
+        lower_limit = self.config.lower_price_limit if self.config.lower_price_limit else Decimal("0")
+        upper_limit = self.config.upper_price_limit if self.config.upper_price_limit else current_price * 2
+
+        # If only one limit is set, create appropriate range
+        if not self.config.lower_price_limit:
+            lower_limit = max(Decimal("0"), upper_limit * Decimal("0.5"))
+        if not self.config.upper_price_limit:
+            upper_limit = lower_limit * Decimal("2")
+
+        # Calculate position
+        price_range = upper_limit - lower_limit
+        if price_range <= 0:
+            return None
+
+        current_position = (current_price - lower_limit) / price_range
+
+        # Create bar
+        bar_width = 50
+        current_pos = int(current_position * bar_width)
+
+        # Build visualization
+        limit_bar = ['─'] * bar_width
+        limit_bar[0] = '['
+        limit_bar[-1] = ']'
+
+        # Place price marker
+        if current_pos < 0:
+            marker_line = '● ' + ''.join(limit_bar)
+            status = "⛔ BELOW LOWER LIMIT"
+        elif current_pos >= bar_width:
+            marker_line = ''.join(limit_bar) + ' ●'
+            status = "⛔ ABOVE UPPER LIMIT"
+        else:
+            limit_bar[current_pos] = '●'
+            marker_line = ''.join(limit_bar)
+            status = "✓ Within Limits"
+
+        viz_lines = []
+        viz_lines.append("Price Limits:")
+        viz_lines.append(marker_line)
+
+        # Build limit labels
+        lower_str = f'{float(lower_limit):.6f}' if self.config.lower_price_limit else 'None'
+        upper_str = f'{float(upper_limit):.6f}' if self.config.upper_price_limit else 'None'
+        viz_lines.append(lower_str + ' ' * (bar_width - len(lower_str) - len(upper_str)) + upper_str)
+        viz_lines.append(f'Status: {status}')
+
+        return '\n'.join(viz_lines)
+
     def _create_price_range_visualization(self, lower_price: Decimal, current_price: Decimal,
                                           upper_price: Decimal) -> str:
         """Create visual representation of price range with current price marker"""
@@ -1152,6 +1337,12 @@ class LpPositionManager(ScriptStrategyBase):
                     lines.append("Status: ✅ In Bounds")
                 else:
                     lines.append("Status: ⚠️ Out of Bounds")
+
+                # Add price limits visualization
+                limits_viz = self._create_price_limits_visualization(current_price)
+                if limits_viz:
+                    lines.append("")
+                    lines.append(limits_viz)
             else:
                 lines.append(f"Position Range: {lower_price:.6f} - {upper_price:.6f}")
 
@@ -1169,6 +1360,13 @@ class LpPositionManager(ScriptStrategyBase):
 
             if self.pool_info:
                 lines.append(f"Current Price: {self.pool_info.price:.6f}")
+
+                # Add price limits visualization if configured
+                current_price = Decimal(str(self.pool_info.price))
+                limits_viz = self._create_price_limits_visualization(current_price)
+                if limits_viz:
+                    lines.append("")
+                    lines.append(limits_viz)
 
         # Add P&L Summary
         pnl_summary = self._calculate_pnl_summary()
