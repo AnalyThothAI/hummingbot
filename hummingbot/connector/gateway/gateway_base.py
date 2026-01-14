@@ -711,22 +711,16 @@ class GatewayBase(ConnectorBase):
 
                 # First try the address as key
                 if token_address in balances:
-                    balance = Decimal(str(balances[token_address]))
-                    self.logger().debug(f"Fetched balance for {token_address[:8]}...: {balance}")
-                    return balance
+                    return Decimal(str(balances[token_address]))
 
                 # Gateway may return balance keyed by symbol instead of address
                 # Since we requested one token, take the first (and only) balance
                 elif len(balances) == 1:
                     symbol, balance_str = next(iter(balances.items()))
-                    balance = Decimal(str(balance_str))
-                    self.logger().debug(f"Fetched balance for {token_address[:8]}... (returned as {symbol}): {balance}")
-                    return balance
+                    return Decimal(str(balance_str))
                 else:
-                    self.logger().warning(f"No balance returned for token address {token_address[:8]}...")
                     return s_decimal_0
             else:
-                self.logger().warning(f"No balances in response for token address {token_address[:8]}...")
                 return s_decimal_0
         except Exception as e:
             self.logger().error(f"Error fetching balance for token address {token_address}: {str(e)}", exc_info=True)
