@@ -56,7 +56,6 @@ from typing import Dict, Optional, Tuple
 
 from pydantic import Field
 
-from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.gateway.common_types import ConnectorType, get_connector_type
 from hummingbot.connector.gateway.gateway_lp import CLMMPoolInfo, CLMMPositionInfo
@@ -67,14 +66,18 @@ from hummingbot.core.event.events import (
     RangePositionUpdateFailureEvent,
 )
 from hummingbot.core.utils.async_utils import safe_ensure_future
-from hummingbot.data_feed.market_data_provider import MarketDataProvider
-from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
+from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 
 
-class LpPositionManagerConfig(BaseClientModel):
+class LpPositionManagerConfig(StrategyV2ConfigBase):
     script_file_name: str = os.path.basename(__file__)
     config_file_name: Optional[str] = None  # Set by trading_core with the config file name
+    # Override StrategyV2ConfigBase required fields with empty defaults (not used for LP)
+    markets: Dict[str, set] = {}
+    candles_config: list[CandlesConfig] = []
+    # LP-specific config
     connector: str = Field("meteora/clmm", json_schema_extra={
         "prompt": "CLMM connector in format 'name/type' (e.g. meteora/clmm, uniswap/clmm)", "prompt_on_new": True})
     pool_address: str = Field("", json_schema_extra={
@@ -97,7 +100,7 @@ class LpPositionManagerConfig(BaseClientModel):
         "prompt": "Strategy type for Meteora (0=Spot, 1=Curve, None=use default)", "prompt_on_new": False})
 
 
-class LpPositionManager(ScriptStrategyBase):
+class LpPositionManager(StrategyV2Base):
     """
     CLMM LP position manager that automatically rebalances when price moves out of bounds.
     """
@@ -113,7 +116,7 @@ class LpPositionManager(ScriptStrategyBase):
         cls.markets = {config.connector: {"UNKNOWN-UNKNOWN"}}
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: LpPositionManagerConfig):
-        super().__init__(connectors)
+        super().__init__(connectors, config)
         self.config = config
         self.exchange = config.connector
         self.connector_type = get_connector_type(config.connector)
@@ -135,9 +138,7 @@ class LpPositionManager(ScriptStrategyBase):
         self.quote_token_address: Optional[str] = None
         self._trading_pair_resolved = False
 
-        # Initialize market data provider for rate oracle (required for PNL tracking)
-        # We'll initialize rate sources after resolving trading_pair
-        self.market_data_provider = MarketDataProvider(connectors)
+        # Note: market_data_provider is initialized by StrategyV2Base
 
         # State tracking
         self.pool_info: Optional[CLMMPoolInfo] = None
@@ -1633,7 +1634,7 @@ class LpPositionManager(ScriptStrategyBase):
                 lines.append(f"    {quote}: {pnl_summary['total_close_quote']:.6f}")
                 lines.append(f"    Value: {pnl_summary['total_close_value']:.6f} {quote}")
                 lines.append("")
-                lines.append("  Total Fees Collected:")
+                lines.append("  Fees Collected:")
                 lines.append(f"    {base}: {pnl_summary['total_fees_base']:.6f} ({pnl_summary['total_fees_base_value']:.6f} {quote})")
                 lines.append(f"    {quote}: {pnl_summary['total_fees_quote']:.6f}")
                 lines.append(f"    Value: {pnl_summary['total_fees_value']:.6f} {quote}")
