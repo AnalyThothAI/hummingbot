@@ -33,10 +33,12 @@ NOTES
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
 from decimal import Decimal
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 from pydantic import Field
@@ -134,6 +136,10 @@ class LpPositionManager(ScriptStrategyBase):
         self._last_check_time: float = 0
         self._last_position_update_time: float = 0
         self._last_pool_info_fetch_time: float = 0
+
+        # P&L tracking
+        self._tracking_file_path = Path("data") / f"lp_position_history_{self.pool_address[:8]}.json"
+        self._tracking_data: Dict = self._load_tracking_data()
 
         # Log initial startup (will log more details after resolving trading pair)
         self.log_with_clock(logging.INFO,
@@ -238,6 +244,87 @@ class LpPositionManager(ScriptStrategyBase):
             await self.create_initial_position()
         else:
             self.logger().info("No existing position and no initial amounts provided - monitoring only")
+
+    def _load_tracking_data(self) -> Dict:
+        """Load P&L tracking data from JSON file"""
+        if self._tracking_file_path.exists():
+            try:
+                with open(self._tracking_file_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                self.logger().warning(f"Failed to load tracking data: {e}, starting fresh")
+
+        # Initialize new tracking data with current SOL balance
+        connector = self.connectors[self.config.connector]
+        initial_sol = connector.get_available_balance("SOL")
+
+        return {
+            "initial_sol_balance": float(initial_sol),
+            "tracking_started": int(time.time()),
+            "positions": []
+        }
+
+    def _save_tracking_data(self):
+        """Save P&L tracking data to JSON file"""
+        try:
+            self._tracking_file_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._tracking_file_path, 'w') as f:
+                json.dump(self._tracking_data, f, indent=2)
+        except Exception as e:
+            self.logger().error(f"Failed to save tracking data: {e}", exc_info=True)
+
+    def _record_position_event(self, event_type: str, position_info: Optional[CLMMPositionInfo] = None):
+        """Record position open/close event for P&L tracking"""
+        if not position_info and event_type == "open":
+            self.logger().warning("Cannot record open event without position info")
+            return
+
+        if not self.pool_info:
+            self.logger().warning("Cannot record position event without pool info")
+            return
+
+        try:
+            event_data = {
+                "type": event_type,
+                "timestamp": int(time.time()),
+                "position_address": self.current_position_id if self.current_position_id else "unknown",
+                "trading_pair": self.trading_pair,
+                "lower_price": float(position_info.lower_price) if position_info else 0,
+                "upper_price": float(position_info.upper_price) if position_info else 0,
+                "mid_price": float(self.pool_info.price),
+            }
+
+            if event_type == "open" and position_info:
+                base_amount = Decimal(str(position_info.base_token_amount))
+                quote_amount = Decimal(str(position_info.quote_token_amount))
+                price = Decimal(str(self.pool_info.price))
+
+                event_data.update({
+                    "base_amount": float(base_amount),
+                    "quote_amount": float(quote_amount),
+                    "value_in_quote": float(base_amount * price + quote_amount)
+                })
+            elif event_type == "close" and position_info:
+                base_amount = Decimal(str(position_info.base_token_amount))
+                quote_amount = Decimal(str(position_info.quote_token_amount))
+                base_fees = Decimal(str(position_info.base_fee_amount))
+                quote_fees = Decimal(str(position_info.quote_fee_amount))
+                price = Decimal(str(self.pool_info.price))
+
+                event_data.update({
+                    "base_amount": float(base_amount),
+                    "quote_amount": float(quote_amount),
+                    "base_fees": float(base_fees),
+                    "quote_fees": float(quote_fees),
+                    "value_in_quote": float(base_amount * price + quote_amount + base_fees * price + quote_fees)
+                })
+
+            self._tracking_data["positions"].append(event_data)
+            self._save_tracking_data()
+            self.logger().info(f"Recorded {event_type} event for position {event_data['position_address'][:8]}...")
+
+        except Exception as e:
+            self.logger().error(f"Error recording position event: {e}", exc_info=True)
 
     def on_tick(self):
         """Called on each strategy tick"""
@@ -839,6 +926,9 @@ class LpPositionManager(ScriptStrategyBase):
                     f"Actual position price range: {float(self.position_info.lower_price):.6f} - "
                     f"{float(self.position_info.upper_price):.6f}"
                 )
+
+                # Record position open event for P&L tracking
+                self._record_position_event("open", self.position_info)
         except Exception as e:
             self.logger().error(f"Error fetching position info after add: {str(e)}")
 
@@ -873,6 +963,10 @@ class LpPositionManager(ScriptStrategyBase):
         if hasattr(event, 'order_id') and event.order_id == self.pending_close_order_id:
             self.logger().info(f"Position closing order {event.order_id} confirmed!")
 
+            # Record position close event for P&L tracking (before clearing position_info)
+            if self.position_info:
+                self._record_position_event("close", self.position_info)
+
             # Clear current position
             self.current_position_id = None
             self.position_info = None
@@ -897,6 +991,50 @@ class LpPositionManager(ScriptStrategyBase):
                 safe_ensure_future(self.open_rebalanced_position())
             else:
                 self.logger().warning("Position closed but no rebalance info available!")
+
+    def _calculate_pnl_summary(self) -> Dict:
+        """Calculate P&L summary from position history"""
+        positions = self._tracking_data.get("positions", [])
+
+        opens = [p for p in positions if p["type"] == "open"]
+        closes = [p for p in positions if p["type"] == "close"]
+
+        # Calculate averages
+        avg_open_value = sum(p["value_in_quote"] for p in opens) / len(opens) if opens else 0
+        avg_close_value = sum(p["value_in_quote"] for p in closes) / len(closes) if closes else 0
+        avg_open_price = sum(p["mid_price"] for p in opens) / len(opens) if opens else 0
+        avg_close_price = sum(p["mid_price"] for p in closes) / len(closes) if closes else 0
+
+        # Calculate position P&L (only from closed positions)
+        position_pnl = avg_close_value - avg_open_value if closes else 0
+        position_roi_pct = (position_pnl / avg_open_value * 100) if avg_open_value > 0 else 0
+
+        # Get current position duration if open
+        current_position_duration = None
+        if self.current_position_id and opens:
+            last_open = max((p for p in opens), key=lambda x: x["timestamp"])
+            current_position_duration = int(time.time() - last_open["timestamp"])
+
+        # SOL balance change
+        connector = self.connectors[self.config.connector]
+        current_sol = float(connector.get_available_balance("SOL"))
+        initial_sol = self._tracking_data.get("initial_sol_balance", current_sol)
+        sol_change = current_sol - initial_sol
+
+        return {
+            "opens_count": len(opens),
+            "closes_count": len(closes),
+            "avg_open_value": avg_open_value,
+            "avg_close_value": avg_close_value,
+            "avg_open_price": avg_open_price,
+            "avg_close_price": avg_close_price,
+            "position_pnl": position_pnl,
+            "position_roi_pct": position_roi_pct,
+            "current_position_duration": current_position_duration,
+            "initial_sol": initial_sol,
+            "current_sol": current_sol,
+            "sol_change": sol_change
+        }
 
     def _create_price_range_visualization(self, lower_price: Decimal, current_price: Decimal,
                                           upper_price: Decimal) -> str:
@@ -1021,5 +1159,34 @@ class LpPositionManager(ScriptStrategyBase):
 
             if self.pool_info:
                 lines.append(f"Current Price: {self.pool_info.price:.6f}")
+
+        # Add P&L Summary
+        pnl_summary = self._calculate_pnl_summary()
+        if pnl_summary["opens_count"] > 0 or pnl_summary["closes_count"] > 0:
+            lines.append("")
+            lines.append("=" * 50)
+            lines.append("LP Performance Summary:")
+            lines.append(f"  Positions Opened: {pnl_summary['opens_count']}")
+            lines.append(f"  Positions Closed: {pnl_summary['closes_count']}")
+
+            if pnl_summary["closes_count"] > 0:
+                lines.append("")
+                lines.append(f"  Avg Open:  {pnl_summary['avg_open_value']:.6f} {self.quote_token} (avg price: {pnl_summary['avg_open_price']:.6f})")
+                lines.append(f"  Avg Close: {pnl_summary['avg_close_value']:.6f} {self.quote_token} (avg price: {pnl_summary['avg_close_price']:.6f})")
+                pnl_sign = "+" if pnl_summary["position_pnl"] >= 0 else ""
+                lines.append(f"  Position P&L: {pnl_sign}{pnl_summary['position_pnl']:.6f} {self.quote_token} ({pnl_sign}{pnl_summary['position_roi_pct']:.2f}%)")
+
+            if pnl_summary["current_position_duration"] is not None:
+                duration_m = pnl_summary["current_position_duration"] // 60
+                duration_s = pnl_summary["current_position_duration"] % 60
+                lines.append("")
+                lines.append(f"  Current: OPEN since {duration_m}m {duration_s}s")
+
+            lines.append("")
+            lines.append("Wallet SOL:")
+            lines.append(f"  Initial:  {pnl_summary['initial_sol']:.4f} SOL")
+            lines.append(f"  Current:  {pnl_summary['current_sol']:.4f} SOL")
+            sol_change_sign = "+" if pnl_summary["sol_change"] >= 0 else ""
+            lines.append(f"  Change:   {sol_change_sign}{pnl_summary['sol_change']:.4f} SOL")
 
         return "\n".join(lines)
