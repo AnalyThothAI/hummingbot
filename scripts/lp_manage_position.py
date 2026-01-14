@@ -945,12 +945,13 @@ class LpPositionManager(ScriptStrategyBase):
             self.has_rebalanced_once = True
             self.logger().info(f"Rebalanced {side}-only position order submitted with ID: {order_id}")
 
-            # Clean up balance info
-            self._closed_position_balances = None
+            # NOTE: Don't clear _closed_position_balances here - it's needed for retry on timeout
+            # It will be cleared in did_add_liquidity() after successful confirmation
 
         except Exception as e:
             self.logger().error(f"Error opening rebalanced position: {str(e)}")
             self.pending_operation = None
+            self._closed_position_balances = None  # Clear on error since we won't retry
 
     def _compute_width_percentages(self, base_amt: float = 0, quote_amt: float = 0):
         """
@@ -1109,6 +1110,7 @@ class LpPositionManager(ScriptStrategyBase):
             self.pending_open_order_id = None
             self.pending_operation = None
             self.out_of_bounds_since = None
+            self._closed_position_balances = None  # Clear rebalance info now that open succeeded
 
             # Build notification message with amounts added
             if self._opening_position_amounts:
@@ -1252,8 +1254,31 @@ class LpPositionManager(ScriptStrategyBase):
         total_fees_base_value = sum(p.get("base_fees", 0) * p.get("mid_price", 0) for p in closes)
         total_fees_value = total_fees_base_value + total_fees_quote
 
-        # Calculate position P&L: Total Close Value + Total Fees - Total Open Value
-        position_pnl = (total_close_value + total_fees_value - total_open_value) if closes else 0
+        # Calculate current position value (only if script created the initial position)
+        # If first record is "open", script created initial position - include current position value
+        # If first record is "close", script inherited existing position - don't include current position value
+        current_position_value = Decimal("0")
+        current_position_base = Decimal("0")
+        current_position_quote = Decimal("0")
+        current_position_base_fees = Decimal("0")
+        current_position_quote_fees = Decimal("0")
+        first_event_is_open = positions and positions[0].get("type") == "open"
+
+        if first_event_is_open and self.current_position_id and self.position_info and self.pool_info:
+            current_price = Decimal(str(self.pool_info.price))
+            current_position_base = Decimal(str(self.position_info.base_token_amount))
+            current_position_quote = Decimal(str(self.position_info.quote_token_amount))
+            current_position_base_fees = Decimal(str(self.position_info.base_fee_amount))
+            current_position_quote_fees = Decimal(str(self.position_info.quote_fee_amount))
+            # Total value = tokens + uncollected fees
+            current_position_value = (
+                current_position_base * current_price + current_position_quote +
+                current_position_base_fees * current_price + current_position_quote_fees
+            )
+
+        # Calculate P&L: (Closed Value + Fees + Current Position Value) - Total Open Value
+        total_current_value = total_close_value + total_fees_value + float(current_position_value)
+        position_pnl = (total_current_value - total_open_value) if total_open_value > 0 else 0
         position_roi_pct = (position_pnl / total_open_value * 100) if total_open_value > 0 else 0
 
         # Get current position open timestamp if open
@@ -1286,7 +1311,14 @@ class LpPositionManager(ScriptStrategyBase):
             "total_fees_base_value": total_fees_base_value,
             "total_fees_quote": total_fees_quote,
             "total_fees_value": total_fees_value,
-            # P&L
+            # Current position (if open and created by script)
+            "current_position_value": float(current_position_value),
+            "current_position_base": float(current_position_base),
+            "current_position_quote": float(current_position_quote),
+            "current_position_base_fees": float(current_position_base_fees),
+            "current_position_quote_fees": float(current_position_quote_fees),
+            "first_event_is_open": first_event_is_open,
+            # P&L (includes current position value)
             "position_pnl": position_pnl,
             "position_roi_pct": position_roi_pct,
             "current_position_open_time": current_position_open_time,
@@ -1585,7 +1617,7 @@ class LpPositionManager(ScriptStrategyBase):
         lines.append("")
         lines.append("LP Performance Summary:")
 
-        if pnl_summary["closes_count"] > 0:
+        if pnl_summary["opens_count"] > 0:
             base = self.base_token or (self.base_token_address[:8] + "..." if self.base_token_address else "BASE")
             quote = self.quote_token or (self.quote_token_address[:8] + "..." if self.quote_token_address else "QUOTE")
             lines.append("")
@@ -1593,16 +1625,25 @@ class LpPositionManager(ScriptStrategyBase):
             lines.append(f"    {base}: {pnl_summary['total_open_base']:.6f} ({pnl_summary['total_open_base_value']:.6f} {quote})")
             lines.append(f"    {quote}: {pnl_summary['total_open_quote']:.6f}")
             lines.append(f"    Value: {pnl_summary['total_open_value']:.6f} {quote}")
-            lines.append("")
-            lines.append(f"  Positions Closed: {pnl_summary['closes_count']}")
-            lines.append(f"    {base}: {pnl_summary['total_close_base']:.6f} ({pnl_summary['total_close_base_value']:.6f} {quote})")
-            lines.append(f"    {quote}: {pnl_summary['total_close_quote']:.6f}")
-            lines.append(f"    Value: {pnl_summary['total_close_value']:.6f} {quote}")
-            lines.append("")
-            lines.append("  Total Fees:")
-            lines.append(f"    {base}: {pnl_summary['total_fees_base']:.6f} ({pnl_summary['total_fees_base_value']:.6f} {quote})")
-            lines.append(f"    {quote}: {pnl_summary['total_fees_quote']:.6f}")
-            lines.append(f"    Value: {pnl_summary['total_fees_value']:.6f} {quote}")
+
+            if pnl_summary["closes_count"] > 0:
+                lines.append("")
+                lines.append(f"  Positions Closed: {pnl_summary['closes_count']}")
+                lines.append(f"    {base}: {pnl_summary['total_close_base']:.6f} ({pnl_summary['total_close_base_value']:.6f} {quote})")
+                lines.append(f"    {quote}: {pnl_summary['total_close_quote']:.6f}")
+                lines.append(f"    Value: {pnl_summary['total_close_value']:.6f} {quote}")
+                lines.append("")
+                lines.append("  Total Fees Collected:")
+                lines.append(f"    {base}: {pnl_summary['total_fees_base']:.6f} ({pnl_summary['total_fees_base_value']:.6f} {quote})")
+                lines.append(f"    {quote}: {pnl_summary['total_fees_quote']:.6f}")
+                lines.append(f"    Value: {pnl_summary['total_fees_value']:.6f} {quote}")
+
+            # Show current position value if script created initial position
+            if pnl_summary["first_event_is_open"] and pnl_summary["current_position_value"] > 0:
+                lines.append("")
+                lines.append("  Current Position Value:")
+                lines.append(f"    Value: {pnl_summary['current_position_value']:.6f} {quote}")
+
             lines.append("")
             pnl_sign = "+" if pnl_summary["position_pnl"] >= 0 else ""
             lines.append(f"  P&L: {pnl_sign}{pnl_summary['position_pnl']:.6f} {quote} ({pnl_sign}{pnl_summary['position_roi_pct']:.2f}%)")
