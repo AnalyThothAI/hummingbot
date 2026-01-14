@@ -15,7 +15,7 @@ BEHAVIOR
 PARAMETERS
 ----------
 - connector: CLMM connector in format 'name/type' (e.g. raydium/clmm, meteora/clmm)
-- trading_pair: Trading pair (e.g. META-SOL). Pool must be added via 'gateway pool' command first
+- pool_address: Pool address (e.g. 2sf5NYcY4zUPXUSmG6f66mskb24t5F8S11pC1Nz5nQT3)
 - base_amount: Initial base token amount (0 for quote-only position)
 - quote_amount: Initial quote token amount (0 for base-only position)
   * If both are 0 and no existing position: monitoring only
@@ -307,8 +307,7 @@ class LpPositionManager(ScriptStrategyBase):
                 return True
 
             return False
-        except Exception as e:
-            self.logger().debug(f"No existing positions found or error checking: {str(e)}")
+        except Exception:
             return False
 
     async def check_if_position_out_of_range_on_startup(self):
