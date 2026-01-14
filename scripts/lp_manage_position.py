@@ -208,6 +208,9 @@ class LpPositionManager(ScriptStrategyBase):
         if not await self._resolve_pool_info():
             return
 
+        # Initialize SOL balance tracking now that connector is ready
+        self._initialize_sol_balance_if_needed()
+
         # Check for existing position
         has_existing = await self.check_existing_positions()
 
@@ -254,15 +257,22 @@ class LpPositionManager(ScriptStrategyBase):
             except Exception as e:
                 self.logger().warning(f"Failed to load tracking data: {e}, starting fresh")
 
-        # Initialize new tracking data with current SOL balance
-        connector = self.connectors[self.config.connector]
-        initial_sol = connector.get_available_balance("SOL")
-
+        # Initialize new tracking data (SOL balance will be set later when connector is ready)
         return {
-            "initial_sol_balance": float(initial_sol),
+            "initial_sol_balance": 0.0,
             "tracking_started": int(time.time()),
             "positions": []
         }
+
+    def _initialize_sol_balance_if_needed(self):
+        """Initialize SOL balance if not already set (called when connector is ready)"""
+        if self._tracking_data.get("initial_sol_balance", 0.0) == 0.0:
+            connector = self.connectors[self.config.connector]
+            initial_sol = connector.get_available_balance("SOL")
+            if initial_sol > 0:
+                self._tracking_data["initial_sol_balance"] = float(initial_sol)
+                self._save_tracking_data()
+                self.logger().info(f"Initialized SOL balance tracking: {initial_sol:.4f} SOL")
 
     def _save_tracking_data(self):
         """Save P&L tracking data to JSON file"""
