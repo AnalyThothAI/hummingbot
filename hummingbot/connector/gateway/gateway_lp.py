@@ -93,19 +93,13 @@ class GatewayLp(GatewaySwap):
         Helper to trigger LP-specific events when an order completes.
         This is called by both fast monitoring and slow polling to avoid duplication.
         """
-        self.logger().info(f"DEBUG _trigger_lp_events_if_needed called for order_id={order_id}, tx={transaction_hash}")
-
         # Check if already triggered (metadata would be deleted)
         if order_id not in self._lp_orders_metadata:
-            self.logger().info(f"DEBUG order_id {order_id} not in metadata (already triggered or not LP order)")
             return
 
         tracked_order = self._order_tracker.fetch_order(order_id)
         if not tracked_order or tracked_order.trade_type != TradeType.RANGE:
-            self.logger().info(f"DEBUG order {order_id} not tracked or not RANGE type")
             return
-
-        self.logger().info(f"DEBUG order {order_id} state: done={tracked_order.is_done}, failed={tracked_order.is_failure}, cancelled={tracked_order.is_cancelled}")
 
         metadata = self._lp_orders_metadata[order_id]
 
@@ -115,7 +109,6 @@ class GatewayLp(GatewaySwap):
 
         if is_successful:
             # Transaction successful - trigger LP-specific events
-            self.logger().info(f"DEBUG order {order_id} is successful, operation={metadata['operation']}")
             if metadata["operation"] == "add":
                 self._trigger_add_liquidity_event(
                     order_id=order_id,
@@ -165,10 +158,6 @@ class GatewayLp(GatewaySwap):
         """
         Override to trigger RangePosition events after LP transactions complete (batch polling).
         """
-        range_orders = [o for o in tracked_orders if o.trade_type == TradeType.RANGE]
-        if range_orders:
-            self.logger().info(f"DEBUG update_order_status: processing {len(range_orders)} RANGE orders")
-
         # Call parent implementation
         await super().update_order_status(tracked_orders)
 
@@ -178,7 +167,6 @@ class GatewayLp(GatewaySwap):
                 # Get transaction hash
                 try:
                     tx_hash = await tracked_order.get_exchange_order_id()
-                    self.logger().info(f"DEBUG Checking LP event trigger for order {tracked_order.client_order_id}, tx={tx_hash}")
                     self._trigger_lp_events_if_needed(tracked_order.client_order_id, tx_hash)
                 except Exception as e:
                     self.logger().warning(f"Error triggering LP event for {tracked_order.client_order_id}: {e}", exc_info=True)
