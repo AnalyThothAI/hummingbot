@@ -24,10 +24,10 @@ PARAMETERS
 - position_width_pct: TOTAL position width as percentage of mid price (e.g. 2.0 = ±1%)
 - rebalance_seconds: Seconds price must stay out-of-bounds before rebalancing
 - lower_price_limit: (Optional) Never provide liquidity below this price
-  * When price < lower_price_limit: Close position and hold tokens
+  * When price < lower_price_limit: Skip rebalance, keep current position
   * When price > lower_price_limit: Position's lower bound won't go below this limit
 - upper_price_limit: (Optional) Never provide liquidity above this price
-  * When price > upper_price_limit: Close position and hold tokens
+  * When price > upper_price_limit: Skip rebalance, keep current position
   * When price < upper_price_limit: Position's upper bound won't go above this limit
 - strategy_type: (Optional) Meteora-specific strategy type (0=Spot, 1=Curve, None=use default)
 
@@ -305,6 +305,12 @@ class LpPositionManager(ScriptStrategyBase):
 
     def _validate_price_limits(self):
         """Validate price limits configuration"""
+        # Normalize 0 to None (treat 0 as "no limit")
+        if self.config.lower_price_limit is not None and self.config.lower_price_limit == 0:
+            self.config.lower_price_limit = None
+        if self.config.upper_price_limit is not None and self.config.upper_price_limit == 0:
+            self.config.upper_price_limit = None
+
         if self.config.lower_price_limit and self.config.upper_price_limit:
             if self.config.lower_price_limit >= self.config.upper_price_limit:
                 raise ValueError(
@@ -492,12 +498,12 @@ class LpPositionManager(ScriptStrategyBase):
                 # Calculate deviation using helper
                 deviation, direction, bound = self._calculate_price_deviation(current_price, lower_price, upper_price)
 
-                # Add arrow indicator
-                arrow = "↓" if direction == "below" else "↑"
+                # Add arrow indicators (emoji for start, text for direction)
+                arrow = "⬇️" if direction == "below" else "⬆️"
+                text_arrow = "↓" if direction == "below" else "↑"
 
-                msg = (f"⚠️ Position is already out of range! Price {float(current_price):.6f} {arrow} {direction} "
-                       f"bound {float(bound):.6f} by {deviation:.2f}%. Rebalance countdown started "
-                       f"({self.config.rebalance_seconds}s threshold)")
+                msg = (f"{arrow} Out of range: {float(current_price):.6f} {text_arrow} {direction} "
+                       f"{float(bound):.6f} ({deviation:.2f}%). Rebalance in {self.config.rebalance_seconds}s")
 
                 self.logger().warning(msg)
                 self.notify_hb_app_with_timestamp(msg)
@@ -666,13 +672,13 @@ class LpPositionManager(ScriptStrategyBase):
                     deviation, direction, bound = self._calculate_price_deviation(current_price, lower_price, upper_price)
                     self.logger().info(f"Price {current_price:.6f} moved {direction} bound {bound:.6f} by {deviation:.2f}%")
 
-                    # Add arrow indicator
-                    arrow = "↓" if direction == "below" else "↑"
+                    # Add arrow indicators (emoji for start, text for direction)
+                    arrow = "⬇️" if direction == "below" else "⬆️"
+                    text_arrow = "↓" if direction == "below" else "↑"
 
                     # Notify user that position is out of range
-                    msg = (f"⚠️ {self.trading_pair} position out of range on {self.exchange}: "
-                           f"Price {float(current_price):.6f} {arrow} {direction} bound {float(bound):.6f} by {deviation:.2f}%. "
-                           f"Will rebalance after {self.config.rebalance_seconds}s")
+                    msg = (f"{arrow} {self.trading_pair} out of range: {float(current_price):.6f} {text_arrow} "
+                           f"{direction} {float(bound):.6f} ({deviation:.2f}%). Rebalance in {self.config.rebalance_seconds}s")
                     self.notify_hb_app_with_timestamp(msg)
 
                 elapsed_seconds = current_time - self.out_of_bounds_since
@@ -682,19 +688,14 @@ class LpPositionManager(ScriptStrategyBase):
 
                     # Check if price is within limits before rebalancing
                     if not self._is_price_within_limits(current_price):
-                        # Price outside limits - close position and hold
+                        # Price outside limits - skip rebalance, keep position open
                         limit_msg = ""
                         if self.config.lower_price_limit and current_price < self.config.lower_price_limit:
-                            limit_msg = f"below lower price limit {float(self.config.lower_price_limit):.6f}"
+                            limit_msg = f"below lower limit {float(self.config.lower_price_limit):.6f}"
                         elif self.config.upper_price_limit and current_price > self.config.upper_price_limit:
-                            limit_msg = f"above upper price limit {float(self.config.upper_price_limit):.6f}"
+                            limit_msg = f"above upper limit {float(self.config.upper_price_limit):.6f}"
 
-                        self.logger().info(f"Price {limit_msg}, closing position without rebalancing")
-                        msg = f"⛔ Price {limit_msg} - closing position and holding tokens"
-                        self.notify_hb_app_with_timestamp(msg)
-
-                        # Close position without opening a new one
-                        await self.close_position_only()
+                        self.logger().info(f"Price {limit_msg}, skipping rebalance")
                     else:
                         # Normal rebalance
                         await self.rebalance_position(current_price, lower_price, upper_price)
@@ -715,13 +716,12 @@ class LpPositionManager(ScriptStrategyBase):
             # Calculate deviation using helper
             deviation, direction, _ = self._calculate_price_deviation(current_price, old_lower, old_upper)
 
-            # Add arrow indicator
-            arrow = "↓" if direction == "below" else "↑"
+            # Add arrow indicators
+            text_arrow = "↓" if direction == "below" else "↑"
 
-            # Notify user about rebalance trigger
-            msg = (f"🔄 Rebalancing {self.trading_pair} position on {self.exchange}: "
-                   f"Price {float(current_price):.6f} {arrow} {direction} range "
-                   f"[{float(old_lower):.6f}-{float(old_upper):.6f}] by {deviation:.2f}%")
+            # Notify user about closing position
+            msg = (f"❌ Closing {self.trading_pair}: {float(current_price):.6f} {text_arrow} {direction} "
+                   f"[{float(old_lower):.6f}-{float(old_upper):.6f}] ({deviation:.2f}%)")
             self.notify_hb_app_with_timestamp(msg)
 
             # Store amounts being removed from position (including fees)
@@ -902,6 +902,11 @@ class LpPositionManager(ScriptStrategyBase):
                 "base_amount": base_amt,
                 "quote_amount": quote_amt
             }
+
+            # Notify user about opening new position
+            token_amt = f"{base_amt:.4f} {self.base_token}" if side == "base" else f"{quote_amt:.4f} {self.quote_token}"
+            msg = f"🟢 Opening {self.trading_pair}: {token_amt} @ [{lower_price:.6f}-{upper_price:.6f}]"
+            self.notify_hb_app_with_timestamp(msg)
 
             # Build connector-specific parameters
             extra_params = self._build_extra_params()
@@ -1091,11 +1096,11 @@ class LpPositionManager(ScriptStrategyBase):
             if self._opening_position_amounts:
                 base_amt = self._opening_position_amounts["base_amount"]
                 quote_amt = self._opening_position_amounts["quote_amount"]
-                msg = (f"✓ Position opened on {self.exchange}: "
+                msg = (f"✅ Opened {self.trading_pair}: "
                        f"Added {base_amt:.6f} {self.base_token} + {quote_amt:.6f} {self.quote_token}")
                 self._opening_position_amounts = None  # Clear after use
             else:
-                msg = f"✓ Position opened on {self.exchange}"
+                msg = f"✅ Opened {self.trading_pair}"
 
             self.notify_hb_app_with_timestamp(msg)
 
@@ -1119,10 +1124,10 @@ class LpPositionManager(ScriptStrategyBase):
             if self._closed_position_balances:
                 total_base = self._closed_position_balances["total_base_removed"]
                 total_quote = self._closed_position_balances["total_quote_removed"]
-                msg = (f"✓ Position closed on {self.exchange}: "
+                msg = (f"✅ Closed {self.trading_pair}: "
                        f"Removed {total_base:.6f} {self.base_token} + {total_quote:.6f} {self.quote_token}")
             else:
-                msg = f"✓ Position closed on {self.exchange}"
+                msg = f"✅ Closed {self.trading_pair}"
 
             self.notify_hb_app_with_timestamp(msg)
 
@@ -1150,11 +1155,11 @@ class LpPositionManager(ScriptStrategyBase):
         position_pnl = avg_close_value - avg_open_value if closes else 0
         position_roi_pct = (position_pnl / avg_open_value * 100) if avg_open_value > 0 else 0
 
-        # Get current position duration if open
-        current_position_duration = None
+        # Get current position open timestamp if open
+        current_position_open_time = None
         if self.current_position_id and opens:
             last_open = max((p for p in opens), key=lambda x: x["timestamp"])
-            current_position_duration = int(time.time() - last_open["timestamp"])
+            current_position_open_time = last_open["timestamp"]
 
         # SOL balance change
         connector = self.connectors[self.config.connector]
@@ -1171,7 +1176,7 @@ class LpPositionManager(ScriptStrategyBase):
             "avg_close_price": avg_close_price,
             "position_pnl": position_pnl,
             "position_roi_pct": position_roi_pct,
-            "current_position_duration": current_position_duration,
+            "current_position_open_time": current_position_open_time,
             "initial_sol": initial_sol,
             "current_sol": current_sol,
             "sol_change": sol_change
@@ -1268,6 +1273,66 @@ class LpPositionManager(ScriptStrategyBase):
 
         return '\n'.join(viz_lines)
 
+    def _create_distribution_visualization(self, is_base_only: bool) -> Optional[str]:
+        """
+        Create distribution visualization for Meteora strategy types.
+        Only shows for Meteora connector with strategy_type defined.
+
+        Args:
+            is_base_only: True if base-only position (range above price), False if quote-only (range below price)
+
+        Returns:
+            Distribution visualization string or None if not applicable
+        """
+        # Only show for Meteora with strategy_type defined
+        if "meteora" not in self.config.connector.lower() or self.config.strategy_type is None:
+            return None
+
+        bar_width = 50
+        blocks = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']  # 8 levels
+
+        strategy_type = self.config.strategy_type
+
+        if strategy_type == 0:
+            # Spot: flat distribution
+            distribution = '█' * bar_width
+            label = "Spot"
+        elif strategy_type == 1:
+            # Curve: peak near current price
+            if is_base_only:
+                # Range above price, peak at left (near price)
+                distribution = self._create_gradient(bar_width, blocks, descending=True)
+            else:
+                # Range below price, peak at right (near price)
+                distribution = self._create_gradient(bar_width, blocks, descending=False)
+            label = "Curve"
+        elif strategy_type == 2:
+            # Bid-Ask: peak far from current price
+            if is_base_only:
+                # Range above price, peak at right (far from price)
+                distribution = self._create_gradient(bar_width, blocks, descending=False)
+            else:
+                # Range below price, peak at left (far from price)
+                distribution = self._create_gradient(bar_width, blocks, descending=True)
+            label = "Bid-Ask"
+        else:
+            return None
+
+        return f"Distribution: {label}\n{distribution}"
+
+    @staticmethod
+    def _create_gradient(width: int, blocks: list, descending: bool) -> str:
+        """Create a gradient bar using block characters."""
+        result = []
+        for i in range(width):
+            # Map position to block index (0-7)
+            if descending:
+                block_idx = int((1 - i / width) * (len(blocks) - 1))
+            else:
+                block_idx = int((i / width) * (len(blocks) - 1))
+            result.append(blocks[block_idx])
+        return ''.join(result)
+
     def format_status(self) -> str:
         """Format status message for display"""
         lines = []
@@ -1330,13 +1395,22 @@ class LpPositionManager(ScriptStrategyBase):
             if self.pool_info:
                 current_price = Decimal(str(self.pool_info.price))
 
+                # Distribution visualization (Meteora only, only for positions created by script)
+                if self.has_rebalanced_once:
+                    is_base_only = base_amount > 0 and quote_amount == 0
+                    dist_viz = self._create_distribution_visualization(is_base_only)
+                    if dist_viz:
+                        lines.append(dist_viz)
+
                 # Price range visualization
+                lines.append("Position Range:")
                 lines.append(self._create_price_range_visualization(lower_price, current_price, upper_price))
 
                 if self._price_in_bounds(current_price, lower_price, upper_price):
                     lines.append("Status: ✅ In Bounds")
                 else:
-                    lines.append("Status: ⚠️ Out of Bounds")
+                    arrow = "⬇️" if current_price < lower_price else "⬆️"
+                    lines.append(f"Status: {arrow} Out of Bounds")
 
                 # Add price limits visualization
                 limits_viz = self._create_price_limits_visualization(current_price)
@@ -1384,11 +1458,14 @@ class LpPositionManager(ScriptStrategyBase):
                 pnl_sign = "+" if pnl_summary["position_pnl"] >= 0 else ""
                 lines.append(f"  Position P&L: {pnl_sign}{pnl_summary['position_pnl']:.6f} {self.quote_token} ({pnl_sign}{pnl_summary['position_roi_pct']:.2f}%)")
 
-            if pnl_summary["current_position_duration"] is not None:
-                duration_m = pnl_summary["current_position_duration"] // 60
-                duration_s = pnl_summary["current_position_duration"] % 60
+            if pnl_summary["current_position_open_time"] is not None:
+                from datetime import datetime
+                open_dt = datetime.fromtimestamp(pnl_summary["current_position_open_time"])
+                elapsed = int(time.time() - pnl_summary["current_position_open_time"])
+                elapsed_m = elapsed // 60
+                elapsed_s = elapsed % 60
                 lines.append("")
-                lines.append(f"  Current: OPEN since {duration_m}m {duration_s}s")
+                lines.append(f"  Current: OPEN since {open_dt.strftime('%Y-%m-%d %H:%M:%S')} ({elapsed_m}m {elapsed_s}s)")
 
             lines.append("")
             lines.append("Wallet SOL:")
