@@ -1204,6 +1204,19 @@ class LpPositionManager(StrategyV2Base):
         total_position_rent = sum(u.position_rent or 0 for u in opens)
         total_position_rent_refunded = sum(u.position_rent_refunded or 0 for u in closes)
 
+        # Calculate total transaction fees (SOL fees from trade_fee JSON)
+        total_tx_fees = 0.0
+        for u in updates:
+            if u.trade_fee:
+                try:
+                    fee_data = u.trade_fee if isinstance(u.trade_fee, dict) else {}
+                    flat_fees = fee_data.get("flat_fees", [])
+                    for fee in flat_fees:
+                        if fee.get("token") == "SOL":
+                            total_tx_fees += float(fee.get("amount", 0))
+                except (TypeError, ValueError):
+                    pass
+
         # Calculate current position value (only if script created the initial position)
         # If first record is "ADD", script created initial position - include current position value
         # If first record is "REMOVE", script inherited existing position - don't include current position value
@@ -1273,9 +1286,10 @@ class LpPositionManager(StrategyV2Base):
             "position_pnl": position_pnl,
             "position_roi_pct": position_roi_pct,
             "current_position_open_time": current_position_open_time,
-            # Rent tracking
+            # Rent and tx fee tracking
             "total_position_rent": total_position_rent,
             "total_position_rent_refunded": total_position_rent_refunded,
+            "total_tx_fees": total_tx_fees,
             # SOL tracking
             "initial_sol": initial_sol,
             "current_sol": current_sol,
@@ -1602,10 +1616,12 @@ class LpPositionManager(StrategyV2Base):
             pnl_sign = "+" if pnl_summary["position_pnl"] >= 0 else ""
             lines.append(f"  P&L: {pnl_sign}{pnl_summary['position_pnl']:.6f} {quote} ({pnl_sign}{pnl_summary['position_roi_pct']:.2f}%)")
 
-            # Show net rent (paid - refunded)
+            # Show net rent and tx fees
             net_rent = pnl_summary["total_position_rent"] - pnl_summary["total_position_rent_refunded"]
             if net_rent != 0:
                 lines.append(f"  Net Rent Paid: {net_rent:.6f} SOL")
+            if pnl_summary["total_tx_fees"] > 0:
+                lines.append(f"  Tx Fees Paid: {pnl_summary['total_tx_fees']:.6f} SOL")
         else:
             lines.append(f"  Positions Opened: {pnl_summary['opens_count']}")
             lines.append(f"  Positions Closed: {pnl_summary['closes_count']}")
