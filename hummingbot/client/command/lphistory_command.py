@@ -270,7 +270,12 @@ class LPHistoryCommand:
         lines.append(f"\n{connector_name} / {trading_pair}")
         lines.append(f"Network: {network}")
 
-        # Positions table - grouped by side (buy=quote only, sell=base only, both=double-sided)
+        # Count open and closed positions
+        open_position_count = len([addr for addr, pos in positions.items() if "ADD" in pos and "REMOVE" not in pos])
+        closed_position_count = len(closed_positions)
+        lines.append(f"Positions Opened: {open_position_count + closed_position_count}  |  Positions Closed: {closed_position_count}")
+
+        # Closed Positions table - grouped by side (buy=quote only, sell=base only, both=double-sided)
         # Determine side based on ADD amounts: base only=sell, quote only=buy, both=both
         buy_positions = [(o, c) for o, c in zip(opens, closes) if o.base_amount == 0 or o.base_amount is None]
         sell_positions = [(o, c) for o, c in zip(opens, closes) if o.quote_amount == 0 or o.quote_amount is None]
@@ -290,7 +295,7 @@ class LPHistoryCommand:
              smart_round(sum(Decimal(str(o.quote_amount or 0)) + Decimal(str(c.quote_amount or 0)) for o, c in both_positions), precision)],
         ]
         pos_df = pd.DataFrame(data=pos_data, columns=pos_columns)
-        lines.extend(["", "  Positions:"] + ["    " + line for line in pos_df.to_string(index=False).split("\n")])
+        lines.extend(["", "  Closed Positions:"] + ["    " + line for line in pos_df.to_string(index=False).split("\n")])
 
         # Assets table
         assets_columns = ["", "add", "remove", "fees"]
@@ -327,7 +332,6 @@ class LPHistoryCommand:
         lines.extend(["", "  Performance:"] +
                      ["    " + line for line in perf_df.to_string(index=False, header=False).split("\n")])
 
-        # Note about open positions (those with ADD but no REMOVE)
-        open_positions = len([addr for addr, pos in positions.items() if "ADD" in pos and "REMOVE" not in pos])
-        if open_positions > 0:
-            lines.append(f"\n  Note: {open_positions} position(s) still open. P&L excludes unrealized gains/losses.")
+        # Note about open positions
+        if open_position_count > 0:
+            lines.append(f"\n  Note: {open_position_count} position(s) still open. P&L excludes unrealized gains/losses.")
