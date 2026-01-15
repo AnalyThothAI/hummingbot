@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from hummingbot.connector.gateway.common_types import ConnectorType, get_connector_type
 from hummingbot.connector.gateway.gateway_in_flight_order import GatewayInFlightOrder
 from hummingbot.connector.gateway.gateway_swap import GatewaySwap
-from hummingbot.core.data_type.common import LPType, TradeType
+from hummingbot.core.data_type.common import LPType, OrderType, TradeType
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.event.events import (
     MarketEvent,
@@ -125,6 +125,11 @@ class GatewayLp(GatewaySwap):
                         trade_type=tracked_order.trade_type,
                         flat_fees=[TokenAmount(amount=tracked_order.gas_price, token=self._native_currency)]
                     ),
+                    # P&L tracking fields from gateway response
+                    position_address=metadata.get("position_address", ""),
+                    base_amount=metadata.get("base_amount", Decimal("0")),
+                    quote_amount=metadata.get("quote_amount", Decimal("0")),
+                    rent_paid=metadata.get("rent_paid", Decimal("0")),
                 )
             elif metadata["operation"] == "remove":
                 self._trigger_remove_liquidity_event(
@@ -138,6 +143,13 @@ class GatewayLp(GatewaySwap):
                         trade_type=tracked_order.trade_type,
                         flat_fees=[TokenAmount(amount=tracked_order.gas_price, token=self._native_currency)]
                     ),
+                    # P&L tracking fields from gateway response
+                    position_address=metadata.get("position_address", ""),
+                    base_amount=metadata.get("base_amount", Decimal("0")),
+                    quote_amount=metadata.get("quote_amount", Decimal("0")),
+                    base_fee=metadata.get("base_fee", Decimal("0")),
+                    quote_fee=metadata.get("quote_fee", Decimal("0")),
+                    rent_paid=metadata.get("rent_paid", Decimal("0")),
                 )
         elif tracked_order.is_failure:
             # Transaction failed - trigger LP-specific failure event for strategy handling
@@ -230,6 +242,11 @@ class GatewayLp(GatewaySwap):
         fee_tier: str,
         creation_timestamp: float,
         trade_fee: TradeFeeBase,
+        position_address: str = "",
+        base_amount: Decimal = Decimal("0"),
+        quote_amount: Decimal = Decimal("0"),
+        mid_price: Decimal = Decimal("0"),
+        rent_paid: Decimal = Decimal("0"),
     ):
         """Trigger RangePositionLiquidityAddedEvent"""
         event = RangePositionLiquidityAddedEvent(
@@ -244,6 +261,12 @@ class GatewayLp(GatewaySwap):
             creation_timestamp=creation_timestamp,
             trade_fee=trade_fee,
             token_id=0,
+            # P&L tracking fields
+            position_address=position_address,
+            mid_price=mid_price,
+            base_amount=base_amount,
+            quote_amount=quote_amount,
+            rent_paid=rent_paid,
         )
         self.trigger_event(MarketEvent.RangePositionLiquidityAdded, event)
         self.logger().info(f"Triggered RangePositionLiquidityAddedEvent for order {order_id}")
@@ -256,6 +279,15 @@ class GatewayLp(GatewaySwap):
         token_id: str,
         creation_timestamp: float,
         trade_fee: TradeFeeBase,
+        position_address: str = "",
+        lower_price: Decimal = Decimal("0"),
+        upper_price: Decimal = Decimal("0"),
+        mid_price: Decimal = Decimal("0"),
+        base_amount: Decimal = Decimal("0"),
+        quote_amount: Decimal = Decimal("0"),
+        base_fee: Decimal = Decimal("0"),
+        quote_fee: Decimal = Decimal("0"),
+        rent_paid: Decimal = Decimal("0"),
     ):
         """Trigger RangePositionLiquidityRemovedEvent"""
         event = RangePositionLiquidityRemovedEvent(
@@ -266,6 +298,16 @@ class GatewayLp(GatewaySwap):
             token_id=token_id,
             trade_fee=trade_fee,
             creation_timestamp=creation_timestamp,
+            # P&L tracking fields
+            position_address=position_address,
+            lower_price=lower_price,
+            upper_price=upper_price,
+            mid_price=mid_price,
+            base_amount=base_amount,
+            quote_amount=quote_amount,
+            base_fee=base_fee,
+            quote_fee=quote_fee,
+            rent_paid=rent_paid,
         )
         self.trigger_event(MarketEvent.RangePositionLiquidityRemoved, event)
         self.logger().info(f"Triggered RangePositionLiquidityRemovedEvent for order {order_id}")
@@ -497,7 +539,8 @@ class GatewayLp(GatewaySwap):
                                   trading_pair=trading_pair,
                                   trade_type=trade_type,
                                   price=Decimal(str(price)),
-                                  amount=Decimal(str(total_amount_in_base)))
+                                  amount=Decimal(str(total_amount_in_base)),
+                                  order_type=OrderType.AMM_ADD)
 
         # Determine position price range
         # Priority: explicit prices > width percentages
@@ -519,7 +562,7 @@ class GatewayLp(GatewaySwap):
             if not pool_address:
                 raise ValueError(f"Could not find pool for {trading_pair}")
 
-        # Store metadata for event triggering
+        # Store metadata for event triggering (will be enriched with response data)
         self._lp_orders_metadata[order_id] = {
             "operation": "add",
             "lower_price": Decimal(str(lower_price)),
@@ -545,6 +588,16 @@ class GatewayLp(GatewaySwap):
             transaction_hash: Optional[str] = transaction_result.get("signature")
             if transaction_hash is not None and transaction_hash != "":
                 self.update_order_from_hash(order_id, trading_pair, transaction_hash, transaction_result)
+                # Store response data in metadata for P&L tracking
+                # Gateway returns positive values for token amounts
+                data = transaction_result.get("data", {})
+                self._lp_orders_metadata[order_id].update({
+                    "position_address": data.get("positionAddress", ""),
+                    "base_amount": Decimal(str(data.get("baseTokenAmountAdded", 0))),
+                    "quote_amount": Decimal(str(data.get("quoteTokenAmountAdded", 0))),
+                    # Position rent paid (positive = we paid)
+                    "rent_paid": Decimal(str(data.get("positionRent", 0))),
+                })
                 return transaction_hash
             else:
                 raise ValueError("No transaction hash returned from gateway")
@@ -594,7 +647,8 @@ class GatewayLp(GatewaySwap):
                                   trading_pair=trading_pair,
                                   trade_type=trade_type,
                                   price=Decimal(str(price)),
-                                  amount=Decimal(str(total_amount_in_base)))
+                                  amount=Decimal(str(total_amount_in_base)),
+                                  order_type=OrderType.AMM_ADD)
 
         # Get pool address for the trading pair
         pool_address = await self.get_pool_address(trading_pair)
@@ -686,9 +740,10 @@ class GatewayLp(GatewaySwap):
         # Start tracking order
         self.start_tracking_order(order_id=order_id,
                                   trading_pair=trading_pair,
-                                  trade_type=trade_type)
+                                  trade_type=trade_type,
+                                  order_type=OrderType.AMM_REMOVE)
 
-        # Store metadata for event triggering
+        # Store metadata for event triggering (will be enriched with response data)
         self._lp_orders_metadata[order_id] = {
             "operation": "remove",
             "position_address": position_address,
@@ -705,6 +760,17 @@ class GatewayLp(GatewaySwap):
             transaction_hash: Optional[str] = transaction_result.get("signature")
             if transaction_hash is not None and transaction_hash != "":
                 self.update_order_from_hash(order_id, trading_pair, transaction_hash, transaction_result)
+                # Store response data in metadata for P&L tracking
+                # Gateway returns positive values for token amounts
+                data = transaction_result.get("data", {})
+                self._lp_orders_metadata[order_id].update({
+                    "base_amount": Decimal(str(data.get("baseTokenAmountRemoved", 0))),
+                    "quote_amount": Decimal(str(data.get("quoteTokenAmountRemoved", 0))),
+                    "base_fee": Decimal(str(data.get("baseFeeAmountCollected", 0))),
+                    "quote_fee": Decimal(str(data.get("quoteFeeAmountCollected", 0))),
+                    # Position rent refunded (negative = we got refund)
+                    "rent_paid": -Decimal(str(data.get("positionRentRefunded", 0))),
+                })
                 return transaction_hash
             else:
                 raise ValueError("No transaction hash returned from gateway")
@@ -739,9 +805,10 @@ class GatewayLp(GatewaySwap):
         # Start tracking order
         self.start_tracking_order(order_id=order_id,
                                   trading_pair=trading_pair,
-                                  trade_type=trade_type)
+                                  trade_type=trade_type,
+                                  order_type=OrderType.AMM_REMOVE)
 
-        # Store metadata for event triggering
+        # Store metadata for event triggering (will be enriched with response data)
         self._lp_orders_metadata[order_id] = {
             "operation": "remove",
             "position_address": position_address,
@@ -759,6 +826,17 @@ class GatewayLp(GatewaySwap):
             transaction_hash: Optional[str] = transaction_result.get("signature")
             if transaction_hash is not None and transaction_hash != "":
                 self.update_order_from_hash(order_id, trading_pair, transaction_hash, transaction_result)
+                # Store response data in metadata for P&L tracking
+                # Gateway returns positive values for token amounts
+                data = transaction_result.get("data", {})
+                self._lp_orders_metadata[order_id].update({
+                    "base_amount": Decimal(str(data.get("baseTokenAmountRemoved", 0))),
+                    "quote_amount": Decimal(str(data.get("quoteTokenAmountRemoved", 0))),
+                    "base_fee": Decimal(str(data.get("baseFeeAmountCollected", 0))),
+                    "quote_fee": Decimal(str(data.get("quoteFeeAmountCollected", 0))),
+                    # Position rent refunded (negative = we got refund)
+                    "rent_paid": -Decimal(str(data.get("positionRentRefunded", 0))),
+                })
                 return transaction_hash
             else:
                 raise ValueError("No transaction hash returned from gateway")
@@ -796,7 +874,8 @@ class GatewayLp(GatewaySwap):
         # Start tracking order
         self.start_tracking_order(order_id=order_id,
                                   trading_pair=trading_pair,
-                                  trade_type=trade_type)
+                                  trade_type=trade_type,
+                                  order_type=OrderType.AMM_REMOVE)
 
         try:
             transaction_result = await self._get_gateway_instance().amm_remove_liquidity(

@@ -260,6 +260,12 @@ class RangePositionLiquidityAddedEvent:
     creation_timestamp: float
     trade_fee: TradeFeeBase
     token_id: Optional[int] = 0
+    # P&L tracking fields
+    position_address: Optional[str] = ""
+    mid_price: Optional[Decimal] = s_decimal_0
+    base_amount: Optional[Decimal] = s_decimal_0
+    quote_amount: Optional[Decimal] = s_decimal_0
+    rent_paid: Optional[Decimal] = s_decimal_0  # Positive = paid, negative = refunded
 
 
 @dataclass
@@ -271,6 +277,16 @@ class RangePositionLiquidityRemovedEvent:
     token_id: str
     trade_fee: TradeFeeBase
     creation_timestamp: float
+    # P&L tracking fields
+    position_address: Optional[str] = ""
+    lower_price: Optional[Decimal] = s_decimal_0
+    upper_price: Optional[Decimal] = s_decimal_0
+    mid_price: Optional[Decimal] = s_decimal_0
+    base_amount: Optional[Decimal] = s_decimal_0
+    quote_amount: Optional[Decimal] = s_decimal_0
+    base_fee: Optional[Decimal] = s_decimal_0
+    quote_fee: Optional[Decimal] = s_decimal_0
+    rent_paid: Optional[Decimal] = s_decimal_0  # Positive = paid, negative = refunded
 
 
 @dataclass
@@ -286,6 +302,13 @@ class RangePositionUpdateEvent:
     amount: Optional[Decimal] = s_decimal_0
     creation_timestamp: float = 0
     token_id: Optional[int] = 0
+    # P&L tracking fields
+    position_address: Optional[str] = ""
+    mid_price: Optional[Decimal] = s_decimal_0
+    base_amount: Optional[Decimal] = s_decimal_0
+    quote_amount: Optional[Decimal] = s_decimal_0
+    base_fee: Optional[Decimal] = s_decimal_0
+    quote_fee: Optional[Decimal] = s_decimal_0
 
 
 @dataclass

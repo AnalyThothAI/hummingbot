@@ -46,16 +46,17 @@ NOTES
 """
 
 import asyncio
-import json
 import logging
 import os
 import time
 from decimal import Decimal
-from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from pydantic import Field
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+from hummingbot import data_path
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.gateway.common_types import ConnectorType, get_connector_type
 from hummingbot.connector.gateway.gateway_lp import CLMMPoolInfo, CLMMPositionInfo
@@ -67,6 +68,7 @@ from hummingbot.core.event.events import (
 )
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
+from hummingbot.model.range_position_update import RangePositionUpdate
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 
@@ -161,15 +163,20 @@ class LpPositionManager(StrategyV2Base):
         self._last_position_update_time: float = 0
         self._last_pool_info_fetch_time: float = 0
 
-        # P&L tracking - use config file name if available, otherwise script name
+        # SQLite database access for P&L tracking
+        # Use the strategy-specific database (same as markets_recorder)
         if config.config_file_name:
-            # Remove .yml extension if present
-            tracking_name = config.config_file_name.replace('.yml', '').replace('.yaml', '')
+            db_name = config.config_file_name.replace('.yml', '').replace('.yaml', '')
         else:
-            # Fallback to script name without .py extension
-            tracking_name = config.script_file_name.replace('.py', '')
-        self._tracking_file_path = Path("data") / f"{tracking_name}.json"
-        self._tracking_data: Dict = self._load_tracking_data()
+            db_name = "hummingbot_trades"
+        db_path = os.path.join(data_path(), f"{db_name}.sqlite")
+        self._db_engine = create_engine(f"sqlite:///{db_path}")
+        self._db_session_maker = sessionmaker(bind=self._db_engine)
+        # Ensure RangePositionUpdate table exists (creates if missing)
+        RangePositionUpdate.__table__.create(bind=self._db_engine, checkfirst=True)
+
+        # Track initial SOL balance (for gas cost tracking)
+        self._initial_sol_balance: Optional[float] = None
 
         # Log initial startup (will log more details after resolving trading pair)
         self.log_with_clock(logging.INFO,
@@ -290,33 +297,32 @@ class LpPositionManager(StrategyV2Base):
         else:
             self.logger().info("No existing position and no initial amounts provided - monitoring only")
 
-    def _load_tracking_data(self) -> Dict:
-        """Load P&L tracking data from JSON file"""
-        if self._tracking_file_path.exists():
-            try:
-                with open(self._tracking_file_path, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                self.logger().warning(f"Failed to load tracking data: {e}, starting fresh")
+    def _get_position_updates_from_db(self) -> List[RangePositionUpdate]:
+        """Query RangePositionUpdate records from SQLite database for this config file"""
+        config_file = self.config.config_file_name
+        if not config_file:
+            return []
 
-        # Initialize new tracking data (SOL balance will be set later when connector is ready)
-        return {
-            "config_file": self.config.config_file_name,
-            "pool_address": self.pool_address,
-            "connector": self.exchange,
-            "initial_sol_balance": 0.0,
-            "tracking_started": int(time.time()),
-            "positions": []
-        }
+        try:
+            with self._db_session_maker() as session:
+                updates = session.query(RangePositionUpdate).filter(
+                    RangePositionUpdate.config_file_path == config_file
+                ).order_by(RangePositionUpdate.timestamp).all()
+                # Detach from session before returning
+                session.expunge_all()
+                return updates
+        except Exception as e:
+            self.logger().error(f"Error querying position updates from database: {e}")
+            return []
 
+    # TO-DO: Change sol to network's nativeCurrency to support other chains
     def _initialize_sol_balance_if_needed(self):
         """Initialize SOL balance if not already set (called when connector is ready)"""
-        if self._tracking_data.get("initial_sol_balance", 0.0) == 0.0:
+        if self._initial_sol_balance is None:
             connector = self.connectors[self.config.connector]
             initial_sol = connector.get_available_balance("SOL")
             if initial_sol > 0:
-                self._tracking_data["initial_sol_balance"] = float(initial_sol)
-                self._save_tracking_data()
+                self._initial_sol_balance = float(initial_sol)
                 self.logger().info(f"Initialized SOL balance tracking: {initial_sol:.4f} SOL")
 
     def _validate_price_limits(self):
@@ -357,68 +363,6 @@ class LpPositionManager(StrategyV2Base):
             )
 
         return lower_bound, upper_bound
-
-    def _save_tracking_data(self):
-        """Save P&L tracking data to JSON file"""
-        try:
-            self._tracking_file_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._tracking_file_path, 'w') as f:
-                json.dump(self._tracking_data, f, indent=2)
-        except Exception as e:
-            self.logger().error(f"Failed to save tracking data: {e}", exc_info=True)
-
-    def _record_position_event(self, event_type: str, position_info: Optional[CLMMPositionInfo] = None):
-        """Record position open/close event for P&L tracking"""
-        if not position_info and event_type == "open":
-            self.logger().warning("Cannot record open event without position info")
-            return
-
-        if not self.pool_info:
-            self.logger().warning("Cannot record position event without pool info")
-            return
-
-        try:
-            event_data = {
-                "type": event_type,
-                "timestamp": int(time.time()),
-                "position_address": self.current_position_id if self.current_position_id else "unknown",
-                "trading_pair": self.trading_pair,
-                "lower_price": float(position_info.lower_price) if position_info else 0,
-                "upper_price": float(position_info.upper_price) if position_info else 0,
-                "mid_price": float(self.pool_info.price),
-            }
-
-            if event_type == "open" and position_info:
-                base_amount = Decimal(str(position_info.base_token_amount))
-                quote_amount = Decimal(str(position_info.quote_token_amount))
-                price = Decimal(str(self.pool_info.price))
-
-                event_data.update({
-                    "base_amount": float(base_amount),
-                    "quote_amount": float(quote_amount),
-                    "value_in_quote": float(base_amount * price + quote_amount)
-                })
-            elif event_type == "close" and position_info:
-                base_amount = Decimal(str(position_info.base_token_amount))
-                quote_amount = Decimal(str(position_info.quote_token_amount))
-                base_fees = Decimal(str(position_info.base_fee_amount))
-                quote_fees = Decimal(str(position_info.quote_fee_amount))
-                price = Decimal(str(self.pool_info.price))
-
-                event_data.update({
-                    "base_amount": float(base_amount),
-                    "quote_amount": float(quote_amount),
-                    "base_fees": float(base_fees),
-                    "quote_fees": float(quote_fees),
-                    "value_in_quote": float(base_amount * price + quote_amount + base_fees * price + quote_fees)
-                })
-
-            self._tracking_data["positions"].append(event_data)
-            self._save_tracking_data()
-            self.logger().info(f"Recorded {event_type} event for position {event_data['position_address'][:8]}...")
-
-        except Exception as e:
-            self.logger().error(f"Error recording position event: {e}", exc_info=True)
 
     def on_tick(self):
         """Called on each strategy tick"""
@@ -1071,20 +1015,19 @@ class LpPositionManager(StrategyV2Base):
 
         return True
 
-    async def fetch_position_info_after_add(self):
-        """Fetch position info after position is created"""
+    async def fetch_position_info_after_add(self, position_address: str):
+        """Fetch position info using the position address from the add liquidity response"""
         try:
-            await asyncio.sleep(self.POSITION_CREATION_DELAY)  # Wait for position to be created on-chain
-
             connector = self.connectors[self.exchange]
 
-            # Fetch positions for this pool (pool_address is from config)
-            positions = await connector.get_user_positions(pool_address=self.pool_address)
+            # Fetch position info directly using the position address
+            self.position_info = await connector.get_position_info(
+                trading_pair=self.trading_pair,
+                position_address=position_address
+            )
 
-            if positions:
-                # Get the most recent position
-                self.position_info = positions[-1]
-                self.current_position_id = self.position_info.address
+            if self.position_info:
+                self.current_position_id = position_address
                 self.logger().info(f"Position info fetched: {self.current_position_id}")
 
                 # Log actual price range from the created position
@@ -1092,9 +1035,8 @@ class LpPositionManager(StrategyV2Base):
                     f"Actual position price range: {float(self.position_info.lower_price):.6f} - "
                     f"{float(self.position_info.upper_price):.6f}"
                 )
-
-                # Record position open event for P&L tracking
-                self._record_position_event("open", self.position_info)
+            else:
+                self.logger().warning(f"Could not fetch position info for {position_address}")
         except Exception as e:
             self.logger().error(f"Error fetching position info after add: {str(e)}")
 
@@ -1104,8 +1046,12 @@ class LpPositionManager(StrategyV2Base):
         if hasattr(event, 'order_id') and event.order_id == self.pending_open_order_id:
             self.logger().info(f"Position opening order {event.order_id} confirmed!")
 
-            # Fetch the new position info
-            safe_ensure_future(self.fetch_position_info_after_add())
+            # Fetch the new position info using position_address from event
+            position_address = getattr(event, 'position_address', None)
+            if position_address:
+                safe_ensure_future(self.fetch_position_info_after_add(position_address))
+            else:
+                self.logger().warning("No position_address in event, cannot fetch position info")
 
             # Clear pending state
             self.pending_open_order_id = None
@@ -1129,10 +1075,7 @@ class LpPositionManager(StrategyV2Base):
         """Called when liquidity is removed from a position"""
         if hasattr(event, 'order_id') and event.order_id == self.pending_close_order_id:
             self.logger().info(f"Position closing order {event.order_id} confirmed!")
-
-            # Record position close event for P&L tracking (before clearing position_info)
-            if self.position_info:
-                self._record_position_event("close", self.position_info)
+            # P&L tracking: Position events are automatically recorded by markets_recorder
 
             # Clear current position
             self.current_position_id = None
@@ -1228,70 +1171,77 @@ class LpPositionManager(StrategyV2Base):
             self.pending_operation = None
 
     def _calculate_pnl_summary(self) -> Dict:
-        """Calculate P&L summary from position history using current price"""
-        positions = self._tracking_data.get("positions", [])
+        """Calculate P&L summary from SQLite database using current price"""
+        # Query position updates from SQLite database
+        updates = self._get_position_updates_from_db()
 
-        opens = [p for p in positions if p["type"] == "open"]
-        closes = [p for p in positions if p["type"] == "close"]
+        # Separate ADD and REMOVE events
+        opens = [u for u in updates if u.order_action == "ADD"]
+        closes = [u for u in updates if u.order_action == "REMOVE"]
 
         # Get current price for all value calculations
         current_price = float(self.pool_info.price) if self.pool_info else 0
 
         # Calculate totals for opens (using current price for base value)
-        total_open_base = sum(p.get("base_amount", 0) for p in opens)
-        total_open_quote = sum(p.get("quote_amount", 0) for p in opens)
+        total_open_base = sum(u.base_amount or 0 for u in opens)
+        total_open_quote = sum(u.quote_amount or 0 for u in opens)
         total_open_base_value = total_open_base * current_price
         total_open_value = total_open_base_value + total_open_quote
 
         # Calculate totals for closes (using current price for base value)
-        total_close_base = sum(p.get("base_amount", 0) for p in closes)
-        total_close_quote = sum(p.get("quote_amount", 0) for p in closes)
+        total_close_base = sum(u.base_amount or 0 for u in closes)
+        total_close_quote = sum(u.quote_amount or 0 for u in closes)
         total_close_base_value = total_close_base * current_price
         total_close_value = total_close_base_value + total_close_quote
 
         # Calculate total fees collected (using current price for base fees)
-        total_fees_base = sum(p.get("base_fees", 0) for p in closes)
-        total_fees_quote = sum(p.get("quote_fees", 0) for p in closes)
+        total_fees_base = sum(u.base_fee or 0 for u in closes)
+        total_fees_quote = sum(u.quote_fee or 0 for u in closes)
         total_fees_base_value = total_fees_base * current_price
         total_fees_value = total_fees_base_value + total_fees_quote
 
+        # Calculate total rent paid (positive = cost on ADD, negative = refund on REMOVE)
+        # Sum across all updates to get net rent cost
+        total_rent_paid = sum(u.rent_paid or 0 for u in updates)
+
         # Calculate current position value (only if script created the initial position)
-        # If first record is "open", script created initial position - include current position value
-        # If first record is "close", script inherited existing position - don't include current position value
+        # If first record is "ADD", script created initial position - include current position value
+        # If first record is "REMOVE", script inherited existing position - don't include current position value
         current_position_value = Decimal("0")
         current_position_base = Decimal("0")
         current_position_quote = Decimal("0")
         current_position_base_fees = Decimal("0")
         current_position_quote_fees = Decimal("0")
-        first_event_is_open = positions and positions[0].get("type") == "open"
+        first_event_is_open = updates and updates[0].order_action == "ADD"
 
         if first_event_is_open and self.current_position_id and self.position_info and self.pool_info:
-            current_price = Decimal(str(self.pool_info.price))
+            current_price_decimal = Decimal(str(self.pool_info.price))
             current_position_base = Decimal(str(self.position_info.base_token_amount))
             current_position_quote = Decimal(str(self.position_info.quote_token_amount))
             current_position_base_fees = Decimal(str(self.position_info.base_fee_amount))
             current_position_quote_fees = Decimal(str(self.position_info.quote_fee_amount))
             # Total value = tokens + uncollected fees
             current_position_value = (
-                current_position_base * current_price + current_position_quote +
-                current_position_base_fees * current_price + current_position_quote_fees
+                current_position_base * current_price_decimal + current_position_quote +
+                current_position_base_fees * current_price_decimal + current_position_quote_fees
             )
 
         # Calculate P&L: (Closed Value + Fees + Current Position Value) - Total Open Value
+        # Note: Rent is tracked separately and not included in P&L
         total_current_value = total_close_value + total_fees_value + float(current_position_value)
         position_pnl = (total_current_value - total_open_value) if total_open_value > 0 else 0
         position_roi_pct = (position_pnl / total_open_value * 100) if total_open_value > 0 else 0
 
-        # Get current position open timestamp if open
+        # Get current position open timestamp if open (timestamp is in milliseconds)
         current_position_open_time = None
         if self.current_position_id and opens:
-            last_open = max((p for p in opens), key=lambda x: x["timestamp"])
-            current_position_open_time = last_open["timestamp"]
+            last_open = max(opens, key=lambda x: x.timestamp)
+            current_position_open_time = last_open.timestamp / 1000  # Convert ms to seconds
 
         # SOL balance change
         connector = self.connectors[self.config.connector]
         current_sol = float(connector.get_available_balance("SOL"))
-        initial_sol = self._tracking_data.get("initial_sol_balance", current_sol)
+        initial_sol = self._initial_sol_balance if self._initial_sol_balance else current_sol
         sol_change = current_sol - initial_sol
 
         return {
@@ -1323,6 +1273,8 @@ class LpPositionManager(StrategyV2Base):
             "position_pnl": position_pnl,
             "position_roi_pct": position_roi_pct,
             "current_position_open_time": current_position_open_time,
+            # Rent tracking (positive = paid, negative = refunded)
+            "total_rent_paid": total_rent_paid,
             # SOL tracking
             "initial_sol": initial_sol,
             "current_sol": current_sol,
@@ -1648,6 +1600,11 @@ class LpPositionManager(StrategyV2Base):
             lines.append("")
             pnl_sign = "+" if pnl_summary["position_pnl"] >= 0 else ""
             lines.append(f"  P&L: {pnl_sign}{pnl_summary['position_pnl']:.6f} {quote} ({pnl_sign}{pnl_summary['position_roi_pct']:.2f}%)")
+
+            # Show rent paid if non-zero
+            if pnl_summary["total_rent_paid"] != 0:
+                rent_sign = "+" if pnl_summary["total_rent_paid"] >= 0 else ""
+                lines.append(f"  Rent: {rent_sign}{pnl_summary['total_rent_paid']:.6f} SOL")
         else:
             lines.append(f"  Positions Opened: {pnl_summary['opens_count']}")
             lines.append(f"  Positions Closed: {pnl_summary['closes_count']}")

@@ -581,14 +581,39 @@ class MarketsRecorder:
             return
 
         timestamp: int = self.db_timestamp
+        event_type: MarketEvent = self.market_event_tag_map[event_tag]
+
+        # Determine order_action based on event type
+        order_action = None
+        if event_type == MarketEvent.RangePositionLiquidityAdded:
+            order_action = "ADD"
+        elif event_type == MarketEvent.RangePositionLiquidityRemoved:
+            order_action = "REMOVE"
+        elif event_type == MarketEvent.RangePositionFeeCollected:
+            order_action = "COLLECT"
 
         with self._sql_manager.get_new_session() as session:
             with session.begin():
-                rp_update: RangePositionUpdate = RangePositionUpdate(hb_id=evt.order_id,
-                                                                     timestamp=timestamp,
-                                                                     tx_hash=evt.exchange_order_id,
-                                                                     token_id=evt.token_id,
-                                                                     trade_fee=evt.trade_fee.to_json())
+                rp_update: RangePositionUpdate = RangePositionUpdate(
+                    hb_id=evt.order_id,
+                    timestamp=timestamp,
+                    tx_hash=evt.exchange_order_id,
+                    token_id=getattr(evt, 'token_id', 0) or 0,
+                    trade_fee=evt.trade_fee.to_json(),
+                    # P&L tracking fields
+                    config_file_path=self._config_file_path,
+                    order_action=order_action,
+                    trading_pair=getattr(evt, 'trading_pair', None),
+                    position_address=getattr(evt, 'position_address', None),
+                    lower_price=float(getattr(evt, 'lower_price', 0) or 0),
+                    upper_price=float(getattr(evt, 'upper_price', 0) or 0),
+                    mid_price=float(getattr(evt, 'mid_price', 0) or 0),
+                    base_amount=float(getattr(evt, 'base_amount', 0) or 0),
+                    quote_amount=float(getattr(evt, 'quote_amount', 0) or 0),
+                    base_fee=float(getattr(evt, 'base_fee', 0) or 0),
+                    quote_fee=float(getattr(evt, 'quote_fee', 0) or 0),
+                    rent_paid=float(getattr(evt, 'rent_paid', 0) or 0),
+                )
                 session.add(rp_update)
                 self.save_market_states(self._config_file_path, connector, session=session)
 
