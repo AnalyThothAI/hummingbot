@@ -134,10 +134,9 @@ class LPPositionExecutor(ExecutorBase):
                 self.lp_position_state.upper_price = Decimal(str(position_info.upper_price))
         except Exception as e:
             error_msg = str(e).lower()
-            # If position closed/not found and we're in CLOSING state (or retrying close),
-            # the close actually succeeded despite timeout - transition to COMPLETE
+            # Handle position status errors
             if "position closed" in error_msg:
-                # Position was explicitly closed - close succeeded
+                # Position was explicitly closed on-chain - close succeeded
                 self.logger().info(
                     f"Position {self.lp_position_state.position_address} confirmed closed on-chain"
                 )
@@ -145,14 +144,12 @@ class LPPositionExecutor(ExecutorBase):
                 self.lp_position_state.active_close_order = None
                 return
             elif "not found" in error_msg:
-                # Position not found - if we're closing, it succeeded
-                if self.lp_position_state.state == LPPositionStates.CLOSING or self._status == RunnableStatus.SHUTTING_DOWN:
-                    self.logger().info(
-                        f"Position {self.lp_position_state.position_address} no longer exists - close succeeded"
-                    )
-                    self.lp_position_state.state = LPPositionStates.COMPLETE
-                    self.lp_position_state.active_close_order = None
-                    return
+                # Position never existed - this is an error, we should never try to close a non-existent position
+                self.logger().error(
+                    f"Position {self.lp_position_state.position_address} not found - position never existed! "
+                    "This indicates a bug in position tracking."
+                )
+                return
             self.logger().debug(f"Error fetching position info: {e}")
 
     async def _create_position(self):
@@ -212,9 +209,12 @@ class LPPositionExecutor(ExecutorBase):
                 self.lp_position_state.state = LPPositionStates.COMPLETE
                 return
             elif "not found" in error_msg:
-                self.logger().info(
-                    f"Position {self.lp_position_state.position_address} not found - close already succeeded"
+                # Position never existed - this is a bug in position tracking
+                self.logger().error(
+                    f"Position {self.lp_position_state.position_address} not found - position never existed! "
+                    "This indicates a bug in position tracking."
                 )
+                # Still mark as complete to avoid infinite retry loop
                 self.lp_position_state.state = LPPositionStates.COMPLETE
                 return
             # Other errors - proceed with close attempt
