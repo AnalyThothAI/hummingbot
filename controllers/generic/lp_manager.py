@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 
 from pydantic import Field
 
-from hummingbot.core.data_type.common import PriceType
+from hummingbot.core.data_type.common import MarketDict
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy_v2.controllers import ControllerBase, ControllerConfigBase
@@ -25,7 +25,8 @@ class LPControllerConfig(ControllerConfigBase):
 
     # Pool configuration (required)
     connector_name: str = "meteora/clmm"
-    network: str = "mainnet-beta"
+    network: str = "solana-mainnet-beta"  # Format: chain-network (e.g., ethereum-mainnet)
+    trading_pair: str = ""  # e.g., "SOL-USDC"
     pool_address: str = ""  # Required - pool address to manage
 
     # Position parameters
@@ -43,6 +44,10 @@ class LPControllerConfig(ControllerConfigBase):
     # Connector-specific params (optional)
     strategy_type: Optional[int] = Field(default=None, json_schema_extra={"is_updatable": True})
 
+    def update_markets(self, markets: MarketDict) -> MarketDict:
+        """Register the LP connector with trading pair"""
+        return markets.add_or_update(self.connector_name, self.trading_pair)
+
 
 class LPController(ControllerBase):
     """Controller for LP position management with rebalancing logic"""
@@ -58,27 +63,22 @@ class LPController(ControllerBase):
     def __init__(self, config: LPControllerConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.config: LPControllerConfig = config
-        self._resolved = False
 
-        # Resolved from pool once at startup (static)
-        self._trading_pair: Optional[str] = None
-        self._base_token: Optional[str] = None
-        self._quote_token: Optional[str] = None
-        self._base_token_address: Optional[str] = None
-        self._quote_token_address: Optional[str] = None
+        # Parse token symbols from trading pair
+        parts = config.trading_pair.split("-")
+        self._base_token: str = parts[0] if len(parts) >= 2 else ""
+        self._quote_token: str = parts[1] if len(parts) >= 2 else ""
 
         # Rebalance tracking
         self._last_executor_info: Optional[Dict] = None
 
-    def initialize_rate_sources(self):
-        """Initialize rate sources for price feeds (like GridStrike)"""
-        if self._trading_pair:
-            self.market_data_provider.initialize_rate_sources([
-                ConnectorPair(
-                    connector_name=self.config.connector_name,
-                    trading_pair=self._trading_pair
-                )
-            ])
+        # Initialize rate sources
+        self.market_data_provider.initialize_rate_sources([
+            ConnectorPair(
+                connector_name=self.config.connector_name,
+                trading_pair=self.config.trading_pair
+            )
+        ])
 
     def active_executor(self) -> Optional[ExecutorInfo]:
         """Get current active executor (should be 0 or 1)"""
@@ -90,22 +90,18 @@ class LPController(ControllerBase):
         actions = []
         executor = self.active_executor()
 
-        # Manual kill switch
+        # Manual kill switch - close position
         if self.config.manual_kill_switch:
             if executor:
                 actions.append(StopExecutorAction(
                     controller_id=self.config.id,
-                    executor_id=executor.id
+                    executor_id=executor.id,
+                    keep_position=False,  # Close position on stop
                 ))
             return actions
 
-        # No active executor
+        # No active executor - create new position
         if executor is None:
-            # Wait for pool info to be resolved before creating executor
-            if not self._resolved:
-                return actions
-
-            # Create new position (initial or rebalanced)
             actions.append(CreateExecutorAction(
                 controller_id=self.config.id,
                 executor_config=self._create_executor_config()
@@ -150,7 +146,8 @@ class LPController(ControllerBase):
                     )
                     actions.append(StopExecutorAction(
                         controller_id=self.config.id,
-                        executor_id=executor.id
+                        executor_id=executor.id,
+                        keep_position=False,  # Close position to rebalance
                     ))
 
         return actions
@@ -183,58 +180,32 @@ class LPController(ControllerBase):
         if self.config.strategy_type is not None:
             extra_params["strategyType"] = self.config.strategy_type
 
+        # Determine side from amounts: 0=BOTH, 1=BUY (quote only), 2=SELL (base only)
+        if base_amt > 0 and quote_amt > 0:
+            side = 0  # Both-sided
+        elif quote_amt > 0:
+            side = 1  # BUY - quote only, positioned to buy base
+        else:
+            side = 2  # SELL - base only, positioned to sell base
+
         return LPPositionExecutorConfig(
             timestamp=self.market_data_provider.time(),
             connector_name=self.config.connector_name,
             pool_address=self.config.pool_address,
-            trading_pair=self._trading_pair,
+            trading_pair=self.config.trading_pair,
             base_token=self._base_token,
             quote_token=self._quote_token,
-            base_token_address=self._base_token_address,
-            quote_token_address=self._quote_token_address,
             lower_price=lower_price,
             upper_price=upper_price,
             base_amount=base_amt,
             quote_amount=quote_amt,
+            side=side,
             extra_params=extra_params if extra_params else None,
             keep_position=False,
         )
 
-    async def on_start(self):
-        """Initialize controller - resolve pool info once"""
-        await self._resolve_pool_info()
-
-    async def _resolve_pool_info(self):
-        """
-        Resolve pool info once at startup.
-        Stores static values: trading pair, token symbols, token addresses.
-        """
-        connector = self.connectors.get(self.config.connector_name)
-        if connector:
-            try:
-                pool_info = await connector.resolve_trading_pair_from_pool(
-                    self.config.pool_address
-                )
-                if pool_info:
-                    self._trading_pair = pool_info["trading_pair"]
-                    self._base_token = pool_info["base_token"]
-                    self._quote_token = pool_info["quote_token"]
-                    self._base_token_address = pool_info["base_token_address"]
-                    self._quote_token_address = pool_info["quote_token_address"]
-
-                    # Initialize rate sources now that we have trading pair
-                    self.initialize_rate_sources()
-                    self._resolved = True
-                    self.logger().info(
-                        f"Pool resolved: {self._trading_pair} at {self.config.pool_address}"
-                    )
-                else:
-                    self.logger().error(f"Could not resolve pool info for {self.config.pool_address}")
-            except Exception as e:
-                self.logger().error(f"Error resolving pool info: {e}")
-
     async def update_processed_data(self):
-        """Called every tick - no-op since we use executor's custom_info for dynamic data"""
+        """Called every tick - no-op since config provides all needed data"""
         pass
 
     def _calculate_price_bounds(self, base_amt: Decimal, quote_amt: Decimal) -> tuple:
@@ -245,10 +216,8 @@ class LPController(ControllerBase):
         For base-only positions: full width ABOVE price (sell base for quote)
         For quote-only positions: full width BELOW price (buy base with quote)
         """
-        current_price = self.market_data_provider.get_price_by_type(
-            self.config.connector_name, self._trading_pair, PriceType.MidPrice
-        )
-        current_price = Decimal(str(current_price))
+        # Use RateOracle for price since LP connectors don't have get_price_by_type
+        current_price = self.market_data_provider.get_rate(self.config.trading_pair)
         total_width = self.config.position_width_pct / Decimal("100")
 
         if base_amt > 0 and quote_amt > 0:
@@ -292,6 +261,97 @@ class LPController(ControllerBase):
             return False
         return True
 
+    def _create_price_range_visualization(self, lower_price: Decimal, current_price: Decimal,
+                                          upper_price: Decimal) -> List[str]:
+        """Create visual representation of price range with current price marker"""
+        # Calculate position in range (0 to 1)
+        price_range = upper_price - lower_price
+        if price_range <= 0:
+            return []
+        current_position = (current_price - lower_price) / price_range
+
+        # Create 50-character wide bar
+        bar_width = 50
+        current_pos = int(float(current_position) * bar_width)
+
+        # Build price range bar
+        range_bar = ['─'] * bar_width
+        range_bar[0] = '├'
+        range_bar[-1] = '┤'
+
+        # Place marker inside or outside range
+        if current_pos < 0:
+            # Price below range
+            marker_line = '● ' + ''.join(range_bar)
+        elif current_pos >= bar_width:
+            # Price above range
+            marker_line = ''.join(range_bar) + ' ●'
+        else:
+            # Price within range
+            range_bar[current_pos] = '●'
+            marker_line = ''.join(range_bar)
+
+        viz_lines = []
+        viz_lines.append(marker_line)
+        lower_str = f'{float(lower_price):.6f}'
+        upper_str = f'{float(upper_price):.6f}'
+        viz_lines.append(lower_str + ' ' * (bar_width - len(lower_str) - len(upper_str) + 2) + upper_str)
+
+        return viz_lines
+
+    def _create_price_limits_visualization(self, current_price: Decimal) -> List[str]:
+        """Create visualization of price limits with current price"""
+        if not self.config.lower_price_limit and not self.config.upper_price_limit:
+            return []
+
+        lower_limit = self.config.lower_price_limit if self.config.lower_price_limit else Decimal("0")
+        upper_limit = self.config.upper_price_limit if self.config.upper_price_limit else current_price * 2
+
+        # If only one limit is set, create appropriate range
+        if not self.config.lower_price_limit:
+            lower_limit = max(Decimal("0"), upper_limit * Decimal("0.5"))
+        if not self.config.upper_price_limit:
+            upper_limit = lower_limit * Decimal("2")
+
+        # Calculate position
+        price_range = upper_limit - lower_limit
+        if price_range <= 0:
+            return []
+
+        current_position = (current_price - lower_limit) / price_range
+
+        # Create bar
+        bar_width = 50
+        current_pos = int(float(current_position) * bar_width)
+
+        # Build visualization
+        limit_bar = ['─'] * bar_width
+        limit_bar[0] = '['
+        limit_bar[-1] = ']'
+
+        # Place price marker
+        if current_pos < 0:
+            marker_line = '● ' + ''.join(limit_bar)
+            status = "⛔ BELOW LOWER LIMIT"
+        elif current_pos >= bar_width:
+            marker_line = ''.join(limit_bar) + ' ●'
+            status = "⛔ ABOVE UPPER LIMIT"
+        else:
+            limit_bar[current_pos] = '●'
+            marker_line = ''.join(limit_bar)
+            status = "✓ Within Limits"
+
+        viz_lines = []
+        viz_lines.append(marker_line)
+
+        # Build limit labels
+        lower_str = f'{float(lower_limit):.6f}' if self.config.lower_price_limit else 'None'
+        upper_str = f'{float(upper_limit):.6f}' if self.config.upper_price_limit else 'None'
+        viz_lines.append(lower_str + ' ' * (bar_width - len(lower_str) - len(upper_str) + 2) + upper_str)
+        viz_lines.append(f'Status: {status}')
+
+        return viz_lines
+
     def to_format_status(self) -> List[str]:
         """
         Format status for display.
@@ -302,7 +362,7 @@ class LPController(ControllerBase):
 
         # Header
         status.append("+" + "-" * box_width + "+")
-        header = f"| LP Manager: {self._trading_pair or 'Resolving...'} on {self.config.connector_name}"
+        header = f"| LP Manager: {self.config.trading_pair or 'Resolving...'} on {self.config.connector_name}"
         status.append(header + " " * (box_width - len(header) + 1) + "|")
         status.append("+" + "-" * box_width + "+")
 
@@ -316,6 +376,21 @@ class LPController(ControllerBase):
             if self.config.base_amount > 0 or self.config.quote_amount > 0:
                 line = f"| Will create position with: {self.config.base_amount} base / {self.config.quote_amount} quote"
                 status.append(line + " " * (box_width - len(line) + 1) + "|")
+
+            # Show current price if available
+            current_price = self.market_data_provider.get_rate(self.config.trading_pair)
+            if current_price:
+                line = f"| Current Price: {current_price:.6f}"
+                status.append(line + " " * (box_width - len(line) + 1) + "|")
+
+                # Price limits visualization
+                if self.config.lower_price_limit or self.config.upper_price_limit:
+                    status.append("|" + " " * box_width + "|")
+                    line = "| Price Limits:"
+                    status.append(line + " " * (box_width - len(line) + 1) + "|")
+                    for viz_line in self._create_price_limits_visualization(Decimal(str(current_price))):
+                        line = f"| {viz_line}"
+                        status.append(line + " " * (box_width - len(line) + 1) + "|")
         else:
             # Active executor - get data from custom_info
             info = executor.custom_info
@@ -354,15 +429,21 @@ class LPController(ControllerBase):
                 line = f"| Tokens: {base_amount:.6f} {self._base_token} / {quote_amount:.6f} {self._quote_token}"
                 status.append(line + " " * (box_width - len(line) + 1) + "|")
 
-                if base_fee > 0 or quote_fee > 0:
-                    line = f"| Fees: {base_fee:.6f} {self._base_token} / {quote_fee:.6f} {self._quote_token}"
-                    status.append(line + " " * (box_width - len(line) + 1) + "|")
+                line = f"| Fees: {base_fee:.6f} {self._base_token} / {quote_fee:.6f} {self._quote_token}"
+                status.append(line + " " * (box_width - len(line) + 1) + "|")
 
-                # Price info
+                # Position range visualization
                 if lower_price and upper_price:
-                    line = f"| Range: [{lower_price:.6f} - {upper_price:.6f}]"
+                    status.append("|" + " " * box_width + "|")
+                    line = "| Position Range:"
                     status.append(line + " " * (box_width - len(line) + 1) + "|")
-                    line = f"| Current Price: {current_price:.6f}"
+                    for viz_line in self._create_price_range_visualization(
+                        Decimal(str(lower_price)), Decimal(str(current_price)), Decimal(str(upper_price))
+                    ):
+                        line = f"| {viz_line}"
+                        status.append(line + " " * (box_width - len(line) + 1) + "|")
+
+                    line = f"| Price: {current_price:.6f}"
                     status.append(line + " " * (box_width - len(line) + 1) + "|")
 
                 # Rebalance countdown if out of range
@@ -372,15 +453,14 @@ class LPController(ControllerBase):
                     line = f"| Rebalance in: {int(remaining)}s"
                     status.append(line + " " * (box_width - len(line) + 1) + "|")
 
-        # Price limits if configured
-        if self.config.lower_price_limit or self.config.upper_price_limit:
-            limits = []
-            if self.config.lower_price_limit:
-                limits.append(f"lower={self.config.lower_price_limit}")
-            if self.config.upper_price_limit:
-                limits.append(f"upper={self.config.upper_price_limit}")
-            line = f"| Price Limits: {', '.join(limits)}"
-            status.append(line + " " * (box_width - len(line) + 1) + "|")
+                # Price limits visualization
+                if self.config.lower_price_limit or self.config.upper_price_limit:
+                    status.append("|" + " " * box_width + "|")
+                    line = "| Price Limits:"
+                    status.append(line + " " * (box_width - len(line) + 1) + "|")
+                    for viz_line in self._create_price_limits_visualization(Decimal(str(current_price))):
+                        line = f"| {viz_line}"
+                        status.append(line + " " * (box_width - len(line) + 1) + "|")
 
         status.append("+" + "-" * box_width + "+")
         return status

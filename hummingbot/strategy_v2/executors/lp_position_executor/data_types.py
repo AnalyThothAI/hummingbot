@@ -38,11 +38,11 @@ class LPPositionExecutorConfig(ExecutorConfigBase):
     pool_address: str
     trading_pair: str  # Resolved from pool, e.g., "SOL-USDC"
 
-    # Token info (resolved from pool)
-    base_token: str
-    quote_token: str
-    base_token_address: str
-    quote_token_address: str
+    # Token info (from trading pair)
+    base_token: str = ""
+    quote_token: str = ""
+    base_token_address: Optional[str] = None
+    quote_token_address: Optional[str] = None
 
     # Position price bounds (calculated by controller)
     lower_price: Decimal
@@ -51,6 +51,10 @@ class LPPositionExecutorConfig(ExecutorConfigBase):
     # Position amounts
     base_amount: Decimal = Decimal("0")  # Initial base amount
     quote_amount: Decimal = Decimal("0")  # Initial quote amount
+
+    # Position side: 0=BOTH, 1=BUY (quote only), 2=SELL (base only)
+    # Set by controller based on initial amounts
+    side: int = 0
 
     # Connector-specific params
     extra_params: Optional[Dict] = None  # e.g., {"strategyType": 0} for Meteora
@@ -89,26 +93,31 @@ class LPPositionState(BaseModel):
 
     def update_state(self, current_price: Optional[Decimal] = None, current_time: Optional[float] = None):
         """
-        Update state based on orders and price.
+        Update state based on position_address and price.
         Called each control_task cycle.
+
+        Note: We don't use TrackedOrder.is_filled since it's read-only.
+        Instead, we check:
+        - position_address set = position was created
+        - state == COMPLETE (set by event handler) = position was closed
 
         Args:
             current_price: Current market price
             current_time: Current timestamp (for tracking out_of_range_since)
         """
-        # Check order states first (takes priority)
-        if self.active_close_order is not None:
-            if self.active_close_order.is_filled:
-                self.state = LPPositionStates.COMPLETE
-            else:
-                self.state = LPPositionStates.CLOSING
+        # If already complete, stay complete
+        if self.state == LPPositionStates.COMPLETE:
             return
 
-        if self.active_open_order is not None:
-            if not self.active_open_order.is_filled:
-                self.state = LPPositionStates.OPENING
-                return
-            # Open order filled - position exists, check price
+        # If closing order is active but position still exists, we're closing
+        if self.active_close_order is not None:
+            self.state = LPPositionStates.CLOSING
+            return
+
+        # If open order is active but position not yet created, we're opening
+        if self.active_open_order is not None and self.position_address is None:
+            self.state = LPPositionStates.OPENING
+            return
 
         # Position exists - determine state based on price location
         if self.position_address and current_price is not None:

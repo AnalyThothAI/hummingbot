@@ -3,7 +3,6 @@ import logging
 from decimal import Decimal
 from typing import Dict, Optional
 
-from hummingbot.core.data_type.common import PriceType
 from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 from hummingbot.core.event.events import (
     MarketEvent,
@@ -78,8 +77,13 @@ class LPPositionExecutor(ExecutorBase):
 
     async def control_task(self):
         """Main control loop - simple state machine"""
+        current_time = self._strategy.current_timestamp
+
+        # Fetch position info when position exists to get current amounts
+        if self.lp_position_state.position_address:
+            await self._update_position_info()
+
         current_price = self._get_current_price()
-        current_time = self._strategy.current_timestamp  # For tracking out_of_range_since
         self.lp_position_state.update_state(current_price, current_time)
 
         match self.lp_position_state.state:
@@ -97,12 +101,39 @@ class LPPositionExecutor(ExecutorBase):
                 pass
 
             case LPPositionStates.COMPLETE:
-                # Position closed
+                # Position closed - close_type already set by early_stop()
                 self.stop()
 
             case LPPositionStates.RETRIES_EXCEEDED:
                 # Already shutting down from failure handler
                 pass
+
+    async def _update_position_info(self):
+        """Fetch current position info from connector to update amounts and fees"""
+        if not self.lp_position_state.position_address:
+            return
+
+        connector = self.connectors.get(self.config.connector_name)
+        if connector is None:
+            return
+
+        try:
+            position_info = await connector.get_position_info(
+                trading_pair=self.config.trading_pair,
+                position_address=self.lp_position_state.position_address
+            )
+
+            if position_info:
+                # Update amounts and fees from live position data
+                self.lp_position_state.base_amount = Decimal(str(position_info.base_token_amount))
+                self.lp_position_state.quote_amount = Decimal(str(position_info.quote_token_amount))
+                self.lp_position_state.base_fee = Decimal(str(position_info.base_fee_amount))
+                self.lp_position_state.quote_fee = Decimal(str(position_info.quote_fee_amount))
+                # Update price bounds from actual position (may differ slightly from config)
+                self.lp_position_state.lower_price = Decimal(str(position_info.lower_price))
+                self.lp_position_state.upper_price = Decimal(str(position_info.upper_price))
+        except Exception as e:
+            self.logger().debug(f"Error fetching position info: {e}")
 
     async def _create_position(self):
         """
@@ -173,8 +204,6 @@ class LPPositionExecutor(ExecutorBase):
         """
         if self.lp_position_state.active_open_order and \
            event.order_id == self.lp_position_state.active_open_order.order_id:
-            self.lp_position_state.active_open_order.is_filled = True
-
             # Extract position data directly from event
             self.lp_position_state.position_address = event.position_address
             # Track rent paid to create position
@@ -183,6 +212,9 @@ class LPPositionExecutor(ExecutorBase):
             self.lp_position_state.quote_amount = event.quote_amount or Decimal("0")
             self.lp_position_state.lower_price = event.lower_price
             self.lp_position_state.upper_price = event.upper_price
+
+            # Clear active_open_order to indicate opening is complete
+            self.lp_position_state.active_open_order = None
 
             self.logger().info(
                 f"Position created: {event.position_address}, "
@@ -204,7 +236,9 @@ class LPPositionExecutor(ExecutorBase):
         """
         if self.lp_position_state.active_close_order and \
            event.order_id == self.lp_position_state.active_close_order.order_id:
-            self.lp_position_state.active_close_order.is_filled = True
+            # Mark position as closed by clearing position_address
+            # Note: We don't set is_filled - it's a read-only property.
+            self.lp_position_state.state = LPPositionStates.COMPLETE
 
             # Track rent refunded on close
             self.lp_position_state.position_rent_refunded = event.position_rent_refunded or Decimal("0")
@@ -224,7 +258,8 @@ class LPPositionExecutor(ExecutorBase):
                 f"fees: {event.base_fee} base / {event.quote_fee} quote"
             )
 
-            # Clear position address (position no longer exists)
+            # Clear active_close_order and position_address
+            self.lp_position_state.active_close_order = None
             self.lp_position_state.position_address = None
 
             # Reset retry counter on success
@@ -282,20 +317,42 @@ class LPPositionExecutor(ExecutorBase):
             # State stays at current (IN_RANGE/OUT_OF_RANGE), early_stop will retry _close_position()
 
     def early_stop(self, keep_position: bool = False):
-        """Stop executor (like PositionExecutor.early_stop)"""
-        if keep_position or self.config.keep_position:
-            self.close_type = CloseType.POSITION_HOLD
-        else:
-            # Close position before stopping
+        """Stop executor (like GridExecutor.early_stop)"""
+        self._status = RunnableStatus.SHUTTING_DOWN
+        self.close_type = CloseType.POSITION_HOLD if keep_position or self.config.keep_position else CloseType.EARLY_STOP
+
+        # Close position if not keeping it
+        if not keep_position and not self.config.keep_position:
             if self.lp_position_state.state in [LPPositionStates.IN_RANGE, LPPositionStates.OUT_OF_RANGE]:
                 asyncio.create_task(self._close_position())
-            self.close_type = CloseType.EARLY_STOP
-        self._status = RunnableStatus.SHUTTING_DOWN
+
+    @property
+    def filled_amount_quote(self) -> Decimal:
+        """Returns total position value in quote currency (tokens + fees)"""
+        current_price = self._get_current_price()
+        if current_price is None or current_price == Decimal("0"):
+            return Decimal("0")
+
+        # Total value = (base * price + quote) + (base_fee * price + quote_fee)
+        token_value = (
+            self.lp_position_state.base_amount * current_price +
+            self.lp_position_state.quote_amount
+        )
+        fee_value = (
+            self.lp_position_state.base_fee * current_price +
+            self.lp_position_state.quote_fee
+        )
+        return token_value + fee_value
 
     def get_custom_info(self) -> Dict:
         """Report state to controller"""
         current_price = self._get_current_price()
+        # Convert side int to display string (side is set by controller in config)
+        side_map = {0: "BOTH", 1: "BUY", 2: "SELL"}
+        side_str = side_map.get(self.config.side, "")
         return {
+            # Side: 0=BOTH (both-sided), 1=BUY (quote only), 2=SELL (base only)
+            "side": side_str,
             "state": self.lp_position_state.state.value,
             "position_address": self.lp_position_state.position_address,
             "current_price": float(current_price) if current_price else None,
@@ -311,6 +368,37 @@ class LPPositionExecutor(ExecutorBase):
             # Timer tracking - executor tracks when it went out of bounds
             "out_of_range_since": self.lp_position_state.out_of_range_since,
         }
+
+    def to_format_status(self) -> str:
+        """Format executor status for display (like XEMMExecutor)"""
+        current_price = self._get_current_price()
+        state = self.lp_position_state.state.value
+        position_addr = self.lp_position_state.position_address or "N/A"
+
+        # Calculate values
+        base_amt = float(self.lp_position_state.base_amount)
+        quote_amt = float(self.lp_position_state.quote_amount)
+        base_fee = float(self.lp_position_state.base_fee)
+        quote_fee = float(self.lp_position_state.quote_fee)
+        lower = float(self.lp_position_state.lower_price)
+        upper = float(self.lp_position_state.upper_price)
+        price = float(current_price) if current_price else 0
+
+        # Total value in quote
+        total_value = base_amt * price + quote_amt + base_fee * price + quote_fee if price else 0
+
+        # Side display
+        side_map = {0: "BOTH", 1: "BUY", 2: "SELL"}
+        side = side_map.get(self.config.side, "")
+
+        return f"""
+LP Position: {position_addr[:16]}... | State: {state} | Side: {side}
+-----------------------------------------------------------------------------------------------------------------------
+    - Range: [{lower:.6f} - {upper:.6f}] | Price: {price:.6f}
+    - Tokens: {base_amt:.6f} base / {quote_amt:.6f} quote | Fees: {base_fee:.6f} / {quote_fee:.6f}
+    - Total Value: {total_value:.6f} quote | PnL: {float(self.get_net_pnl_quote()):.6f} ({float(self.get_net_pnl_pct()):.2f}%)
+-----------------------------------------------------------------------------------------------------------------------
+"""
 
     # Required abstract methods from ExecutorBase
     async def validate_sufficient_balance(self):
@@ -380,13 +468,9 @@ class LPPositionExecutor(ExecutorBase):
         return Decimal("0")
 
     def _get_current_price(self) -> Optional[Decimal]:
-        """Get current price from strategy's market data provider"""
+        """Get current price from RateOracle (LP connectors don't have get_price_by_type)"""
         try:
-            price = self._strategy.market_data_provider.get_price_by_type(
-                self.config.connector_name,
-                self.config.trading_pair,
-                PriceType.MidPrice
-            )
+            price = self._strategy.market_data_provider.get_rate(self.config.trading_pair)
             return Decimal(str(price)) if price else None
         except Exception:
             return None

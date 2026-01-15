@@ -75,7 +75,6 @@ from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 
 class LpPositionManagerConfig(StrategyV2ConfigBase):
     script_file_name: str = os.path.basename(__file__)
-    config_file_name: Optional[str] = None  # Set by trading_core with the config file name
     # Override StrategyV2ConfigBase required fields with empty defaults (not used for LP)
     markets: Dict[str, set] = {}
     candles_config: list[CandlesConfig] = []
@@ -164,12 +163,7 @@ class LpPositionManager(StrategyV2Base):
         self._last_pool_info_fetch_time: float = 0
 
         # SQLite database access for P&L tracking
-        # Use the strategy-specific database (same as markets_recorder)
-        if config.config_file_name:
-            db_name = config.config_file_name.replace('.yml', '').replace('.yaml', '')
-        else:
-            db_name = "hummingbot_trades"
-        db_path = os.path.join(data_path(), f"{db_name}.sqlite")
+        db_path = os.path.join(data_path(), "hummingbot_trades.sqlite")
         self._db_engine = create_engine(f"sqlite:///{db_path}")
         self._db_session_maker = sessionmaker(bind=self._db_engine)
         # Ensure RangePositionUpdate table exists (creates if missing)
@@ -298,15 +292,11 @@ class LpPositionManager(StrategyV2Base):
             self.logger().info("No existing position and no initial amounts provided - monitoring only")
 
     def _get_position_updates_from_db(self) -> List[RangePositionUpdate]:
-        """Query RangePositionUpdate records from SQLite database for this config file"""
-        config_file = self.config.config_file_name
-        if not config_file:
-            return []
-
+        """Query RangePositionUpdate records from SQLite database for this pool"""
         try:
             with self._db_session_maker() as session:
                 updates = session.query(RangePositionUpdate).filter(
-                    RangePositionUpdate.config_file_path == config_file
+                    RangePositionUpdate.trading_pair == self._trading_pair
                 ).order_by(RangePositionUpdate.timestamp).all()
                 # Detach from session before returning
                 session.expunge_all()

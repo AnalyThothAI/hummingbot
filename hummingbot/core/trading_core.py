@@ -518,9 +518,6 @@ class TradingCore:
 
         # Create strategy instance
         if config:
-            # Pass config file name to config object for tracking purposes
-            if self._config_source:
-                config.config_file_name = self._config_source
             self.strategy = script_strategy_class(self.markets, config)
         else:
             self.strategy = script_strategy_class(self.markets)
