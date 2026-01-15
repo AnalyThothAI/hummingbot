@@ -321,10 +321,22 @@ class LPController(ControllerBase):
 
         # Price limits visualization (if configured)
         if self.config.lower_price_limit or self.config.upper_price_limit:
-            current_price = self.market_data_provider.get_rate(self.config.trading_pair)
-            if current_price:
+            current_price_rate = self.market_data_provider.get_rate(self.config.trading_pair)
+            if current_price_rate:
+                # Get position range from executor if available
+                position_lower = None
+                position_upper = None
+                if executor:
+                    pos_lower = executor.custom_info.get("lower_price")
+                    pos_upper = executor.custom_info.get("upper_price")
+                    if pos_lower and pos_upper:
+                        position_lower = Decimal(str(pos_lower))
+                        position_upper = Decimal(str(pos_upper))
+
                 status.append("|" + " " * box_width + "|")
-                limits_viz = self._create_price_limits_visualization(current_price)
+                limits_viz = self._create_price_limits_visualization(
+                    current_price_rate, position_lower, position_upper
+                )
                 if limits_viz:
                     for viz_line in limits_viz.split('\n'):
                         line = f"| {viz_line}"
@@ -369,8 +381,13 @@ class LPController(ControllerBase):
 
         return '\n'.join(viz_lines)
 
-    def _create_price_limits_visualization(self, current_price: Decimal) -> Optional[str]:
-        """Create visualization of price limits with current price"""
+    def _create_price_limits_visualization(
+        self,
+        current_price: Decimal,
+        position_lower: Optional[Decimal] = None,
+        position_upper: Optional[Decimal] = None
+    ) -> Optional[str]:
+        """Create visualization of price limits with current price and position range markers"""
         if not self.config.lower_price_limit and not self.config.upper_price_limit:
             return None
 
@@ -399,7 +416,16 @@ class LPController(ControllerBase):
         limit_bar[0] = '['
         limit_bar[-1] = ']'
 
-        # Place price marker
+        # Place position range markers (|) first
+        if position_lower is not None and position_upper is not None:
+            pos_lower_idx = int((position_lower - lower_limit) / price_range * bar_width)
+            pos_upper_idx = int((position_upper - lower_limit) / price_range * bar_width)
+            if 0 < pos_lower_idx < bar_width:
+                limit_bar[pos_lower_idx] = '|'
+            if 0 < pos_upper_idx < bar_width:
+                limit_bar[pos_upper_idx] = '|'
+
+        # Place price marker (● overwrites | if same position)
         if current_pos < 0:
             marker_line = '● ' + ''.join(limit_bar)
             status = "⛔ BELOW LOWER LIMIT"
