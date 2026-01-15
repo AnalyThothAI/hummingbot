@@ -264,6 +264,30 @@ class LPController(ControllerBase):
     def to_format_status(self) -> List[str]:
         """
         Format status for display.
-        LP positions are now displayed in the LP Positions table.
+        Shows header with pool info. Position details in LP Positions table.
         """
-        return []
+        status = []
+        box_width = 100
+
+        # Header
+        status.append("+" + "-" * box_width + "+")
+        header = f"| LP Manager: {self.config.trading_pair} on {self.config.connector_name}"
+        status.append(header + " " * (box_width - len(header) + 1) + "|")
+        status.append("+" + "-" * box_width + "+")
+
+        # Network and pool info
+        line = f"| Network: {self.config.network}"
+        status.append(line + " " * (box_width - len(line) + 1) + "|")
+
+        line = f"| Pool: {self.config.pool_address}"
+        status.append(line + " " * (box_width - len(line) + 1) + "|")
+
+        # Position address from active executor
+        executor = self.active_executor()
+        if executor:
+            position_address = executor.custom_info.get("position_address", "N/A")
+            line = f"| Position: {position_address}"
+            status.append(line + " " * (box_width - len(line) + 1) + "|")
+
+        status.append("+" + "-" * box_width + "+")
+        return status

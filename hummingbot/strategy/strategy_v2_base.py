@@ -479,7 +479,6 @@ class StrategyV2Base(ScriptStrategyBase):
                         "Connector": pos.connector_name,
                         "Pair": pos.trading_pair,
                         "Side": pos.side,
-                        "Position": f"{pos.position_address[:12]}...",
                         "State": f"{state_indicator} {pos.state}",
                         "Range": f"{float(pos.lower_price):.4f}-{float(pos.upper_price):.4f}",
                         "Price": f"{float(pos.current_price):.4f}",
