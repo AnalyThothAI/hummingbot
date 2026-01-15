@@ -463,7 +463,7 @@ class LpPositionManager(StrategyV2Base):
                 arrow = "⬇️" if direction == "below" else "⬆️"
                 text_arrow = "↓" if direction == "below" else "↑"
 
-                msg = (f"{arrow} Out of range: {float(current_price):.6f} {text_arrow} {direction} "
+                msg = (f"{arrow}  Out of range: {float(current_price):.6f} {text_arrow} {direction} "
                        f"{float(bound):.6f} ({deviation:.2f}%). Rebalance in {self.config.rebalance_seconds}s")
                 self.logger().warning(msg)
                 self.notify_hb_app_with_timestamp(msg)
@@ -640,7 +640,7 @@ class LpPositionManager(StrategyV2Base):
                     text_arrow = "↓" if direction == "below" else "↑"
 
                     # Notify user that position is out of range
-                    msg = (f"{arrow} {self.trading_pair} out of range: {float(current_price):.6f} {text_arrow} "
+                    msg = (f"{arrow}  {self.trading_pair} out of range: {float(current_price):.6f} {text_arrow} "
                            f"{direction} {float(bound):.6f} ({deviation:.2f}%). Rebalance in {self.config.rebalance_seconds}s")
                     self.notify_hb_app_with_timestamp(msg)
 
