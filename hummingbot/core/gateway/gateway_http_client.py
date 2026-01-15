@@ -455,14 +455,18 @@ class GatewayHttpClient:
             if response.status != 200 and not fail_silently:
                 self.log_error_codes(parsed_response)
 
-                if "error" in parsed_response or "message" in parsed_response:
-                    # Include error code if present (e.g., TRANSACTION_TIMEOUT)
+                if "message" in parsed_response:
+                    # Gateway HttpError format: message (detailed), code (optional), error (generic HTTP name), name
+                    error_msg = parsed_response.get('message')
                     error_code = parsed_response.get('code', '')
-                    error_msg = parsed_response.get('error') or parsed_response.get('message', 'Unknown error')
+                    error_name = parsed_response.get('error', '')
+                    error_type = parsed_response.get('name', '')
                     code_suffix = f" [code: {error_code}]" if error_code else ""
-                    raise ValueError(f"Error on {method.upper()} {url} Error: {error_msg}{code_suffix}")
+                    type_prefix = f"{error_type}: " if error_type else ""
+                    name_suffix = f" ({error_name})" if error_name else ""
+                    raise ValueError(f"Gateway error: {type_prefix}{error_msg}{name_suffix}{code_suffix}")
                 else:
-                    raise ValueError(f"Error on {method.upper()} {url} Error: {parsed_response}")
+                    raise ValueError(f"Error on {method.upper()} {url}: {parsed_response}")
 
         except Exception as e:
             if not fail_silently:
