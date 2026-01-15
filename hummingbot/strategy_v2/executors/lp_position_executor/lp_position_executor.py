@@ -134,9 +134,18 @@ class LPPositionExecutor(ExecutorBase):
                 self.lp_position_state.upper_price = Decimal(str(position_info.upper_price))
         except Exception as e:
             error_msg = str(e).lower()
-            # If position not found and we're in CLOSING state (or retrying close),
+            # If position closed/not found and we're in CLOSING state (or retrying close),
             # the close actually succeeded despite timeout - transition to COMPLETE
-            if "not found" in error_msg or "closed" in error_msg:
+            if "position closed" in error_msg:
+                # Position was explicitly closed - close succeeded
+                self.logger().info(
+                    f"Position {self.lp_position_state.position_address} confirmed closed on-chain"
+                )
+                self.lp_position_state.state = LPPositionStates.COMPLETE
+                self.lp_position_state.active_close_order = None
+                return
+            elif "not found" in error_msg:
+                # Position not found - if we're closing, it succeeded
                 if self.lp_position_state.state == LPPositionStates.CLOSING or self._status == RunnableStatus.SHUTTING_DOWN:
                     self.logger().info(
                         f"Position {self.lp_position_state.position_address} no longer exists - close succeeded"
@@ -196,9 +205,15 @@ class LPPositionExecutor(ExecutorBase):
                 return
         except Exception as e:
             error_msg = str(e).lower()
-            if "not found" in error_msg or "closed" in error_msg:
+            if "position closed" in error_msg:
                 self.logger().info(
-                    f"Position {self.lp_position_state.position_address} no longer exists - close already succeeded"
+                    f"Position {self.lp_position_state.position_address} confirmed closed on-chain - skipping close"
+                )
+                self.lp_position_state.state = LPPositionStates.COMPLETE
+                return
+            elif "not found" in error_msg:
+                self.logger().info(
+                    f"Position {self.lp_position_state.position_address} not found - close already succeeded"
                 )
                 self.lp_position_state.state = LPPositionStates.COMPLETE
                 return
