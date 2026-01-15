@@ -489,8 +489,6 @@ class StrategyV2Base(ScriptStrategyBase):
                     else:
                         state_display = pos.state
                     lp_positions_data.append({
-                        "Connector": pos.connector_name,
-                        "Pair": pos.trading_pair,
                         "Side": pos.side,
                         "State": state_display,
                         "Range": f"{float(pos.lower_price):.4f}-{float(pos.upper_price):.4f}",

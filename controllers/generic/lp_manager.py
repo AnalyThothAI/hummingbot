@@ -275,11 +275,14 @@ class LPController(ControllerBase):
         status.append(header + " " * (box_width - len(header) + 1) + "|")
         status.append("+" + "-" * box_width + "+")
 
-        # Network and pool info
+        # Network, connector, pool, position
         line = f"| Network: {self.config.network}"
         status.append(line + " " * (box_width - len(line) + 1) + "|")
 
-        line = f"| Pool: {self.config.pool_address}"
+        line = f"| Connector: {self.config.connector_name}"
+        status.append(line + " " * (box_width - len(line) + 1) + "|")
+
+        line = f"| Pool: {self.config.pool_address} ({self.config.trading_pair})"
         status.append(line + " " * (box_width - len(line) + 1) + "|")
 
         # Position address from active executor
