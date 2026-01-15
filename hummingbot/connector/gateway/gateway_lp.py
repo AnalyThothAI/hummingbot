@@ -1030,6 +1030,7 @@ class GatewayLp(GatewaySwap):
                     network=self.network,
                     position_address=position_address,
                     wallet_address=self.address,
+                    fail_silently=True,
                 )
                 # Validate response against CLMM schema
                 return CLMMPositionInfo(**resp) if resp else None
