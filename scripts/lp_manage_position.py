@@ -1200,9 +1200,9 @@ class LpPositionManager(StrategyV2Base):
         total_fees_base_value = total_fees_base * current_price
         total_fees_value = total_fees_base_value + total_fees_quote
 
-        # Calculate total rent paid (positive = cost on ADD, negative = refund on REMOVE)
-        # Sum across all updates to get net rent cost
-        total_rent_paid = sum(u.rent_paid or 0 for u in updates)
+        # Calculate total rent: paid on ADD, refunded on REMOVE
+        total_position_rent = sum(u.position_rent or 0 for u in opens)
+        total_position_rent_refunded = sum(u.position_rent_refunded or 0 for u in closes)
 
         # Calculate current position value (only if script created the initial position)
         # If first record is "ADD", script created initial position - include current position value
@@ -1273,8 +1273,9 @@ class LpPositionManager(StrategyV2Base):
             "position_pnl": position_pnl,
             "position_roi_pct": position_roi_pct,
             "current_position_open_time": current_position_open_time,
-            # Rent tracking (positive = paid, negative = refunded)
-            "total_rent_paid": total_rent_paid,
+            # Rent tracking
+            "total_position_rent": total_position_rent,
+            "total_position_rent_refunded": total_position_rent_refunded,
             # SOL tracking
             "initial_sol": initial_sol,
             "current_sol": current_sol,
@@ -1601,10 +1602,10 @@ class LpPositionManager(StrategyV2Base):
             pnl_sign = "+" if pnl_summary["position_pnl"] >= 0 else ""
             lines.append(f"  P&L: {pnl_sign}{pnl_summary['position_pnl']:.6f} {quote} ({pnl_sign}{pnl_summary['position_roi_pct']:.2f}%)")
 
-            # Show rent paid if non-zero
-            if pnl_summary["total_rent_paid"] != 0:
-                rent_sign = "+" if pnl_summary["total_rent_paid"] >= 0 else ""
-                lines.append(f"  Rent: {rent_sign}{pnl_summary['total_rent_paid']:.6f} SOL")
+            # Show rent tracking
+            if pnl_summary["total_position_rent"] > 0 or pnl_summary["total_position_rent_refunded"] > 0:
+                lines.append(f"  Rent Paid: {pnl_summary['total_position_rent']:.6f} SOL")
+                lines.append(f"  Rent Refunded: {pnl_summary['total_position_rent_refunded']:.6f} SOL")
         else:
             lines.append(f"  Positions Opened: {pnl_summary['opens_count']}")
             lines.append(f"  Positions Closed: {pnl_summary['closes_count']}")

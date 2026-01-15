@@ -34,7 +34,8 @@ class RangePositionUpdate(HummingbotBase):
     quote_amount = Column(Float, nullable=True)  # Quote token amount
     base_fee = Column(Float, nullable=True)  # Base fee collected (for REMOVE)
     quote_fee = Column(Float, nullable=True)  # Quote fee collected (for REMOVE)
-    rent_paid = Column(Float, nullable=True)  # Position rent: positive on ADD (paid), negative on REMOVE (refunded)
+    position_rent = Column(Float, nullable=True)  # SOL rent paid to create position (ADD only)
+    position_rent_refunded = Column(Float, nullable=True)  # SOL rent refunded on close (REMOVE only)
 
     def __repr__(self) -> str:
         return (f"RangePositionUpdate(id={self.id}, hb_id='{self.hb_id}', "

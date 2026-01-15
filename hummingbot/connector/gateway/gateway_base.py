@@ -471,7 +471,8 @@ class GatewayBase(ConnectorBase):
                              price: Decimal = s_decimal_0,
                              amount: Decimal = s_decimal_0,
                              gas_price: Decimal = s_decimal_0,
-                             is_approval: bool = False):
+                             is_approval: bool = False,
+                             order_type: OrderType = OrderType.AMM_SWAP):
         """
         Starts tracking an order by simply adding it into _in_flight_orders dictionary in ClientOrderTracker.
         """
@@ -480,7 +481,7 @@ class GatewayBase(ConnectorBase):
                 client_order_id=order_id,
                 exchange_order_id=exchange_order_id,
                 trading_pair=trading_pair,
-                order_type=OrderType.AMM_SWAP,
+                order_type=order_type,
                 trade_type=trade_type,
                 price=price,
                 amount=amount,

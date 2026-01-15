@@ -265,7 +265,7 @@ class RangePositionLiquidityAddedEvent:
     mid_price: Optional[Decimal] = s_decimal_0
     base_amount: Optional[Decimal] = s_decimal_0
     quote_amount: Optional[Decimal] = s_decimal_0
-    rent_paid: Optional[Decimal] = s_decimal_0  # Positive = paid, negative = refunded
+    position_rent: Optional[Decimal] = s_decimal_0  # SOL rent paid to create position
 
 
 @dataclass
@@ -286,7 +286,7 @@ class RangePositionLiquidityRemovedEvent:
     quote_amount: Optional[Decimal] = s_decimal_0
     base_fee: Optional[Decimal] = s_decimal_0
     quote_fee: Optional[Decimal] = s_decimal_0
-    rent_paid: Optional[Decimal] = s_decimal_0  # Positive = paid, negative = refunded
+    position_rent_refunded: Optional[Decimal] = s_decimal_0  # SOL rent refunded on close
 
 
 @dataclass

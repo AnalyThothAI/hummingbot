@@ -129,7 +129,7 @@ class GatewayLp(GatewaySwap):
                     position_address=metadata.get("position_address", ""),
                     base_amount=metadata.get("base_amount", Decimal("0")),
                     quote_amount=metadata.get("quote_amount", Decimal("0")),
-                    rent_paid=metadata.get("rent_paid", Decimal("0")),
+                    position_rent=metadata.get("position_rent", Decimal("0")),
                 )
             elif metadata["operation"] == "remove":
                 self._trigger_remove_liquidity_event(
@@ -149,7 +149,7 @@ class GatewayLp(GatewaySwap):
                     quote_amount=metadata.get("quote_amount", Decimal("0")),
                     base_fee=metadata.get("base_fee", Decimal("0")),
                     quote_fee=metadata.get("quote_fee", Decimal("0")),
-                    rent_paid=metadata.get("rent_paid", Decimal("0")),
+                    position_rent_refunded=metadata.get("position_rent_refunded", Decimal("0")),
                 )
         elif tracked_order.is_failure:
             # Transaction failed - trigger LP-specific failure event for strategy handling
@@ -246,7 +246,7 @@ class GatewayLp(GatewaySwap):
         base_amount: Decimal = Decimal("0"),
         quote_amount: Decimal = Decimal("0"),
         mid_price: Decimal = Decimal("0"),
-        rent_paid: Decimal = Decimal("0"),
+        position_rent: Decimal = Decimal("0"),
     ):
         """Trigger RangePositionLiquidityAddedEvent"""
         event = RangePositionLiquidityAddedEvent(
@@ -266,7 +266,7 @@ class GatewayLp(GatewaySwap):
             mid_price=mid_price,
             base_amount=base_amount,
             quote_amount=quote_amount,
-            rent_paid=rent_paid,
+            position_rent=position_rent,
         )
         self.trigger_event(MarketEvent.RangePositionLiquidityAdded, event)
         self.logger().info(f"Triggered RangePositionLiquidityAddedEvent for order {order_id}")
@@ -287,7 +287,7 @@ class GatewayLp(GatewaySwap):
         quote_amount: Decimal = Decimal("0"),
         base_fee: Decimal = Decimal("0"),
         quote_fee: Decimal = Decimal("0"),
-        rent_paid: Decimal = Decimal("0"),
+        position_rent_refunded: Decimal = Decimal("0"),
     ):
         """Trigger RangePositionLiquidityRemovedEvent"""
         event = RangePositionLiquidityRemovedEvent(
@@ -307,7 +307,7 @@ class GatewayLp(GatewaySwap):
             quote_amount=quote_amount,
             base_fee=base_fee,
             quote_fee=quote_fee,
-            rent_paid=rent_paid,
+            position_rent_refunded=position_rent_refunded,
         )
         self.trigger_event(MarketEvent.RangePositionLiquidityRemoved, event)
         self.logger().info(f"Triggered RangePositionLiquidityRemovedEvent for order {order_id}")
@@ -595,8 +595,8 @@ class GatewayLp(GatewaySwap):
                     "position_address": data.get("positionAddress", ""),
                     "base_amount": Decimal(str(data.get("baseTokenAmountAdded", 0))),
                     "quote_amount": Decimal(str(data.get("quoteTokenAmountAdded", 0))),
-                    # Position rent paid (positive = we paid)
-                    "rent_paid": Decimal(str(data.get("positionRent", 0))),
+                    # SOL rent paid to create position
+                    "position_rent": Decimal(str(data.get("positionRent", 0))),
                 })
                 return transaction_hash
             else:
@@ -768,8 +768,8 @@ class GatewayLp(GatewaySwap):
                     "quote_amount": Decimal(str(data.get("quoteTokenAmountRemoved", 0))),
                     "base_fee": Decimal(str(data.get("baseFeeAmountCollected", 0))),
                     "quote_fee": Decimal(str(data.get("quoteFeeAmountCollected", 0))),
-                    # Position rent refunded (negative = we got refund)
-                    "rent_paid": -Decimal(str(data.get("positionRentRefunded", 0))),
+                    # SOL rent refunded on close
+                    "position_rent_refunded": Decimal(str(data.get("positionRentRefunded", 0))),
                 })
                 return transaction_hash
             else:
@@ -834,8 +834,8 @@ class GatewayLp(GatewaySwap):
                     "quote_amount": Decimal(str(data.get("quoteTokenAmountRemoved", 0))),
                     "base_fee": Decimal(str(data.get("baseFeeAmountCollected", 0))),
                     "quote_fee": Decimal(str(data.get("quoteFeeAmountCollected", 0))),
-                    # Position rent refunded (negative = we got refund)
-                    "rent_paid": -Decimal(str(data.get("positionRentRefunded", 0))),
+                    # SOL rent refunded on close
+                    "position_rent_refunded": Decimal(str(data.get("positionRentRefunded", 0))),
                 })
                 return transaction_hash
             else:

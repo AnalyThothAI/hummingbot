@@ -612,7 +612,9 @@ class MarketsRecorder:
                     quote_amount=float(getattr(evt, 'quote_amount', 0) or 0),
                     base_fee=float(getattr(evt, 'base_fee', 0) or 0),
                     quote_fee=float(getattr(evt, 'quote_fee', 0) or 0),
-                    rent_paid=float(getattr(evt, 'rent_paid', 0) or 0),
+                    # Rent tracking: position_rent on ADD, position_rent_refunded on REMOVE
+                    position_rent=float(getattr(evt, 'position_rent', 0) or 0),
+                    position_rent_refunded=float(getattr(evt, 'position_rent_refunded', 0) or 0),
                 )
                 session.add(rp_update)
                 self.save_market_states(self._config_file_path, connector, session=session)

@@ -240,9 +240,9 @@ class LPPositionState(BaseModel):
     base_fee: Decimal = Decimal("0")
     quote_fee: Decimal = Decimal("0")
 
-    # Rent tracking: positive on ADD (rent paid), negative on REMOVE (rent refunded)
-    # This matches the DB column rent_paid in RangePositionUpdate
-    rent_paid: Decimal = Decimal("0")
+    # Rent tracking
+    position_rent: Decimal = Decimal("0")  # SOL rent paid to create position (ADD only)
+    position_rent_refunded: Decimal = Decimal("0")  # SOL rent refunded on close (REMOVE only)
 
     # Order tracking
     active_open_order: Optional[TrackedOrder] = None
@@ -312,7 +312,8 @@ class LPPositionState(BaseModel):
         self.quote_amount = Decimal("0")
         self.base_fee = Decimal("0")
         self.quote_fee = Decimal("0")
-        self.rent_paid = Decimal("0")
+        self.position_rent = Decimal("0")
+        self.position_rent_refunded = Decimal("0")
         self.active_open_order = None
         self.active_close_order = None
         self.state = LPPositionStates.NOT_ACTIVE
@@ -517,8 +518,8 @@ class LPPositionExecutor(ExecutorBase):
 
             # Extract position data directly from event
             self.lp_position_state.position_address = event.position_address
-            # rent_paid is positive on ADD (we paid rent)
-            self.lp_position_state.rent_paid = event.rent_paid
+            # Track rent paid to create position
+            self.lp_position_state.position_rent = event.position_rent
             self.lp_position_state.base_amount = event.base_amount
             self.lp_position_state.quote_amount = event.quote_amount
             self.lp_position_state.lower_price = event.lower_price
@@ -526,7 +527,7 @@ class LPPositionExecutor(ExecutorBase):
 
             self.logger().info(
                 f"Position created: {event.position_address}, "
-                f"rent paid: {event.rent_paid} SOL, "
+                f"rent: {event.position_rent} SOL, "
                 f"base: {event.base_amount}, quote: {event.quote_amount}"
             )
 
@@ -549,9 +550,8 @@ class LPPositionExecutor(ExecutorBase):
            event.order_id == self.lp_position_state.active_close_order.order_id:
             self.lp_position_state.active_close_order.is_filled = True
 
-            # rent_paid is negative on REMOVE (we got refund)
-            # This is stored as -positionRentRefunded by gateway_lp.py
-            self.lp_position_state.rent_paid = event.rent_paid
+            # Track rent refunded on close
+            self.lp_position_state.position_rent_refunded = event.position_rent_refunded
 
             # Update final amounts (tokens returned from position)
             self.lp_position_state.base_amount = event.base_amount
@@ -563,7 +563,7 @@ class LPPositionExecutor(ExecutorBase):
 
             self.logger().info(
                 f"Position closed: {self.lp_position_state.position_address}, "
-                f"rent refunded: {abs(event.rent_paid)} SOL, "
+                f"rent refunded: {event.position_rent_refunded} SOL, "
                 f"base: {event.base_amount}, quote: {event.quote_amount}, "
                 f"fees: {event.base_fee} base / {event.quote_fee} quote"
             )
