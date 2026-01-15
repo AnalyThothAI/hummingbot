@@ -550,6 +550,24 @@ class ExecutorOrchestrator:
             report[controller_id] = positions_summary
         return report
 
+    def get_lp_positions_report(self) -> Dict[str, List]:
+        """
+        Generate LP positions report from active LP executors.
+        Returns a dictionary with controller_id as key and list of LPPositionSummary as value.
+        """
+        report = {}
+        for controller_id, executors in self.active_executors.items():
+            lp_positions = []
+            for executor in executors:
+                # Check if it's an LP executor with a position
+                if (hasattr(executor, 'get_lp_position_summary') and
+                        hasattr(executor, 'lp_position_state') and
+                        executor.lp_position_state.position_address):
+                    lp_positions.append(executor.get_lp_position_summary())
+            if lp_positions:
+                report[controller_id] = lp_positions
+        return report
+
     def get_all_reports(self) -> Dict[str, Dict]:
         """
         Generate a unified report containing executors, positions, and performance for all controllers.
@@ -561,6 +579,7 @@ class ExecutorOrchestrator:
         # Generate all reports
         executors_report = self.get_executors_report()
         positions_report = self.get_positions_report()
+        lp_positions_report = self.get_lp_positions_report()
 
         # Get all controller IDs
         all_controller_ids = set(list(self.active_executors.keys()) +
@@ -572,6 +591,7 @@ class ExecutorOrchestrator:
             controller_id: {
                 "executors": executors_report.get(controller_id, []),
                 "positions": positions_report.get(controller_id, []),
+                "lp_positions": lp_positions_report.get(controller_id, []),
                 "performance": self.generate_performance_report(controller_id)
             }
             for controller_id in all_controller_ids

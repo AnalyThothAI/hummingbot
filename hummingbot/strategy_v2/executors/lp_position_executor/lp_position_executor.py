@@ -369,6 +369,35 @@ class LPPositionExecutor(ExecutorBase):
             "out_of_range_since": self.lp_position_state.out_of_range_since,
         }
 
+    def get_lp_position_summary(self):
+        """Create LPPositionSummary for reporting."""
+        from hummingbot.strategy_v2.executors.data_types import LPPositionSummary
+
+        current_price = self._get_current_price() or Decimal("0")
+        total_value = (
+            self.lp_position_state.base_amount * current_price +
+            self.lp_position_state.quote_amount
+        )
+
+        return LPPositionSummary(
+            connector_name=self.config.connector_name,
+            trading_pair=self.config.trading_pair,
+            position_address=self.lp_position_state.position_address or "",
+            state=self.lp_position_state.state.value,
+            current_price=current_price,
+            lower_price=self.lp_position_state.lower_price,
+            upper_price=self.lp_position_state.upper_price,
+            base_amount=self.lp_position_state.base_amount,
+            quote_amount=self.lp_position_state.quote_amount,
+            base_token=self.config.base_token,
+            quote_token=self.config.quote_token,
+            base_fee=self.lp_position_state.base_fee,
+            quote_fee=self.lp_position_state.quote_fee,
+            total_value_quote=total_value,
+            unrealized_pnl_quote=self.get_net_pnl_quote(),
+            out_of_range_since=self.lp_position_state.out_of_range_since,
+        )
+
     def to_format_status(self) -> str:
         """Format executor status for display (like XEMMExecutor)"""
         current_price = self._get_current_price()
