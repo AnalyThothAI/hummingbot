@@ -464,27 +464,29 @@ class StrategyV2Base(ScriptStrategyBase):
             else:
                 lines.append("  No executors found.")
 
-            # Positions table
-            positions = self.get_positions_by_controller(controller_id)
-            if positions:
-                lines.append("\n  Positions Held:")
-                positions_data = []
-                for pos in positions:
-                    positions_data.append({
-                        "Connector": pos.connector_name,
-                        "Trading Pair": pos.trading_pair,
-                        "Side": pos.side.name,
-                        "Amount": f"{pos.amount:.4f}",
-                        "Value (USD)": f"${pos.amount * pos.breakeven_price:.2f}",
-                        "Breakeven Price": f"{pos.breakeven_price:.6f}",
-                        "Unrealized PnL": f"${pos.unrealized_pnl_quote:+.2f}",
-                        "Realized PnL": f"${pos.realized_pnl_quote:+.2f}",
-                        "Fees": f"${pos.cum_fees_quote:.2f}"
-                    })
-                positions_df = pd.DataFrame(positions_data)
-                lines.append(format_df_for_printout(positions_df, table_format="psql", index=False))
-            else:
-                lines.append("  No positions held.")
+            # Positions table (skip for LP executors which track positions differently)
+            is_lp_controller = any(e.type == "lp_position_executor" for e in executors_list) if executors_list else False
+            if not is_lp_controller:
+                positions = self.get_positions_by_controller(controller_id)
+                if positions:
+                    lines.append("\n  Positions Held:")
+                    positions_data = []
+                    for pos in positions:
+                        positions_data.append({
+                            "Connector": pos.connector_name,
+                            "Trading Pair": pos.trading_pair,
+                            "Side": pos.side.name,
+                            "Amount": f"{pos.amount:.4f}",
+                            "Value (USD)": f"${pos.amount * pos.breakeven_price:.2f}",
+                            "Breakeven Price": f"{pos.breakeven_price:.6f}",
+                            "Unrealized PnL": f"${pos.unrealized_pnl_quote:+.2f}",
+                            "Realized PnL": f"${pos.realized_pnl_quote:+.2f}",
+                            "Fees": f"${pos.cum_fees_quote:.2f}"
+                        })
+                    positions_df = pd.DataFrame(positions_data)
+                    lines.append(format_df_for_printout(positions_df, table_format="psql", index=False))
+                else:
+                    lines.append("  No positions held.")
 
             # Collect performance data for summary table
             performance_report = self.get_performance_report(controller_id)
