@@ -79,6 +79,7 @@ class LPPositionSummary(BaseModel):
     connector_name: str
     trading_pair: str
     position_address: str
+    side: str  # BUY, SELL, BOTH
     state: str  # IN_RANGE, OUT_OF_RANGE, OPENING, CLOSING, etc.
     # Price info
     current_price: Decimal
@@ -99,7 +100,7 @@ class LPPositionSummary(BaseModel):
     out_of_range_since: Optional[float] = None
 
     @property
-    def fees_value_quote(self) -> Decimal:
+    def fees_quote(self) -> Decimal:
         """Total fees value in quote token."""
         if self.current_price > 0:
             return self.base_fee * self.current_price + self.quote_fee

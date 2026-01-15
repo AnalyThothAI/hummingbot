@@ -476,12 +476,15 @@ class StrategyV2Base(ScriptStrategyBase):
                 for pos in lp_positions:
                     state_indicator = "[OK]" if pos.state == "IN_RANGE" else "[!]"
                     lp_positions_data.append({
+                        "Connector": pos.connector_name,
+                        "Pair": pos.trading_pair,
+                        "Side": pos.side,
                         "Position": f"{pos.position_address[:12]}...",
                         "State": f"{state_indicator} {pos.state}",
                         "Range": f"{float(pos.lower_price):.4f}-{float(pos.upper_price):.4f}",
                         "Price": f"{float(pos.current_price):.4f}",
                         "Tokens": f"{float(pos.base_amount):.4f} {pos.base_token} / {float(pos.quote_amount):.4f} {pos.quote_token}",
-                        "Fees": f"{float(pos.base_fee):.6f} / {float(pos.quote_fee):.6f}",
+                        "Fees": f"{float(pos.fees_quote):.6f}",
                         "Value": f"{float(pos.total_value_quote):.4f}",
                         "PnL": f"{float(pos.unrealized_pnl_quote):+.4f}",
                     })

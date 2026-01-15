@@ -379,10 +379,15 @@ class LPPositionExecutor(ExecutorBase):
             self.lp_position_state.quote_amount
         )
 
+        # Map side: 0=BOTH, 1=BUY, 2=SELL
+        side_map = {0: "BOTH", 1: "BUY", 2: "SELL"}
+        side = side_map.get(self.config.side, "BOTH")
+
         return LPPositionSummary(
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
             position_address=self.lp_position_state.position_address or "",
+            side=side,
             state=self.lp_position_state.state.value,
             current_price=current_price,
             lower_price=self.lp_position_state.lower_price,
