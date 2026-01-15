@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import inspect
 import os
+import time
 from decimal import Decimal
 from typing import Callable, Dict, List, Optional, Set
 
@@ -473,6 +474,7 @@ class StrategyV2Base(ScriptStrategyBase):
             if lp_positions:
                 lines.append("\n  LP Positions:")
                 lp_positions_data = []
+                current_time = time.time()
                 for pos in lp_positions:
                     # Use emojis matching lp_manage_position.py
                     if pos.state == "IN_RANGE":
@@ -482,6 +484,10 @@ class StrategyV2Base(ScriptStrategyBase):
                             state_display = "⬇️  Below Range "
                         else:
                             state_display = "⬆️  Above Range "
+                        # Add elapsed time if out_of_range_since is set
+                        if pos.out_of_range_since is not None:
+                            elapsed = int(current_time - pos.out_of_range_since)
+                            state_display += f"({elapsed}s)"
                     elif pos.state == "OPENING":
                         state_display = "⏳ Opening"
                     elif pos.state == "CLOSING":
