@@ -319,6 +319,14 @@ class LPController(ControllerBase):
                     line = f"| {viz_line}"
                     status.append(line + " " * (box_width - len(line) + 1) + "|")
 
+                # Show rebalance timer if out of range
+                out_of_range_since = executor.custom_info.get("out_of_range_since")
+                if out_of_range_since is not None:
+                    current_time = self.market_data_provider.time()
+                    elapsed = int(current_time - out_of_range_since)
+                    line = f"| Rebalance: {elapsed}s / {self.config.rebalance_seconds}s"
+                    status.append(line + " " * (box_width - len(line) + 1) + "|")
+
         # Price limits visualization (if configured)
         if self.config.lower_price_limit or self.config.upper_price_limit:
             current_price_rate = self.market_data_provider.get_rate(self.config.trading_pair)
