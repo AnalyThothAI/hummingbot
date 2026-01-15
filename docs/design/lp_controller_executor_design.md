@@ -649,8 +649,9 @@ class LPPositionExecutor(ExecutorBase):
             "quote_amount": float(self.lp_position_state.quote_amount),
             "base_fee": float(self.lp_position_state.base_fee),
             "quote_fee": float(self.lp_position_state.quote_fee),
-            # Rent tracking: positive = paid (on ADD), negative = refunded (on REMOVE)
-            "rent_paid": float(self.lp_position_state.rent_paid),
+            # Rent tracking
+            "position_rent": float(self.lp_position_state.position_rent),
+            "position_rent_refunded": float(self.lp_position_state.position_rent_refunded),
             # Timer tracking - executor tracks when it went out of bounds
             "out_of_range_since": self.lp_position_state.out_of_range_since,
         }
@@ -1250,28 +1251,27 @@ The existing event classes in `hummingbot/core/event/events.py` map to gateway r
 | Gateway Field (open) | Event Field | Description |
 |---------------------|-------------|-------------|
 | `positionAddress` | `position_address` | Created position NFT address |
-| `positionRent` | `rent_paid` (positive) | SOL deposited for position rent (~0.057 SOL) |
+| `positionRent` | `position_rent` | SOL deposited for position rent (~0.057 SOL) |
 | `baseTokenAmountAdded` | `base_amount` | Actual base token added (positive) |
 | `quoteTokenAmountAdded` | `quote_amount` | Actual quote token added (positive) |
 | `fee` | `trade_fee` | SOL transaction fee (separate from rent) |
 
 | Gateway Field (close) | Event Field | Description |
 |----------------------|-------------|-------------|
-| `positionRentRefunded` | `rent_paid` (negative) | SOL returned from position rent |
+| `positionRentRefunded` | `position_rent_refunded` | SOL returned from position rent |
 | `baseTokenAmountRemoved` | `base_amount` | Actual base token removed (positive) |
 | `quoteTokenAmountRemoved` | `quote_amount` | Actual quote token removed (positive) |
 | `baseFeeAmountCollected` | `base_fee` | LP trading fees collected in base token |
 | `quoteFeeAmountCollected` | `quote_fee` | LP trading fees collected in quote token |
 | `fee` | `trade_fee` | SOL transaction fee (separate from rent refund) |
 
-**Key Design Decision: Unified `rent_paid` Field**
+**Rent Tracking: Separate Fields, Net Display**
 
-Instead of separate `position_rent` and `position_rent_refunded` fields, we use a single `rent_paid` field:
-- **Positive on ADD**: Rent paid to create position (e.g., +0.057 SOL)
-- **Negative on REMOVE**: Rent refunded when closing position (e.g., -0.057 SOL)
+We track rent as two separate fields for visibility:
+- `position_rent`: SOL rent paid when creating position (ADD only)
+- `position_rent_refunded`: SOL rent returned when closing position (REMOVE only)
 
-This matches the DB column `rent_paid` in `RangePositionUpdate` table and simplifies P&L tracking:
-- Sum all `rent_paid` values to get net rent cost
+Status displays "Net Rent Paid" = position_rent - position_rent_refunded:
 - P&L calculation excludes rent (tracked separately for display)
 
 ```python
@@ -1297,7 +1297,7 @@ class RangePositionLiquidityAddedEvent:
     mid_price: Optional[Decimal] = s_decimal_0
     base_amount: Optional[Decimal] = s_decimal_0  # baseTokenAmountAdded (positive)
     quote_amount: Optional[Decimal] = s_decimal_0  # quoteTokenAmountAdded (positive)
-    rent_paid: Optional[Decimal] = s_decimal_0  # positionRent (positive = paid)
+    position_rent: Optional[Decimal] = s_decimal_0  # SOL rent paid to create position
 
 
 @dataclass
@@ -1322,7 +1322,7 @@ class RangePositionLiquidityRemovedEvent:
     quote_amount: Optional[Decimal] = s_decimal_0  # quoteTokenAmountRemoved (positive)
     base_fee: Optional[Decimal] = s_decimal_0  # baseFeeAmountCollected
     quote_fee: Optional[Decimal] = s_decimal_0  # quoteFeeAmountCollected
-    rent_paid: Optional[Decimal] = s_decimal_0  # -positionRentRefunded (negative = refund)
+    position_rent_refunded: Optional[Decimal] = s_decimal_0  # SOL rent refunded on close
 
 
 @dataclass
@@ -1451,10 +1451,10 @@ hummingbot/
 **LPPositionExecutor** - Single position lifecycle:
 - Opens position on start
 - Extracts position data directly from LP events (no separate fetch needed)
-- Tracks `rent_paid` (positive on ADD = SOL deposited, negative on REMOVE = SOL refunded)
+- Tracks `position_rent` (on ADD) and `position_rent_refunded` (on REMOVE)
 - Monitors position and reports state via `get_custom_info()`
 - Tracks `out_of_range_since` timestamp (when price moves out of range)
-- Reports: state, position_address, amounts, price, fees, rent_paid, out_of_range_since
+- Reports: state, position_address, amounts, price, fees, rent fields, out_of_range_since
 - Closes position when stopped (unless `keep_position=True`)
 - Runs `control_task()` every `update_interval` (default 1.0s, from ExecutorOrchestrator)
 
@@ -1498,7 +1498,7 @@ Controller                          Executor
 ### Components
 
 - **LPPositionStates**: NOT_ACTIVE, OPENING, IN_RANGE, OUT_OF_RANGE, CLOSING, COMPLETE, RETRIES_EXCEEDED
-- **LPPositionState**: State tracking model within executor (includes `out_of_range_since`, `rent_paid`)
+- **LPPositionState**: State tracking model within executor (includes `out_of_range_since`, rent fields)
 - **LPPositionExecutorConfig**: Position parameters (lower_price, upper_price, amounts)
 - **LPPositionExecutor**: Position lifecycle (~100 lines)
 - **LPControllerConfig**: Pool + policy parameters (position_width_pct, rebalance_seconds, price_limits)
@@ -1512,16 +1512,17 @@ Controller                          Executor
 - `quote_amount`: Token amount added/removed (always positive)
 - `base_fee`: LP trading fees collected in base token (REMOVE only)
 - `quote_fee`: LP trading fees collected in quote token (REMOVE only)
-- `rent_paid`: Position rent - positive on ADD (paid), negative on REMOVE (refunded)
+- `position_rent`: SOL rent paid to create position (ADD only)
+- `position_rent_refunded`: SOL rent refunded on close (REMOVE only)
 
 **P&L Calculation** (excludes rent):
 ```
 P&L = (Total Close Value + Total Fees + Current Position Value) - Total Open Value
 ```
 
-**Rent Tracking** (displayed separately):
+**Rent Tracking** (displayed as "Net Rent Paid"):
 ```
-Net Rent = sum(rent_paid for all updates)
+Net Rent Paid = position_rent - position_rent_refunded
 ```
 - Positive: Net cost (more rent paid than refunded)
 - Negative: Net refund (position closed, rent returned)
