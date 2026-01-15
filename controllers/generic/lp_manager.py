@@ -295,8 +295,8 @@ class LPController(ControllerBase):
         # Strategy type (Meteora-specific)
         if self.config.strategy_type is not None:
             strategy_names = {0: "Spot", 1: "Curve", 2: "Bid-Ask"}
-            strategy_name = strategy_names.get(self.config.strategy_type, f"Type {self.config.strategy_type}")
-            line = f"| Strategy Type: {strategy_name}"
+            strategy_name = strategy_names.get(self.config.strategy_type, "Unknown")
+            line = f"| Strategy Type: {self.config.strategy_type} - {strategy_name}"
             status.append(line + " " * (box_width - len(line) + 1) + "|")
 
         if executor:
