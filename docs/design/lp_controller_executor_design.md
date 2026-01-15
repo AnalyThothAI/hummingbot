@@ -476,10 +476,11 @@ class LPPositionExecutor(ExecutorBase):
     async def _close_position(self):
         """
         Close position (removes all liquidity and closes position).
-        Calls connector.close_position() which maps to gateway close_position endpoint.
+        Calls connector.remove_liquidity() which maps to gateway close_position endpoint.
         """
         connector = self.connectors.get(self.config.connector_name)
-        order_id = connector.close_position(
+        order_id = connector.remove_liquidity(
+            trading_pair=self.config.trading_pair,
             position_address=self.lp_position_state.position_address,
         )
         self.lp_position_state.active_close_order = TrackedOrder(order_id=order_id)
