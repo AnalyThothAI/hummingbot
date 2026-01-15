@@ -292,5 +292,125 @@ class LPController(ControllerBase):
             line = f"| Position: {position_address}"
             status.append(line + " " * (box_width - len(line) + 1) + "|")
 
+            # Position range visualization
+            lower_price = executor.custom_info.get("lower_price")
+            upper_price = executor.custom_info.get("upper_price")
+            current_price = executor.custom_info.get("current_price")
+
+            if lower_price and upper_price and current_price:
+                status.append("|" + " " * box_width + "|")
+                line = "| Position Range:"
+                status.append(line + " " * (box_width - len(line) + 1) + "|")
+
+                range_viz = self._create_price_range_visualization(
+                    Decimal(str(lower_price)),
+                    Decimal(str(current_price)),
+                    Decimal(str(upper_price))
+                )
+                for viz_line in range_viz.split('\n'):
+                    line = f"| {viz_line}"
+                    status.append(line + " " * (box_width - len(line) + 1) + "|")
+
+        # Price limits visualization (if configured)
+        if self.config.lower_price_limit or self.config.upper_price_limit:
+            current_price = self.market_data_provider.get_rate(self.config.trading_pair)
+            if current_price:
+                status.append("|" + " " * box_width + "|")
+                limits_viz = self._create_price_limits_visualization(current_price)
+                if limits_viz:
+                    for viz_line in limits_viz.split('\n'):
+                        line = f"| {viz_line}"
+                        status.append(line + " " * (box_width - len(line) + 1) + "|")
+
         status.append("+" + "-" * box_width + "+")
         return status
+
+    def _create_price_range_visualization(self, lower_price: Decimal, current_price: Decimal,
+                                          upper_price: Decimal) -> str:
+        """Create visual representation of price range with current price marker"""
+        # Calculate position in range (0 to 1)
+        price_range = upper_price - lower_price
+        current_position = (current_price - lower_price) / price_range
+
+        # Create 50-character wide bar
+        bar_width = 50
+        current_pos = int(current_position * bar_width)
+
+        # Build price range bar
+        range_bar = ['─'] * bar_width
+        range_bar[0] = '├'
+        range_bar[-1] = '┤'
+
+        # Place marker inside or outside range
+        if current_pos < 0:
+            # Price below range
+            marker_line = '● ' + ''.join(range_bar)
+        elif current_pos >= bar_width:
+            # Price above range
+            marker_line = ''.join(range_bar) + ' ●'
+        else:
+            # Price within range
+            range_bar[current_pos] = '●'
+            marker_line = ''.join(range_bar)
+
+        viz_lines = []
+        viz_lines.append(marker_line)
+        lower_str = f'{float(lower_price):.6f}'
+        upper_str = f'{float(upper_price):.6f}'
+        viz_lines.append(lower_str + ' ' * (bar_width - len(lower_str) - len(upper_str)) + upper_str)
+
+        return '\n'.join(viz_lines)
+
+    def _create_price_limits_visualization(self, current_price: Decimal) -> Optional[str]:
+        """Create visualization of price limits with current price"""
+        if not self.config.lower_price_limit and not self.config.upper_price_limit:
+            return None
+
+        lower_limit = self.config.lower_price_limit if self.config.lower_price_limit else Decimal("0")
+        upper_limit = self.config.upper_price_limit if self.config.upper_price_limit else current_price * 2
+
+        # If only one limit is set, create appropriate range
+        if not self.config.lower_price_limit:
+            lower_limit = max(Decimal("0"), upper_limit * Decimal("0.5"))
+        if not self.config.upper_price_limit:
+            upper_limit = lower_limit * Decimal("2")
+
+        # Calculate position
+        price_range = upper_limit - lower_limit
+        if price_range <= 0:
+            return None
+
+        current_position = (current_price - lower_limit) / price_range
+
+        # Create bar
+        bar_width = 50
+        current_pos = int(current_position * bar_width)
+
+        # Build visualization
+        limit_bar = ['─'] * bar_width
+        limit_bar[0] = '['
+        limit_bar[-1] = ']'
+
+        # Place price marker
+        if current_pos < 0:
+            marker_line = '● ' + ''.join(limit_bar)
+            status = "⛔ BELOW LOWER LIMIT"
+        elif current_pos >= bar_width:
+            marker_line = ''.join(limit_bar) + ' ●'
+            status = "⛔ ABOVE UPPER LIMIT"
+        else:
+            limit_bar[current_pos] = '●'
+            marker_line = ''.join(limit_bar)
+            status = "✓ Within Limits"
+
+        viz_lines = []
+        viz_lines.append("Price Limits:")
+        viz_lines.append(marker_line)
+
+        # Build limit labels
+        lower_str = f'{float(lower_limit):.6f}' if self.config.lower_price_limit else 'None'
+        upper_str = f'{float(upper_limit):.6f}' if self.config.upper_price_limit else 'None'
+        viz_lines.append(lower_str + ' ' * (bar_width - len(lower_str) - len(upper_str)) + upper_str)
+        viz_lines.append(f'Status: {status}')
+
+        return '\n'.join(viz_lines)
