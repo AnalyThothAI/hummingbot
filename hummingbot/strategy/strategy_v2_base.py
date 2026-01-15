@@ -479,9 +479,9 @@ class StrategyV2Base(ScriptStrategyBase):
                         state_display = "✅ In Range"
                     elif pos.state == "OUT_OF_RANGE":
                         if pos.current_price < pos.lower_price:
-                            state_display = "⬇️ Below Range"
+                            state_display = "⬇️  Below Range"
                         else:
-                            state_display = "⬆️ Above Range"
+                            state_display = "⬆️  Above Range"
                     elif pos.state == "OPENING":
                         state_display = "⏳ Opening"
                     elif pos.state == "CLOSING":
