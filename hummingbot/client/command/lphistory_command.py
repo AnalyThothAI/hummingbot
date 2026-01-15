@@ -187,13 +187,6 @@ class LPHistoryCommand:
                     current_price = Decimal(str(u.mid_price))
                     break
 
-        # Get start price from first open
-        start_price = Decimal("0")
-        for u in opens:
-            if u.mid_price:
-                start_price = Decimal(str(u.mid_price))
-                break
-
         # Calculate totals for opens
         total_open_base = sum(Decimal(str(u.base_amount or 0)) for u in opens)
         total_open_quote = sum(Decimal(str(u.quote_amount or 0)) for u in opens)
@@ -267,10 +260,6 @@ class LPHistoryCommand:
              smart_round(total_open_quote, precision),
              smart_round(total_close_quote, precision),
              smart_round(total_fees_quote, precision)],
-            [f"{trading_pair + ' price':<17}",
-             smart_round(start_price, precision) if start_price > 0 else "-",
-             smart_round(current_price, precision) if current_price > 0 else "-",
-             smart_round(current_price - start_price, precision) if current_price > 0 and start_price > 0 else "-"],
         ]
         assets_df = pd.DataFrame(data=assets_data, columns=assets_columns)
         lines.extend(["", "  Assets:"] + ["    " + line for line in assets_df.to_string(index=False).split("\n")])
