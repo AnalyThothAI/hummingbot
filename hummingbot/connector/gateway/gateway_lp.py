@@ -123,7 +123,7 @@ class GatewayLp(GatewaySwap):
                     trade_fee=TradeFeeBase.new_spot_fee(
                         fee_schema=self.trade_fee_schema(),
                         trade_type=tracked_order.trade_type,
-                        flat_fees=[TokenAmount(amount=tracked_order.gas_price, token=self._native_currency)]
+                        flat_fees=[TokenAmount(amount=metadata.get("tx_fee", Decimal("0")), token=self._native_currency)]
                     ),
                     # P&L tracking fields from gateway response
                     position_address=metadata.get("position_address", ""),
@@ -141,7 +141,7 @@ class GatewayLp(GatewaySwap):
                     trade_fee=TradeFeeBase.new_spot_fee(
                         fee_schema=self.trade_fee_schema(),
                         trade_type=tracked_order.trade_type,
-                        flat_fees=[TokenAmount(amount=tracked_order.gas_price, token=self._native_currency)]
+                        flat_fees=[TokenAmount(amount=metadata.get("tx_fee", Decimal("0")), token=self._native_currency)]
                     ),
                     # P&L tracking fields from gateway response
                     position_address=metadata.get("position_address", ""),
@@ -597,6 +597,8 @@ class GatewayLp(GatewaySwap):
                     "quote_amount": Decimal(str(data.get("quoteTokenAmountAdded", 0))),
                     # SOL rent paid to create position
                     "position_rent": Decimal(str(data.get("positionRent", 0))),
+                    # SOL transaction fee
+                    "tx_fee": Decimal(str(data.get("fee", 0))),
                 })
                 return transaction_hash
             else:
@@ -770,6 +772,8 @@ class GatewayLp(GatewaySwap):
                     "quote_fee": Decimal(str(data.get("quoteFeeAmountCollected", 0))),
                     # SOL rent refunded on close
                     "position_rent_refunded": Decimal(str(data.get("positionRentRefunded", 0))),
+                    # SOL transaction fee
+                    "tx_fee": Decimal(str(data.get("fee", 0))),
                 })
                 return transaction_hash
             else:
@@ -836,6 +840,8 @@ class GatewayLp(GatewaySwap):
                     "quote_fee": Decimal(str(data.get("quoteFeeAmountCollected", 0))),
                     # SOL rent refunded on close
                     "position_rent_refunded": Decimal(str(data.get("positionRentRefunded", 0))),
+                    # SOL transaction fee
+                    "tx_fee": Decimal(str(data.get("fee", 0))),
                 })
                 return transaction_hash
             else:
