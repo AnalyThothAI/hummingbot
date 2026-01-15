@@ -2,7 +2,7 @@ import threading
 import time
 from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -111,37 +111,6 @@ class LPHistoryCommand:
 
         self.notify("\n".join(lines))
 
-    def _get_connector_info(self) -> tuple:  # type: HummingbotApplication
-        """Get connector name and network from strategy config."""
-        connector_name = "unknown"
-        network = "unknown"
-
-        try:
-            if hasattr(self, 'strategy') and self.strategy:
-                # StrategyV2: check controllers dict
-                controllers = getattr(self.strategy, 'controllers', None)
-                if controllers:
-                    for controller in controllers.values():
-                        config = getattr(controller, 'config', None)
-                        if config:
-                            cn = getattr(config, 'connector_name', None)
-                            nw = getattr(config, 'network', None)
-                            if cn:
-                                connector_name = cn
-                            if nw:
-                                network = nw
-                            break
-                # Fallback: try direct config access
-                if connector_name == "unknown":
-                    config = getattr(self.strategy, 'config', None)
-                    if config:
-                        connector_name = getattr(config, 'connector', None) or getattr(config, 'connector_name', None) or "unknown"
-                        network = getattr(config, 'network', None) or "unknown"
-        except Exception:
-            pass
-
-        return connector_name, network
-
     async def _get_current_price(self, trading_pair: str) -> Decimal:  # type: HummingbotApplication
         """Get current price from RateOracle (same as history command)."""
         try:
@@ -167,27 +136,19 @@ class LPHistoryCommand:
             f"Duration: {pd.Timedelta(seconds=int(current_time - start_time))}"
         ])
 
-        # Get connector info
-        connector_name, network = self._get_connector_info()
+        # Group by (market, trading_pair) like history command
+        market_info: Set[Tuple[str, str]] = set((u.market or "unknown", u.trading_pair or "UNKNOWN") for u in updates)
 
-        # Group by trading pair
-        pairs: Dict[str, List[RangePositionUpdate]] = {}
-        for u in updates:
-            pair = u.trading_pair or "UNKNOWN"
-            if pair not in pairs:
-                pairs[pair] = []
-            pairs[pair].append(u)
-
-        # Report for each trading pair
-        for trading_pair, pair_updates in pairs.items():
-            await self._report_pair_performance(lines, connector_name, network, trading_pair, pair_updates, precision)
+        # Report for each market/trading pair
+        for market, trading_pair in market_info:
+            pair_updates = [u for u in updates if u.market == market and u.trading_pair == trading_pair]
+            await self._report_pair_performance(lines, market, trading_pair, pair_updates, precision)
 
         self.notify("\n".join(lines))
 
     async def _report_pair_performance(self,  # type: HummingbotApplication
                                        lines: List[str],
-                                       connector_name: str,
-                                       network: str,
+                                       market: str,
                                        trading_pair: str,
                                        updates: List[RangePositionUpdate],
                                        precision: Optional[int] = None):
@@ -205,8 +166,7 @@ class LPHistoryCommand:
                             if "ADD" in pos and "REMOVE" in pos}
 
         if not closed_positions:
-            lines.append(f"\n{connector_name} / {trading_pair}")
-            lines.append(f"Network: {network}")
+            lines.append(f"\n{market} / {trading_pair}")
             lines.append("\n  No closed positions to report.")
             return
 
@@ -266,9 +226,8 @@ class LPHistoryCommand:
         position_pnl = total_returned - total_open_value if total_open_value > 0 else Decimal("0")
         position_roi_pct = (position_pnl / total_open_value * 100) if total_open_value > 0 else Decimal("0")
 
-        # Header with connector/network info
-        lines.append(f"\n{connector_name} / {trading_pair}")
-        lines.append(f"Network: {network}")
+        # Header with market info
+        lines.append(f"\n{market} / {trading_pair}")
 
         # Count open and closed positions
         open_position_count = len([addr for addr, pos in positions.items() if "ADD" in pos and "REMOVE" not in pos])

@@ -602,6 +602,7 @@ class MarketsRecorder:
                     trade_fee=evt.trade_fee.to_json(),
                     # P&L tracking fields
                     config_file_path=self._config_file_path,
+                    market=connector.display_name,
                     order_action=order_action,
                     trading_pair=getattr(evt, 'trading_pair', None),
                     position_address=getattr(evt, 'position_address', None),

@@ -24,6 +24,7 @@ class RangePositionUpdate(HummingbotBase):
 
     # P&L tracking fields
     config_file_path = Column(Text, nullable=True)  # Strategy config file
+    market = Column(Text, nullable=True)  # Connector name (e.g., "meteora/clmm")
     order_action = Column(Text, nullable=True)  # "ADD" or "REMOVE"
     trading_pair = Column(Text, nullable=True)  # e.g., "SOL-USDC"
     position_address = Column(Text, nullable=True)  # LP position NFT address
