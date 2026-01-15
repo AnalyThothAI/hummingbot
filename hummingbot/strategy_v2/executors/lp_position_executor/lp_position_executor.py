@@ -133,6 +133,17 @@ class LPPositionExecutor(ExecutorBase):
                 self.lp_position_state.lower_price = Decimal(str(position_info.lower_price))
                 self.lp_position_state.upper_price = Decimal(str(position_info.upper_price))
         except Exception as e:
+            error_msg = str(e).lower()
+            # If position not found and we're in CLOSING state (or retrying close),
+            # the close actually succeeded despite timeout - transition to COMPLETE
+            if "not found" in error_msg or "closed" in error_msg:
+                if self.lp_position_state.state == LPPositionStates.CLOSING or self._status == RunnableStatus.SHUTTING_DOWN:
+                    self.logger().info(
+                        f"Position {self.lp_position_state.position_address} no longer exists - close succeeded"
+                    )
+                    self.lp_position_state.state = LPPositionStates.COMPLETE
+                    self.lp_position_state.active_close_order = None
+                    return
             self.logger().debug(f"Error fetching position info: {e}")
 
     async def _create_position(self):
@@ -170,6 +181,28 @@ class LPPositionExecutor(ExecutorBase):
         if connector is None:
             self.logger().error(f"Connector {self.config.connector_name} not found")
             return
+
+        # Verify position still exists before trying to close (handles timeout-but-succeeded case)
+        try:
+            position_info = await connector.get_position_info(
+                trading_pair=self.config.trading_pair,
+                position_address=self.lp_position_state.position_address
+            )
+            if position_info is None:
+                self.logger().info(
+                    f"Position {self.lp_position_state.position_address} already closed - skipping close"
+                )
+                self.lp_position_state.state = LPPositionStates.COMPLETE
+                return
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "not found" in error_msg or "closed" in error_msg:
+                self.logger().info(
+                    f"Position {self.lp_position_state.position_address} no longer exists - close already succeeded"
+                )
+                self.lp_position_state.state = LPPositionStates.COMPLETE
+                return
+            # Other errors - proceed with close attempt
 
         order_id = connector.remove_liquidity(
             trading_pair=self.config.trading_pair,
