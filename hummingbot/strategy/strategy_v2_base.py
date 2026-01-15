@@ -474,12 +474,25 @@ class StrategyV2Base(ScriptStrategyBase):
                 lines.append("\n  LP Positions:")
                 lp_positions_data = []
                 for pos in lp_positions:
-                    state_indicator = "[OK]" if pos.state == "IN_RANGE" else "[!]"
+                    # Use emojis matching lp_manage_position.py
+                    if pos.state == "IN_RANGE":
+                        state_display = "✅ In Range"
+                    elif pos.state == "OUT_OF_RANGE":
+                        if pos.current_price < pos.lower_price:
+                            state_display = "⬇️ Below Range"
+                        else:
+                            state_display = "⬆️ Above Range"
+                    elif pos.state == "OPENING":
+                        state_display = "⏳ Opening"
+                    elif pos.state == "CLOSING":
+                        state_display = "⏳ Closing"
+                    else:
+                        state_display = pos.state
                     lp_positions_data.append({
                         "Connector": pos.connector_name,
                         "Pair": pos.trading_pair,
                         "Side": pos.side,
-                        "State": f"{state_indicator} {pos.state}",
+                        "State": state_display,
                         "Range": f"{float(pos.lower_price):.4f}-{float(pos.upper_price):.4f}",
                         "Price": f"{float(pos.current_price):.4f}",
                         "Tokens": f"{float(pos.base_amount):.4f} {pos.base_token} / {float(pos.quote_amount):.4f} {pos.quote_token}",
