@@ -1602,10 +1602,10 @@ class LpPositionManager(StrategyV2Base):
             pnl_sign = "+" if pnl_summary["position_pnl"] >= 0 else ""
             lines.append(f"  P&L: {pnl_sign}{pnl_summary['position_pnl']:.6f} {quote} ({pnl_sign}{pnl_summary['position_roi_pct']:.2f}%)")
 
-            # Show rent tracking
-            if pnl_summary["total_position_rent"] > 0 or pnl_summary["total_position_rent_refunded"] > 0:
-                lines.append(f"  Rent Paid: {pnl_summary['total_position_rent']:.6f} SOL")
-                lines.append(f"  Rent Refunded: {pnl_summary['total_position_rent_refunded']:.6f} SOL")
+            # Show net rent (paid - refunded)
+            net_rent = pnl_summary["total_position_rent"] - pnl_summary["total_position_rent_refunded"]
+            if net_rent != 0:
+                lines.append(f"  Net Rent Paid: {net_rent:.6f} SOL")
         else:
             lines.append(f"  Positions Opened: {pnl_summary['opens_count']}")
             lines.append(f"  Positions Closed: {pnl_summary['closes_count']}")
