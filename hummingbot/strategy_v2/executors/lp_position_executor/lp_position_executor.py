@@ -12,6 +12,7 @@ from hummingbot.core.event.events import (
 )
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+from hummingbot.strategy_v2.budget.budget_coordinator import BudgetCoordinatorRegistry
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.executors.lp_position_executor.data_types import (
     LPPositionExecutorConfig,
@@ -58,6 +59,11 @@ class LPPositionExecutor(ExecutorBase):
         self.lp_position_state = LPPositionState()
         self._current_retries = 0
         self._max_retries = max_retries
+        self._budget_key = config.budget_key
+        self._budget_reservation_id = config.budget_reservation_id
+        self._budget_coordinator = (
+            BudgetCoordinatorRegistry.get(self._budget_key) if self._budget_key else None
+        )
         self._setup_lp_event_forwarders()
 
     def _setup_lp_event_forwarders(self):
@@ -165,16 +171,29 @@ class LPPositionExecutor(ExecutorBase):
         # Calculate mid price for add_liquidity call
         mid_price = (self.config.lower_price + self.config.upper_price) / Decimal("2")
 
-        order_id = connector.add_liquidity(
-            trading_pair=self.config.trading_pair,
-            price=float(mid_price),
-            lower_price=float(self.config.lower_price),
-            upper_price=float(self.config.upper_price),
-            base_token_amount=float(self.config.base_amount),
-            quote_token_amount=float(self.config.quote_amount),
-            pool_address=self.config.pool_address,
-            extra_params=self.config.extra_params,
-        )
+        if self._budget_coordinator:
+            async with self._budget_coordinator.action_lock:
+                order_id = connector.add_liquidity(
+                    trading_pair=self.config.trading_pair,
+                    price=float(mid_price),
+                    lower_price=float(self.config.lower_price),
+                    upper_price=float(self.config.upper_price),
+                    base_token_amount=float(self.config.base_amount),
+                    quote_token_amount=float(self.config.quote_amount),
+                    pool_address=self.config.pool_address,
+                    extra_params=self.config.extra_params,
+                )
+        else:
+            order_id = connector.add_liquidity(
+                trading_pair=self.config.trading_pair,
+                price=float(mid_price),
+                lower_price=float(self.config.lower_price),
+                upper_price=float(self.config.upper_price),
+                base_token_amount=float(self.config.base_amount),
+                quote_token_amount=float(self.config.quote_amount),
+                pool_address=self.config.pool_address,
+                extra_params=self.config.extra_params,
+            )
         self.lp_position_state.active_open_order = TrackedOrder(order_id=order_id)
         self.lp_position_state.state = LPPositionStates.OPENING
 
@@ -219,10 +238,17 @@ class LPPositionExecutor(ExecutorBase):
                 return
             # Other errors - proceed with close attempt
 
-        order_id = connector.remove_liquidity(
-            trading_pair=self.config.trading_pair,
-            position_address=self.lp_position_state.position_address,
-        )
+        if self._budget_coordinator:
+            async with self._budget_coordinator.action_lock:
+                order_id = connector.remove_liquidity(
+                    trading_pair=self.config.trading_pair,
+                    position_address=self.lp_position_state.position_address,
+                )
+        else:
+            order_id = connector.remove_liquidity(
+                trading_pair=self.config.trading_pair,
+                position_address=self.lp_position_state.position_address,
+            )
         self.lp_position_state.active_close_order = TrackedOrder(order_id=order_id)
         self.lp_position_state.state = LPPositionStates.CLOSING
 
@@ -312,6 +338,7 @@ class LPPositionExecutor(ExecutorBase):
 
             # Reset retry counter on success
             self._current_retries = 0
+            self._release_budget_reservation()
 
     def process_lp_failure_event(
         self,
@@ -348,6 +375,7 @@ class LPPositionExecutor(ExecutorBase):
             # Stop executor - controller will see RETRIES_EXCEEDED and handle appropriately
             self.close_type = CloseType.FAILED
             self._status = RunnableStatus.SHUTTING_DOWN
+            self._release_budget_reservation()
             return
 
         # Log and retry
@@ -373,6 +401,14 @@ class LPPositionExecutor(ExecutorBase):
         if not keep_position and not self.config.keep_position:
             if self.lp_position_state.state in [LPPositionStates.IN_RANGE, LPPositionStates.OUT_OF_RANGE]:
                 asyncio.create_task(self._close_position())
+
+    def on_stop(self):
+        self._release_budget_reservation()
+
+    def _release_budget_reservation(self):
+        if self._budget_coordinator and self._budget_reservation_id:
+            self._budget_coordinator.release(self._budget_reservation_id)
+            self._budget_reservation_id = None
 
     @property
     def filled_amount_quote(self) -> Decimal:

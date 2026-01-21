@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 from hummingbot.strategy_v2.executors.arbitrage_executor.arbitrage_executor import ArbitrageExecutor
 from hummingbot.strategy_v2.executors.data_types import PositionSummary
 from hummingbot.strategy_v2.executors.dca_executor.dca_executor import DCAExecutor
+from hummingbot.strategy_v2.executors.gateway_swap_executor.gateway_swap_executor import GatewaySwapExecutor
 from hummingbot.strategy_v2.executors.grid_executor.grid_executor import GridExecutor
 from hummingbot.strategy_v2.executors.lp_position_executor.lp_position_executor import LPPositionExecutor
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
@@ -147,6 +148,7 @@ class ExecutorOrchestrator:
         "xemm_executor": XEMMExecutor,
         "order_executor": OrderExecutor,
         "lp_position_executor": LPPositionExecutor,
+        "gateway_swap_executor": GatewaySwapExecutor,
     }
 
     @classmethod

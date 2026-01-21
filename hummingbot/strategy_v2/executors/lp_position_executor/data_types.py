@@ -62,6 +62,10 @@ class LPPositionExecutorConfig(ExecutorConfigBase):
     # Early stop behavior (like PositionExecutor)
     keep_position: bool = False  # If True, don't close position on executor stop
 
+    # Budget coordination (optional)
+    budget_key: Optional[str] = None
+    budget_reservation_id: Optional[str] = None
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
