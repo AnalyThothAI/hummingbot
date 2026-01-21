@@ -41,6 +41,12 @@ class GatewaySwapExecutor(ExecutorBase):
         self._current_retries = 0
         self._max_retries = max_retries
         self._last_error: Optional[str] = None
+        self._executed_amount_base: Optional[Decimal] = None
+        self._executed_amount_quote: Optional[Decimal] = None
+        self._executed_amount_in: Optional[Decimal] = None
+        self._executed_amount_out: Optional[Decimal] = None
+        self._token_in: Optional[str] = None
+        self._token_out: Optional[str] = None
         self._budget_coordinator = (
             BudgetCoordinatorRegistry.get(config.budget_key) if config.budget_key else None
         )
@@ -119,6 +125,7 @@ class GatewaySwapExecutor(ExecutorBase):
             if tracked_order.is_failure or tracked_order.is_cancelled:
                 self._handle_retryable_error("order_failed")
                 return
+            self._capture_execution(tracked_order)
             self.close_type = CloseType.COMPLETED
             self.stop()
             return
@@ -201,8 +208,43 @@ class GatewaySwapExecutor(ExecutorBase):
 
     def get_custom_info(self) -> Dict:
         status = GatewaySwapExecutorStatus(
-            state=self.status.value,
+            state=self.status.name,
             order_id=self._order.order_id if self._order else None,
             last_error=self._last_error,
+            trading_pair=self.config.trading_pair,
+            side=self.config.side.name if self.config.side else None,
+            amount_in_is_quote=self.config.amount_in_is_quote,
+            token_in=self._token_in,
+            token_out=self._token_out,
+            amount_in=self._executed_amount_in,
+            amount_out=self._executed_amount_out,
+            executed_amount_base=self._executed_amount_base,
+            executed_amount_quote=self._executed_amount_quote,
         )
         return status.model_dump()
+
+    def _capture_execution(self, tracked_order):
+        executed_base = getattr(tracked_order, "executed_amount_base", Decimal("0"))
+        executed_quote = getattr(tracked_order, "executed_amount_quote", Decimal("0"))
+        self._executed_amount_base = Decimal(str(executed_base or 0))
+        self._executed_amount_quote = Decimal(str(executed_quote or 0))
+
+        base_token, quote_token = self.config.trading_pair.split("-")
+        if self.config.amount_in_is_quote:
+            self._token_in = quote_token
+            self._token_out = base_token
+            self._executed_amount_in = self._executed_amount_base
+            self._executed_amount_out = self._executed_amount_quote
+            return
+
+        if self.config.side == TradeType.BUY:
+            self._token_in = quote_token
+            self._token_out = base_token
+            self._executed_amount_in = self._executed_amount_quote
+            self._executed_amount_out = self._executed_amount_base
+            return
+
+        self._token_in = base_token
+        self._token_out = quote_token
+        self._executed_amount_in = self._executed_amount_base
+        self._executed_amount_out = self._executed_amount_quote

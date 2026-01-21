@@ -28,3 +28,12 @@ class GatewaySwapExecutorStatus(BaseModel):
     state: str
     order_id: Optional[str] = None
     last_error: Optional[str] = None
+    trading_pair: Optional[str] = None
+    side: Optional[str] = None
+    amount_in_is_quote: Optional[bool] = None
+    token_in: Optional[str] = None
+    token_out: Optional[str] = None
+    amount_in: Optional[Decimal] = None
+    amount_out: Optional[Decimal] = None
+    executed_amount_base: Optional[Decimal] = None
+    executed_amount_quote: Optional[Decimal] = None
