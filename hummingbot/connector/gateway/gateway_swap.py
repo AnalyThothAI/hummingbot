@@ -14,6 +14,46 @@ class GatewaySwap(GatewayBase):
     Maintains order tracking and wallet interactions in the base class.
     """
 
+    async def get_quote(
+            self,
+            trading_pair: str,
+            is_buy: bool,
+            amount: Decimal,
+            slippage_pct: Optional[Decimal] = None,
+            pool_address: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Retrieves a full quote response from Gateway.
+
+        :param trading_pair: The market trading pair
+        :param is_buy: True for an intention to buy, False for an intention to sell
+        :param amount: The amount required (in base token unit)
+        :return: The full quote response dict.
+        """
+        base, quote = trading_pair.split("-")
+        side: TradeType = TradeType.BUY if is_buy else TradeType.SELL
+
+        try:
+            return await self._get_gateway_instance().quote_swap(
+                network=self.network,
+                connector=self.connector_name,
+                base_asset=base,
+                quote_asset=quote,
+                amount=amount,
+                side=side,
+                slippage_pct=slippage_pct,
+                pool_address=pool_address
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger().network(
+                f"Error getting quote for {trading_pair} {side} order for {amount} amount.",
+                exc_info=True,
+                app_warning_msg=str(e)
+            )
+            return None
+
     @async_ttl_cache(ttl=5, maxsize=10)
     async def get_quote_price(
             self,
@@ -31,31 +71,15 @@ class GatewaySwap(GatewayBase):
         :param amount: The amount required (in base token unit)
         :return: The quote price.
         """
-        base, quote = trading_pair.split("-")
-        side: TradeType = TradeType.BUY if is_buy else TradeType.SELL
-
-        # Pull the price from gateway.
-        try:
-            resp: Dict[str, Any] = await self._get_gateway_instance().quote_swap(
-                network=self.network,
-                connector=self.connector_name,
-                base_asset=base,
-                quote_asset=quote,
-                amount=amount,
-                side=side,
-                slippage_pct=slippage_pct,
-                pool_address=pool_address
-            )
-            price = resp.get("price", None)
-            return Decimal(price) if price is not None else None
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self.logger().network(
-                f"Error getting quote price for {trading_pair} {side} order for {amount} amount.",
-                exc_info=True,
-                app_warning_msg=str(e)
-            )
+        resp = await self.get_quote(
+            trading_pair=trading_pair,
+            is_buy=is_buy,
+            amount=amount,
+            slippage_pct=slippage_pct,
+            pool_address=pool_address,
+        )
+        price = resp.get("price") if resp else None
+        return Decimal(price) if price is not None else None
 
     async def get_order_price(
             self,
@@ -138,6 +162,10 @@ class GatewaySwap(GatewayBase):
             # Check if we have a quote_id to execute
             quote_id = kwargs.get("quote_id")
             if quote_id:
+                self.logger().info(
+                    f"Gateway swap execute-quote: connector={self.connector_name} quote_id={quote_id} "
+                    f"network={self.network} wallet={self.address}"
+                )
                 # Use execute_quote if we have a quote_id
                 order_result: Dict[str, Any] = await self._get_gateway_instance().execute_quote(
                     connector=self.connector_name,
@@ -146,6 +174,13 @@ class GatewaySwap(GatewayBase):
                     wallet_address=self.address
                 )
             else:
+                slippage_pct = kwargs.get("slippage_pct")
+                pool_address = kwargs.get("pool_address")
+                self.logger().info(
+                    f"Gateway swap execute-swap: connector={self.connector_name} pair={trading_pair} "
+                    f"side={trade_type.name} amount={amount} slippage={slippage_pct} pool={pool_address} "
+                    f"network={self.network} wallet={self.address}"
+                )
                 # Use execute_swap for direct swaps without quote
                 order_result: Dict[str, Any] = await self._get_gateway_instance().execute_swap(
                     connector=self.connector_name,
@@ -153,6 +188,8 @@ class GatewaySwap(GatewayBase):
                     quote_asset=quote,
                     side=trade_type,
                     amount=amount,
+                    slippage_pct=slippage_pct,
+                    pool_address=pool_address,
                     network=self.network,
                     wallet_address=self.address
                 )
