@@ -612,17 +612,44 @@ class ExecutorOrchestrator:
         # Add data from active executors
         active_executors = self.active_executors.get(controller_id, [])
         positions = self.positions_held.get(controller_id, [])
+        controller = self.strategy.controllers.get(controller_id)
+        trading_pair = getattr(getattr(controller, "config", None), "trading_pair", None)
+        pool_trading_pair = getattr(getattr(controller, "config", None), "pool_trading_pair", None)
+        invert_lp_quote = False
+        if isinstance(trading_pair, str) and isinstance(pool_trading_pair, str) and trading_pair != pool_trading_pair:
+            tp_parts = trading_pair.split("-")
+            pool_parts = pool_trading_pair.split("-")
+            if len(tp_parts) == 2 and len(pool_parts) == 2:
+                invert_lp_quote = pool_parts[0] == tp_parts[1] and pool_parts[1] == tp_parts[0]
 
         for executor in active_executors:
             executor_info = executor.executor_info
+            net_pnl_quote = executor_info.net_pnl_quote
+            filled_amount_quote = executor_info.filled_amount_quote
+            invested_quote = None
+            if executor_info.type == "lp_position_executor" and invert_lp_quote:
+                price = executor_info.custom_info.get("current_price")
+                price = Decimal(str(price)) if price is not None else None
+                if price is not None and price > 0:
+                    # Convert LP metrics to the controller's trading pair quote
+                    net_pnl_quote = net_pnl_quote / price
+                    filled_amount_quote = filled_amount_quote / price
+                mid_price = (executor_info.config.lower_price + executor_info.config.upper_price) / Decimal("2")
+                if mid_price > 0:
+                    invested_quote = (
+                        executor_info.config.base_amount * mid_price + executor_info.config.quote_amount
+                    ) / mid_price
+            elif executor_info.type == "lp_position_executor":
+                mid_price = (executor_info.config.lower_price + executor_info.config.upper_price) / Decimal("2")
+                invested_quote = executor_info.config.base_amount * mid_price + executor_info.config.quote_amount
             if not executor_info.is_done:
-                report.unrealized_pnl_quote += executor_info.net_pnl_quote
+                report.unrealized_pnl_quote += net_pnl_quote
             else:
-                report.realized_pnl_quote += executor_info.net_pnl_quote
+                report.realized_pnl_quote += net_pnl_quote
                 if executor_info.close_type:
                     report.close_type_counts[executor_info.close_type] = report.close_type_counts.get(executor_info.close_type, 0) + 1
 
-            report.volume_traded += executor_info.filled_amount_quote
+            report.volume_traded += invested_quote if invested_quote is not None else filled_amount_quote
 
         # Add data from positions held and collect position summaries
         positions_summary = []

@@ -53,6 +53,8 @@ class GatewaySwapExecutor(ExecutorBase):
         self.config: GatewaySwapExecutorConfig = config
         self._order: Optional[TrackedOrder] = None
         self._order_created_ts: Optional[float] = None
+        self._order_timeout_ts: Optional[float] = None
+        self._order_not_found_count = 0
         self._next_retry_ts: Optional[float] = None
         self._current_retries = 0
         self._max_retries = max_retries
@@ -94,6 +96,11 @@ class GatewaySwapExecutor(ExecutorBase):
             self._mark_failed()
             return
         is_buy, trading_pair, amount = swap_params
+
+        if not hasattr(connector, "get_quote"):
+            self._set_last_error(f"Connector {self.config.connector_name} does not support get_quote")
+            self._mark_failed()
+            return
 
         quote = await self._fetch_quote(connector, trading_pair, is_buy, amount)
         if quote:
@@ -139,6 +146,8 @@ class GatewaySwapExecutor(ExecutorBase):
 
         self._order = TrackedOrder(order_id=order_id)
         self._order_created_ts = self._now()
+        self._order_timeout_ts = None
+        self._order_not_found_count = 0
         self._last_error = None
 
     async def _check_order_status(self):
@@ -149,7 +158,11 @@ class GatewaySwapExecutor(ExecutorBase):
         order_id = self._order.order_id
         tracked_order = connector.get_order(order_id)
         if tracked_order is None:
+            self._order_not_found_count += 1
+            if self._order_not_found_count >= 3:
+                self._handle_retryable_error("order_not_found")
             return
+        self._order_not_found_count = 0
         self._order.order = tracked_order
 
         try:
@@ -165,6 +178,15 @@ class GatewaySwapExecutor(ExecutorBase):
             return
 
         if self._is_timed_out():
+            if self._order_timeout_ts is None:
+                self._order_timeout_ts = self._now()
+                self.logger().warning(
+                    "Swap order timed out, waiting for confirmation: %s",
+                    order_id,
+                )
+                return
+            if (self._now() - self._order_timeout_ts) < self.config.timeout_sec:
+                return
             self._handle_retryable_error("order_timeout")
 
     def _capture_execution(self, tracked_order):
@@ -225,15 +247,9 @@ class GatewaySwapExecutor(ExecutorBase):
         amount: Decimal,
     ) -> Optional[QuoteResponse]:
         try:
-            if hasattr(connector, "get_quote"):
-                return await connector.get_quote(
-                    trading_pair=trading_pair,
-                    is_buy=is_buy,
-                    amount=amount,
-                    slippage_pct=self.config.slippage_pct,
-                    pool_address=self.config.pool_address,
-                )
-            price = await connector.get_quote_price(
+            if not hasattr(connector, "get_quote"):
+                return None
+            return await connector.get_quote(
                 trading_pair=trading_pair,
                 is_buy=is_buy,
                 amount=amount,
@@ -243,9 +259,6 @@ class GatewaySwapExecutor(ExecutorBase):
         except Exception as e:
             self.logger().warning(f"Swap quote failed: {e}")
             return None
-        if price is None:
-            return None
-        return {"price": price}
 
     @staticmethod
     def _to_decimal(value: Any) -> Optional[Decimal]:
@@ -300,6 +313,8 @@ class GatewaySwapExecutor(ExecutorBase):
             return
         self._order = None
         self._order_created_ts = None
+        self._order_timeout_ts = None
+        self._order_not_found_count = 0
         self._next_retry_ts = self._now() + float(self.config.retry_delay_sec)
 
     def _mark_failed(self):
@@ -396,6 +411,8 @@ class GatewaySwapExecutor(ExecutorBase):
 
     @property
     def filled_amount_quote(self) -> Decimal:
+        if self.config.amount_in_is_quote:
+            return self._executed_amount_in or Decimal("0")
         if self._executed_amount_quote is not None:
             return self._executed_amount_quote
         return Decimal("0")
