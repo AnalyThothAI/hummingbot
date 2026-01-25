@@ -100,6 +100,7 @@ class GatewayBase(ConnectorBase):
         self._network_transaction_fee = None
         self._poll_notifier = None
         self._native_currency = None
+        self._last_not_ready_log_ts = 0.0
         self._order_tracker: ClientOrderTracker = ClientOrderTracker(connector=self, lost_order_count_limit=10)
         self._amount_quantum_dict = {}
         self._token_data = {}  # Store complete token information
@@ -367,7 +368,12 @@ class GatewayBase(ConnectorBase):
         if not all(status.values()):
             # Log which items are not ready
             not_ready = [k for k, v in status.items() if not v]
-            self.logger().debug(f"Connector {self.name} not ready. Missing: {not_ready}. Status: {status}")
+            now = time.time()
+            if now - self._last_not_ready_log_ts >= 60:
+                self._last_not_ready_log_ts = now
+                self.logger().info(f"Connector {self.name} not ready. Missing: {not_ready}. Status: {status}")
+            else:
+                self.logger().debug(f"Connector {self.name} not ready. Missing: {not_ready}. Status: {status}")
         return all(status.values())
 
     @property

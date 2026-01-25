@@ -64,6 +64,11 @@ class LPPositionExecutor(ExecutorBase):
         self._budget_coordinator = (
             BudgetCoordinatorRegistry.get(self._budget_key) if self._budget_key else None
         )
+        self._pnl_baseline_set = False
+        self._balance_event_seq = 0
+        self._balance_event_base_delta = Decimal("0")
+        self._balance_event_quote_delta = Decimal("0")
+        self._balance_event_type = ""
         self._setup_lp_event_forwarders()
 
     def _setup_lp_event_forwarders(self):
@@ -138,6 +143,10 @@ class LPPositionExecutor(ExecutorBase):
                 # Update price bounds from actual position (may differ slightly from config)
                 self.lp_position_state.lower_price = Decimal(str(position_info.lower_price))
                 self.lp_position_state.upper_price = Decimal(str(position_info.upper_price))
+                self._set_pnl_baseline(
+                    self.lp_position_state.base_amount,
+                    self.lp_position_state.quote_amount,
+                )
         except Exception as e:
             error_msg = str(e).lower()
             # Handle position status errors
@@ -286,6 +295,11 @@ class LPPositionExecutor(ExecutorBase):
             self.lp_position_state.quote_amount = event.quote_amount or Decimal("0")
             self.lp_position_state.lower_price = event.lower_price
             self.lp_position_state.upper_price = event.upper_price
+            if event.base_amount is not None and event.quote_amount is not None:
+                self._set_pnl_baseline(
+                    self.lp_position_state.base_amount,
+                    self.lp_position_state.quote_amount,
+                )
 
             # Clear active_open_order to indicate opening is complete
             self.lp_position_state.active_open_order = None
@@ -295,6 +309,11 @@ class LPPositionExecutor(ExecutorBase):
                 f"rent: {event.position_rent} SOL, "
                 f"base: {event.base_amount}, quote: {event.quote_amount}"
             )
+
+            self._balance_event_seq += 1
+            self._balance_event_type = "open"
+            self._balance_event_base_delta = -(event.base_amount or Decimal("0"))
+            self._balance_event_quote_delta = -(event.quote_amount or Decimal("0"))
 
             # Reset retry counter on success
             self._current_retries = 0
@@ -332,13 +351,26 @@ class LPPositionExecutor(ExecutorBase):
                 f"fees: {event.base_fee} base / {event.quote_fee} quote"
             )
 
+            base_in = (event.base_amount or Decimal("0")) + (event.base_fee or Decimal("0"))
+            quote_in = (event.quote_amount or Decimal("0")) + (event.quote_fee or Decimal("0"))
+            self._balance_event_seq += 1
+            self._balance_event_type = "close"
+            self._balance_event_base_delta = base_in
+            self._balance_event_quote_delta = quote_in
+
             # Clear active_close_order and position_address
             self.lp_position_state.active_close_order = None
             self.lp_position_state.position_address = None
 
             # Reset retry counter on success
             self._current_retries = 0
-            self._release_budget_reservation()
+
+    def _set_pnl_baseline(self, base_amount: Decimal, quote_amount: Decimal) -> None:
+        if self._pnl_baseline_set:
+            return
+        self.config.base_amount = base_amount
+        self.config.quote_amount = quote_amount
+        self._pnl_baseline_set = True
 
     def process_lp_failure_event(
         self,
@@ -434,6 +466,16 @@ class LPPositionExecutor(ExecutorBase):
         # Convert side int to display string (side is set by controller in config)
         side_map = {0: "BOTH", 1: "BUY", 2: "SELL"}
         side_str = side_map.get(self.config.side, "")
+        balance_event = None
+        if self._balance_event_seq > 0:
+            balance_event = {
+                "seq": self._balance_event_seq,
+                "type": self._balance_event_type or None,
+                "delta": {
+                    "base": float(self._balance_event_base_delta),
+                    "quote": float(self._balance_event_quote_delta),
+                },
+            }
         return {
             # Side: 0=BOTH (both-sided), 1=BUY (quote only), 2=SELL (base only)
             "side": side_str,
@@ -451,6 +493,7 @@ class LPPositionExecutor(ExecutorBase):
             "position_rent_refunded": float(self.lp_position_state.position_rent_refunded),
             # Timer tracking - executor tracks when it went out of bounds
             "out_of_range_since": self.lp_position_state.out_of_range_since,
+            "balance_event": balance_event,
         }
 
     def get_lp_position_summary(self):

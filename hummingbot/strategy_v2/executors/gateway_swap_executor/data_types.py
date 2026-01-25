@@ -17,6 +17,7 @@ class GatewaySwapExecutorConfig(ExecutorConfigBase):
     slippage_pct: Optional[Decimal] = None
     pool_address: Optional[str] = None
     timeout_sec: int = 120
+    confirmation_timeout_sec: int = 600
     poll_interval_sec: Decimal = Decimal("2")
     max_retries: int = 0
     retry_delay_sec: Decimal = Decimal("1")
@@ -37,3 +38,5 @@ class GatewaySwapExecutorStatus(BaseModel):
     amount_out: Optional[Decimal] = None
     executed_amount_base: Optional[Decimal] = None
     executed_amount_quote: Optional[Decimal] = None
+    delta_base: Optional[Decimal] = None
+    delta_quote: Optional[Decimal] = None

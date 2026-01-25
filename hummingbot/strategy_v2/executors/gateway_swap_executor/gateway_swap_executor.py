@@ -185,7 +185,9 @@ class GatewaySwapExecutor(ExecutorBase):
                     order_id,
                 )
                 return
-            if (self._now() - self._order_timeout_ts) < self.config.timeout_sec:
+            confirmation_timeout = max(self.config.confirmation_timeout_sec, self.config.timeout_sec)
+            created_ts = self._order_created_ts or self._order_timeout_ts
+            if created_ts is not None and (self._now() - created_ts) < confirmation_timeout:
                 return
             self._handle_retryable_error("order_timeout")
 
@@ -307,6 +309,7 @@ class GatewaySwapExecutor(ExecutorBase):
     def _handle_retryable_error(self, reason: str):
         self._current_retries += 1
         self._last_error = reason
+        self._stop_tracked_order()
         max_retries = self._max_retries if self.config.max_retries is None else self.config.max_retries
         if self._current_retries > max_retries:
             self._mark_failed()
@@ -316,6 +319,14 @@ class GatewaySwapExecutor(ExecutorBase):
         self._order_timeout_ts = None
         self._order_not_found_count = 0
         self._next_retry_ts = self._now() + float(self.config.retry_delay_sec)
+
+    def _stop_tracked_order(self) -> None:
+        if not self._order or not self._order.order_id:
+            return
+        connector = self._get_connector()
+        if connector is None:
+            return
+        connector.stop_tracking_order(self._order.order_id)
 
     def _mark_failed(self):
         self.close_type = CloseType.FAILED
@@ -418,6 +429,30 @@ class GatewaySwapExecutor(ExecutorBase):
         return Decimal("0")
 
     def get_custom_info(self) -> Dict:
+        delta_base = None
+        delta_quote = None
+        fee_base = Decimal("0")
+        fee_quote = Decimal("0")
+        if self._order:
+            fee_asset = self._order.fee_asset
+            if isinstance(fee_asset, str):
+                base_token, quote_token = self.config.trading_pair.split("-")
+                if fee_asset == base_token:
+                    fee_base = self._order.cum_fees_base
+                elif fee_asset == quote_token:
+                    fee_quote = self._order.cum_fees_quote
+        if self._executed_amount_base is not None and self._executed_amount_quote is not None:
+            if self.config.side == TradeType.BUY:
+                delta_base = self._executed_amount_base
+                delta_quote = -self._executed_amount_quote
+            elif self.config.side == TradeType.SELL:
+                delta_base = -self._executed_amount_base
+                delta_quote = self._executed_amount_quote
+        if delta_base is not None and fee_base > 0:
+            delta_base -= fee_base
+        if delta_quote is not None and fee_quote > 0:
+            delta_quote -= fee_quote
+
         status = GatewaySwapExecutorStatus(
             state=self.status.name,
             order_id=self._order.order_id if self._order else None,
@@ -431,6 +466,8 @@ class GatewaySwapExecutor(ExecutorBase):
             amount_out=self._executed_amount_out,
             executed_amount_base=self._executed_amount_base,
             executed_amount_quote=self._executed_amount_quote,
+            delta_base=delta_base,
+            delta_quote=delta_quote,
         )
         return status.model_dump()
 

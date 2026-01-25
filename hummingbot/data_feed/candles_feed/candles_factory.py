@@ -16,6 +16,7 @@ from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.data_feed.candles_feed.dexalot_spot_candles.dexalot_spot_candles import DexalotSpotCandles
 from hummingbot.data_feed.candles_feed.gate_io_perpetual_candles import GateioPerpetualCandles
 from hummingbot.data_feed.candles_feed.gate_io_spot_candles import GateioSpotCandles
+from hummingbot.data_feed.candles_feed.gateway_price_candles import GatewayPriceCandles
 from hummingbot.data_feed.candles_feed.hyperliquid_perpetual_candles.hyperliquid_perpetual_candles import (
     HyperliquidPerpetualCandles,
 )
@@ -81,5 +82,11 @@ class CandlesFactory:
         connector_class = cls._candles_map.get(candles_config.connector)
         if connector_class:
             return connector_class(candles_config.trading_pair, candles_config.interval, candles_config.max_records)
-        else:
-            raise UnsupportedConnectorException(candles_config.connector)
+        if "/" in candles_config.connector:
+            return GatewayPriceCandles(
+                connector=candles_config.connector,
+                trading_pair=candles_config.trading_pair,
+                interval=candles_config.interval,
+                max_records=candles_config.max_records,
+            )
+        raise UnsupportedConnectorException(candles_config.connector)
