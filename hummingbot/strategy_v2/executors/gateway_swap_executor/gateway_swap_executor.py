@@ -1,4 +1,5 @@
 import logging
+import random
 from decimal import Decimal
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -57,7 +58,11 @@ class GatewaySwapExecutor(ExecutorBase):
         self._order_not_found_count = 0
         self._next_retry_ts: Optional[float] = None
         self._current_retries = 0
-        self._max_retries = max_retries
+        self._max_retries = max(max_retries, 30)
+        retry_base = float(config.retry_delay_sec or Decimal("0"))
+        self._retry_base_sec = retry_base if retry_base > 0 else 10.0
+        self._retry_max_sec = 300.0
+        self._retry_jitter_pct = 0.1
         self._last_error: Optional[str] = None
         self._executed_amount_base: Optional[Decimal] = None
         self._executed_amount_quote: Optional[Decimal] = None
@@ -306,11 +311,27 @@ class GatewaySwapExecutor(ExecutorBase):
     def _now(self) -> float:
         return self._strategy.current_timestamp
 
+    def _resolve_max_retries(self) -> int:
+        if self.config.max_retries and self.config.max_retries > 0:
+            return int(self.config.max_retries)
+        return self._max_retries
+
+    def _compute_retry_delay(self) -> float:
+        exponent = max(0, self._current_retries - 1)
+        delay = min(self._retry_base_sec * (2 ** exponent), self._retry_max_sec)
+        jitter = 1 + (random.random() * self._retry_jitter_pct * 2 - self._retry_jitter_pct)
+        return max(0.0, delay * jitter)
+
+    def _schedule_retry(self) -> float:
+        delay = self._compute_retry_delay()
+        self._next_retry_ts = self._now() + delay
+        return delay
+
     def _handle_retryable_error(self, reason: str):
         self._current_retries += 1
         self._last_error = reason
         self._stop_tracked_order()
-        max_retries = self._max_retries if self.config.max_retries is None else self.config.max_retries
+        max_retries = self._resolve_max_retries()
         if self._current_retries > max_retries:
             self._mark_failed()
             return
@@ -318,7 +339,14 @@ class GatewaySwapExecutor(ExecutorBase):
         self._order_created_ts = None
         self._order_timeout_ts = None
         self._order_not_found_count = 0
-        self._next_retry_ts = self._now() + float(self.config.retry_delay_sec)
+        delay = self._schedule_retry()
+        self.logger().warning(
+            "Gateway swap retry %s/%s in %.1fs (reason=%s)",
+            self._current_retries,
+            max_retries,
+            delay,
+            reason,
+        )
 
     def _stop_tracked_order(self) -> None:
         if not self._order or not self._order.order_id:

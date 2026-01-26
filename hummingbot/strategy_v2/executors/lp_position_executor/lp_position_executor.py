@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from decimal import Decimal
 from typing import Dict, Optional
 
@@ -58,7 +59,11 @@ class LPPositionExecutor(ExecutorBase):
         self.config: LPPositionExecutorConfig = config
         self.lp_position_state = LPPositionState()
         self._current_retries = 0
-        self._max_retries = max_retries
+        self._max_retries = max(max_retries, 30)
+        self._next_retry_ts: Optional[float] = None
+        self._retry_base_sec = 10.0
+        self._retry_max_sec = 300.0
+        self._retry_jitter_pct = 0.1
         self._budget_key = config.budget_key
         self._budget_reservation_id = config.budget_reservation_id
         self._budget_coordinator = (
@@ -69,6 +74,7 @@ class LPPositionExecutor(ExecutorBase):
         self._balance_event_base_delta = Decimal("0")
         self._balance_event_quote_delta = Decimal("0")
         self._balance_event_type = ""
+        self._balance_event_ts = 0.0
         self._setup_lp_event_forwarders()
 
     def _setup_lp_event_forwarders(self):
@@ -81,6 +87,23 @@ class LPPositionExecutor(ExecutorBase):
             (MarketEvent.RangePositionLiquidityRemoved, self._lp_remove_forwarder),
             (MarketEvent.RangePositionUpdateFailure, self._lp_failure_forwarder),
         ]
+
+    def _now(self) -> float:
+        return self._strategy.current_timestamp
+
+    def _ready_for_retry(self) -> bool:
+        return self._next_retry_ts is None or self._now() >= self._next_retry_ts
+
+    def _compute_retry_delay(self) -> float:
+        exponent = max(0, self._current_retries - 1)
+        delay = min(self._retry_base_sec * (2 ** exponent), self._retry_max_sec)
+        jitter = 1 + (random.random() * self._retry_jitter_pct * 2 - self._retry_jitter_pct)
+        return max(0.0, delay * jitter)
+
+    def _schedule_retry(self) -> float:
+        delay = self._compute_retry_delay()
+        self._next_retry_ts = self._now() + delay
+        return delay
 
     async def on_start(self):
         """Start executor - will create position in first control_task"""
@@ -100,7 +123,8 @@ class LPPositionExecutor(ExecutorBase):
         match self.lp_position_state.state:
             case LPPositionStates.NOT_ACTIVE:
                 # Create position
-                await self._create_position()
+                if self.status != RunnableStatus.SHUTTING_DOWN and self._ready_for_retry():
+                    await self._create_position()
 
             case LPPositionStates.OPENING | LPPositionStates.CLOSING:
                 # Wait for events
@@ -109,7 +133,9 @@ class LPPositionExecutor(ExecutorBase):
             case LPPositionStates.IN_RANGE | LPPositionStates.OUT_OF_RANGE:
                 # Position active - just monitor (controller handles rebalance decision)
                 # Executor tracks out_of_range_since, controller reads it to decide when to rebalance
-                pass
+                if self.status == RunnableStatus.SHUTTING_DOWN:
+                    if self.lp_position_state.active_close_order is None and self._ready_for_retry():
+                        await self._close_position()
 
             case LPPositionStates.COMPLETE:
                 # Position closed - close_type already set by early_stop()
@@ -314,9 +340,11 @@ class LPPositionExecutor(ExecutorBase):
             self._balance_event_type = "open"
             self._balance_event_base_delta = -(event.base_amount or Decimal("0"))
             self._balance_event_quote_delta = -(event.quote_amount or Decimal("0"))
+            self._balance_event_ts = self._strategy.current_timestamp
 
             # Reset retry counter on success
             self._current_retries = 0
+            self._next_retry_ts = None
 
     def process_lp_removed_event(
         self,
@@ -357,6 +385,7 @@ class LPPositionExecutor(ExecutorBase):
             self._balance_event_type = "close"
             self._balance_event_base_delta = base_in
             self._balance_event_quote_delta = quote_in
+            self._balance_event_ts = self._strategy.current_timestamp
 
             # Clear active_close_order and position_address
             self.lp_position_state.active_close_order = None
@@ -364,6 +393,7 @@ class LPPositionExecutor(ExecutorBase):
 
             # Reset retry counter on success
             self._current_retries = 0
+            self._next_retry_ts = None
 
     def _set_pnl_baseline(self, base_amount: Decimal, quote_amount: Decimal) -> None:
         if self._pnl_baseline_set:
@@ -411,9 +441,10 @@ class LPPositionExecutor(ExecutorBase):
             return
 
         # Log and retry
+        delay = self._schedule_retry()
         self.logger().warning(
             f"LP {operation_type} failed (retry {self._current_retries}/{self._max_retries}). "
-            "Chain may be congested. Retrying..."
+            f"Chain may be congested. Retrying in {delay:.1f}s..."
         )
 
         # Clear failed order to trigger retry in next control_task cycle
@@ -471,6 +502,7 @@ class LPPositionExecutor(ExecutorBase):
             balance_event = {
                 "seq": self._balance_event_seq,
                 "type": self._balance_event_type or None,
+                "timestamp": self._balance_event_ts,
                 "delta": {
                     "base": float(self._balance_event_base_delta),
                     "quote": float(self._balance_event_quote_delta),
@@ -573,7 +605,7 @@ LP Position: {position_addr[:16]}... | State: {state} | Side: {side}
 
         P&L = (current_position_value + fees_earned) - initial_value
         """
-        if not self.lp_position_state.position_address:
+        if not self._pnl_baseline_set:
             return Decimal("0")
 
         current_price = self._get_current_price()
@@ -603,6 +635,8 @@ LP Position: {position_addr[:16]}... | State: {state} | Side: {side}
 
     def get_net_pnl_pct(self) -> Decimal:
         """Returns net P&L as percentage."""
+        if not self._pnl_baseline_set:
+            return Decimal("0")
         current_price = self._get_current_price()
         if current_price is None or current_price == Decimal("0"):
             return Decimal("0")

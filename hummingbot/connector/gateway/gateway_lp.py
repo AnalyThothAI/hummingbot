@@ -204,17 +204,14 @@ class GatewayLp(GatewaySwap):
         # Call parent implementation
         super()._handle_operation_failure(order_id, trading_pair, operation_name, error)
 
-        # Check if this is a transaction timeout error (retryable)
-        # Gateway returns error with code "TRANSACTION_TIMEOUT" for tx confirmation timeouts
+        # Always trigger failure event for LP operations so executors can retry safely.
         error_str = str(error)
-        is_timeout_error = self.TRANSACTION_TIMEOUT_CODE in error_str
-
-        if is_timeout_error and order_id in self._lp_orders_metadata:
+        if order_id in self._lp_orders_metadata:
             metadata = self._lp_orders_metadata[order_id]
             operation = metadata.get("operation", "")
             self.logger().warning(
-                f"Transaction timeout detected for LP {operation} order {order_id} on {trading_pair}. "
-                f"Chain may be congested. Triggering retry event..."
+                f"LP {operation} failed for order {order_id} on {trading_pair}: {error_str[:120]}. "
+                "Triggering retry event..."
             )
             self.trigger_event(
                 MarketEvent.RangePositionUpdateFailure,
@@ -224,11 +221,6 @@ class GatewayLp(GatewaySwap):
                     order_action=LPType.ADD if operation == "add" else LPType.REMOVE,
                 )
             )
-            # Clean up metadata
-            del self._lp_orders_metadata[order_id]
-        elif order_id in self._lp_orders_metadata:
-            # Non-retryable error, just clean up metadata
-            self.logger().warning(f"Non-retryable error for {order_id}: {error_str[:100]}")
             del self._lp_orders_metadata[order_id]
 
     def _trigger_add_liquidity_event(
