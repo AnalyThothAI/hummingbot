@@ -421,17 +421,30 @@ class GatewayBase(ConnectorBase):
             if self._poll_notifier is not None and not self._poll_notifier.is_set():
                 self._poll_notifier.set()
 
-    async def update_balances(self):
+    async def update_balances(self, token_symbols: Optional[List[str]] = None, **kwargs):
         """
         Calls Gateway API to update total and available balances.
+
+        :param token_symbols: Optional list of token symbols or addresses to fetch. If not provided, uses full token list.
+        :param kwargs: Ignored extra args for compatibility with other connector interfaces.
         """
         if self._native_currency is None:
             await self.get_chain_info()
         local_asset_names = set(self._account_balances.keys())
         remote_asset_names = set()
-        token_list = list(self._tokens)
+        if token_symbols is None:
+            token_list = list(self._tokens)
+        else:
+            token_list = list(token_symbols)
         if self._native_currency:
             token_list.append(self._native_currency)
+        # De-duplicate while preserving order
+        seen = set()
+        token_list = [symbol for symbol in token_list if symbol and not (symbol in seen or seen.add(symbol))]
+        if not token_list:
+            token_list = list(self._tokens)
+            if self._native_currency:
+                token_list.append(self._native_currency)
         resp_json: Dict[str, Any] = await self._get_gateway_instance().get_balances(
             chain=self.chain,
             network=self.network,

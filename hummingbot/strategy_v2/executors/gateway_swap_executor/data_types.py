@@ -20,7 +20,7 @@ class GatewaySwapExecutorConfig(ExecutorConfigBase):
     confirmation_timeout_sec: int = 600
     poll_interval_sec: Decimal = Decimal("2")
     max_retries: int = 0
-    retry_delay_sec: Decimal = Decimal("1")
+    retry_delay_sec: Decimal = Decimal("10")
     level_id: Optional[str] = None
     budget_key: Optional[str] = None
 

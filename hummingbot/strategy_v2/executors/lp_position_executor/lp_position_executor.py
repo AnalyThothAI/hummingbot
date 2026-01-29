@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import random
 from decimal import Decimal
@@ -70,11 +69,7 @@ class LPPositionExecutor(ExecutorBase):
             BudgetCoordinatorRegistry.get(self._budget_key) if self._budget_key else None
         )
         self._pnl_baseline_set = False
-        self._balance_event_seq = 0
-        self._balance_event_base_delta = Decimal("0")
-        self._balance_event_quote_delta = Decimal("0")
-        self._balance_event_type = ""
-        self._balance_event_ts = 0.0
+        self._close_requested = False
         self._setup_lp_event_forwarders()
 
     def _setup_lp_event_forwarders(self):
@@ -133,7 +128,7 @@ class LPPositionExecutor(ExecutorBase):
             case LPPositionStates.IN_RANGE | LPPositionStates.OUT_OF_RANGE:
                 # Position active - just monitor (controller handles rebalance decision)
                 # Executor tracks out_of_range_since, controller reads it to decide when to rebalance
-                if self.status == RunnableStatus.SHUTTING_DOWN:
+                if self.status == RunnableStatus.SHUTTING_DOWN and self._close_requested:
                     if self.lp_position_state.active_close_order is None and self._ready_for_retry():
                         await self._close_position()
 
@@ -336,12 +331,6 @@ class LPPositionExecutor(ExecutorBase):
                 f"base: {event.base_amount}, quote: {event.quote_amount}"
             )
 
-            self._balance_event_seq += 1
-            self._balance_event_type = "open"
-            self._balance_event_base_delta = -(event.base_amount or Decimal("0"))
-            self._balance_event_quote_delta = -(event.quote_amount or Decimal("0"))
-            self._balance_event_ts = self._strategy.current_timestamp
-
             # Reset retry counter on success
             self._current_retries = 0
             self._next_retry_ts = None
@@ -379,17 +368,10 @@ class LPPositionExecutor(ExecutorBase):
                 f"fees: {event.base_fee} base / {event.quote_fee} quote"
             )
 
-            base_in = (event.base_amount or Decimal("0")) + (event.base_fee or Decimal("0"))
-            quote_in = (event.quote_amount or Decimal("0")) + (event.quote_fee or Decimal("0"))
-            self._balance_event_seq += 1
-            self._balance_event_type = "close"
-            self._balance_event_base_delta = base_in
-            self._balance_event_quote_delta = quote_in
-            self._balance_event_ts = self._strategy.current_timestamp
-
             # Clear active_close_order and position_address
             self.lp_position_state.active_close_order = None
             self.lp_position_state.position_address = None
+            self._close_requested = False
 
             # Reset retry counter on success
             self._current_retries = 0
@@ -453,17 +435,21 @@ class LPPositionExecutor(ExecutorBase):
             # State will be NOT_ACTIVE, control_task will retry _create_position()
         elif is_close_failure:
             self.lp_position_state.active_close_order = None
-            # State stays at current (IN_RANGE/OUT_OF_RANGE), early_stop will retry _close_position()
+            self._close_requested = True
+            # State stays at current (IN_RANGE/OUT_OF_RANGE), control_task will retry _close_position()
 
     def early_stop(self, keep_position: bool = False):
         """Stop executor (like GridExecutor.early_stop)"""
         self._status = RunnableStatus.SHUTTING_DOWN
-        self.close_type = CloseType.POSITION_HOLD if keep_position or self.config.keep_position else CloseType.EARLY_STOP
-
-        # Close position if not keeping it
-        if not keep_position and not self.config.keep_position:
-            if self.lp_position_state.state in [LPPositionStates.IN_RANGE, LPPositionStates.OUT_OF_RANGE]:
-                asyncio.create_task(self._close_position())
+        should_close = not keep_position and not self.config.keep_position
+        self.close_type = CloseType.POSITION_HOLD if not should_close else CloseType.EARLY_STOP
+        self._close_requested = should_close
+        if should_close:
+            self.logger().info(
+                "LP close requested | state=%s position=%s",
+                self.lp_position_state.state.value,
+                self.lp_position_state.position_address,
+            )
 
     def on_stop(self):
         self._release_budget_reservation()
@@ -497,17 +483,6 @@ class LPPositionExecutor(ExecutorBase):
         # Convert side int to display string (side is set by controller in config)
         side_map = {0: "BOTH", 1: "BUY", 2: "SELL"}
         side_str = side_map.get(self.config.side, "")
-        balance_event = None
-        if self._balance_event_seq > 0:
-            balance_event = {
-                "seq": self._balance_event_seq,
-                "type": self._balance_event_type or None,
-                "timestamp": self._balance_event_ts,
-                "delta": {
-                    "base": float(self._balance_event_base_delta),
-                    "quote": float(self._balance_event_quote_delta),
-                },
-            }
         return {
             # Side: 0=BOTH (both-sided), 1=BUY (quote only), 2=SELL (base only)
             "side": side_str,
@@ -525,7 +500,6 @@ class LPPositionExecutor(ExecutorBase):
             "position_rent_refunded": float(self.lp_position_state.position_rent_refunded),
             # Timer tracking - executor tracks when it went out of bounds
             "out_of_range_since": self.lp_position_state.out_of_range_since,
-            "balance_event": balance_event,
         }
 
     def get_lp_position_summary(self):
