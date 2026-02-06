@@ -40,6 +40,7 @@ __pycache__
 /hummingbot/wallet/ethereum/*.cpp
 /test/**/*.cpp
 /build
+.venv/
 
 # Local files
 **/.DS_Store
