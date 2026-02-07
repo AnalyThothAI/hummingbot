@@ -300,7 +300,18 @@ class ExecutorBase(RunnableBase):
         :param price_type: The type of the price.
         :return: The price.
         """
-        return self.connectors[connector_name].get_price_by_type(trading_pair, price_type)
+        connector = self.connectors[connector_name]
+        get_price_by_type_fn = getattr(connector, "get_price_by_type", None)
+        if callable(get_price_by_type_fn):
+            return get_price_by_type_fn(trading_pair, price_type)
+
+        # Gateway connectors (swap/LP) do not implement the sync CEX-style `get_price_by_type`.
+        # Prefer StrategyV2's MarketDataProvider (it already has gateway-compatible fallbacks).
+        market_data_provider = getattr(self._strategy, "market_data_provider", None)
+        if market_data_provider is not None:
+            return market_data_provider.get_price_by_type(connector_name, trading_pair, price_type)
+
+        raise AttributeError(f"Connector {connector_name} does not support get_price_by_type")
 
     def get_trading_rules(self, connector_name: str, trading_pair: str) -> TradingRule:
         """

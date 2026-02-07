@@ -1022,7 +1022,14 @@ class GatewayLp(GatewaySwap):
                     network=self.network,
                     position_address=position_address,
                     wallet_address=self.address,
+                    # Positions can be burned on-chain; treat 404-like responses as "position closed"
+                    # and avoid spamming network warnings.
+                    fail_silently=True,
                 )
+                if isinstance(resp, dict) and resp.get("statusCode") == 404:
+                    return None
+                if isinstance(resp, dict) and resp.get("statusCode") and resp.get("message"):
+                    raise ValueError(f"Gateway error: {resp.get('message')}")
                 # Validate response against CLMM schema
                 return CLMMPositionInfo(**resp) if resp else None
 
