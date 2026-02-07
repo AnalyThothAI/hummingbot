@@ -32,7 +32,9 @@ class ControllerConfigBase(BaseClientModel):
         controller_name (str): The name of the trading strategy that the controller will use.
         candles_config (List[CandlesConfig]): A list of configurations for the candles data feed.
     """
-    id: str = Field(default=None,)
+    # NOTE: Pydantic v2 does not validate defaults unless configured. Use a default_factory to
+    # guarantee an id is generated when the field is omitted from config files.
+    id: str = Field(default_factory=generate_unique_id)
     controller_name: str
     controller_type: str = "generic"
     total_amount_quote: Decimal = Field(
@@ -59,7 +61,9 @@ class ControllerConfigBase(BaseClientModel):
     @field_validator('id', mode="before")
     @classmethod
     def set_id(cls, v):
-        if v is None or v.strip() == "":
+        if v is None:
+            return generate_unique_id()
+        if isinstance(v, str) and v.strip() == "":
             return generate_unique_id()
         return v
 

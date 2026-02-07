@@ -343,7 +343,20 @@ class MarketDataProvider:
         :return: Price instance.
         """
         connector = self.get_connector_with_fallback(connector_name)
-        return connector.get_price_by_type(trading_pair, price_type)
+        get_price_by_type_fn = getattr(connector, "get_price_by_type", None)
+        if callable(get_price_by_type_fn):
+            return get_price_by_type_fn(trading_pair, price_type)
+
+        # Gateway connectors do not implement `get_price_by_type` like CEX connectors do.
+        # For gateway connectors, MarketDataProvider already fetches rates asynchronously via GatewayHttpClient
+        # and stores them in RateOracle (see `update_rates_task`). Use those cached rates as the synchronous
+        # price source for reporting and PnL calculations.
+        is_gateway_connector = "/" in connector_name or "gateway" in connector_name
+        if is_gateway_connector:
+            rate = RateOracle.get_instance().get_pair_rate(trading_pair)
+            return rate if rate is not None else Decimal("NaN")
+
+        raise AttributeError(f"Connector {connector_name} does not support get_price_by_type")
 
     def get_funding_info(self, connector_name: str, trading_pair: str):
         """
