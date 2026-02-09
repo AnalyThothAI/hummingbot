@@ -38,6 +38,15 @@ class LPPositionExecutor(ExecutorBase):
     max_retries is also passed by orchestrator.
     """
     _logger: Optional[HummingbotLogger] = None
+    # On-chain actions are inherently asynchronous. Under gateway disconnects / timeouts it is
+    # possible for a position to be created successfully, but the executor never receives the
+    # RangePositionLiquidityAddedEvent (no tx hash -> no status polling -> no event).
+    #
+    # To avoid getting stuck in OPENING forever (and to avoid duplicating positions on retries),
+    # we periodically reconcile by querying the connector for owned positions and matching them
+    # back to the last open attempt.
+    _OPEN_RECOVERY_AFTER_SEC = 30.0
+    _OPEN_RECOVERY_INTERVAL_SEC = 10.0
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -70,6 +79,9 @@ class LPPositionExecutor(ExecutorBase):
         )
         self._pnl_baseline_set = False
         self._close_requested = False
+        self._open_submit_ts: Optional[float] = None
+        self._positions_owned_before_open: Optional[set[str]] = None
+        self._last_open_recovery_ts: float = 0.0
         self._setup_lp_event_forwarders()
 
     def _setup_lp_event_forwarders(self):
@@ -119,9 +131,19 @@ class LPPositionExecutor(ExecutorBase):
             case LPPositionStates.NOT_ACTIVE:
                 # Create position
                 if self.status != RunnableStatus.SHUTTING_DOWN and self._ready_for_retry():
+                    # Before retrying a previous open attempt, try to recover a potentially
+                    # created on-chain position (timeout-but-succeeded scenario).
+                    recovered = await self._maybe_recover_open_position(current_time, current_price)
+                    if recovered:
+                        return
                     await self._create_position()
 
-            case LPPositionStates.OPENING | LPPositionStates.CLOSING:
+            case LPPositionStates.OPENING:
+                # Wait for events, but reconcile in case the position was created on-chain
+                # and we missed the added event.
+                await self._maybe_recover_open_position(current_time, current_price)
+
+            case LPPositionStates.CLOSING:
                 # Wait for events
                 pass
 
@@ -198,6 +220,8 @@ class LPPositionExecutor(ExecutorBase):
             self.logger().error(f"Connector {self.config.connector_name} not found")
             return
 
+        await self._snapshot_positions_owned_before_open(connector)
+
         # Calculate mid price for add_liquidity call
         mid_price = (self.config.lower_price + self.config.upper_price) / Decimal("2")
 
@@ -226,6 +250,7 @@ class LPPositionExecutor(ExecutorBase):
             )
         self.lp_position_state.active_open_order = TrackedOrder(order_id=order_id)
         self.lp_position_state.state = LPPositionStates.OPENING
+        self._open_submit_ts = self._now()
 
     async def _close_position(self):
         """
@@ -324,6 +349,8 @@ class LPPositionExecutor(ExecutorBase):
 
             # Clear active_open_order to indicate opening is complete
             self.lp_position_state.active_open_order = None
+            self._open_submit_ts = None
+            self._positions_owned_before_open = None
 
             self.logger().info(
                 f"Position created: {event.position_address}, "
@@ -643,3 +670,119 @@ LP Position: {position_addr[:16]}... | State: {state} | Side: {side}
             return Decimal(str(price)) if price else None
         except Exception:
             return None
+
+    async def _snapshot_positions_owned_before_open(self, connector) -> None:
+        """
+        Capture a baseline of currently owned positions in this pool before submitting an open.
+        Used to detect a newly created position when the open tx succeeded but we missed the event.
+        """
+        self._positions_owned_before_open = None
+        try:
+            get_positions = getattr(connector, "get_user_positions", None)
+            if get_positions is None:
+                return
+            positions = await get_positions(pool_address=self.config.pool_address)
+            self._positions_owned_before_open = {
+                p.address for p in positions
+                if getattr(p, "address", None)
+            }
+        except Exception:
+            # Best-effort only; reconciliation will fall back to conservative heuristics.
+            self._positions_owned_before_open = None
+
+    def _should_attempt_open_recovery(self, now: float) -> bool:
+        if self.lp_position_state.position_address:
+            return False
+        if self._open_submit_ts is None:
+            return False
+        if (now - self._open_submit_ts) < self._OPEN_RECOVERY_AFTER_SEC:
+            return False
+        if self._last_open_recovery_ts and (now - self._last_open_recovery_ts) < self._OPEN_RECOVERY_INTERVAL_SEC:
+            return False
+        return True
+
+    async def _maybe_recover_open_position(self, now: float, current_price: Optional[Decimal]) -> bool:
+        """
+        Attempt to recover an opened position by querying owned positions on the connector.
+
+        Returns True if recovery succeeded and executor state was updated.
+        """
+        if not self._should_attempt_open_recovery(now):
+            return False
+        connector = self.connectors.get(self.config.connector_name)
+        if connector is None:
+            return False
+
+        get_positions = getattr(connector, "get_user_positions", None)
+        if get_positions is None:
+            return False
+
+        self._last_open_recovery_ts = now
+        try:
+            positions = await get_positions(pool_address=self.config.pool_address)
+        except Exception:
+            return False
+        if not positions:
+            return False
+
+        baseline = self._positions_owned_before_open
+        candidates = positions
+        if baseline is not None:
+            new_positions = [p for p in positions if getattr(p, "address", None) and p.address not in baseline]
+            if new_positions:
+                candidates = new_positions
+
+        # Conservative fallback when we don't have a baseline (e.g. gateway query failed at submit time):
+        # only auto-recover if the pool has a single owned position.
+        if baseline is None and len(candidates) != 1:
+            return False
+
+        target_lower = self.config.lower_price
+        target_upper = self.config.upper_price
+
+        def _score(p) -> Decimal:
+            try:
+                lower = Decimal(str(getattr(p, "lower_price", 0)))
+                upper = Decimal(str(getattr(p, "upper_price", 0)))
+            except Exception:
+                return Decimal("inf")
+            return abs(lower - target_lower) + abs(upper - target_upper)
+
+        chosen = min(candidates, key=_score)
+        addr = getattr(chosen, "address", None)
+        if not isinstance(addr, str) or not addr:
+            return False
+
+        # Update executor state directly (equivalent to processing RangePositionLiquidityAddedEvent).
+        self.lp_position_state.position_address = addr
+        try:
+            self.lp_position_state.base_amount = Decimal(str(getattr(chosen, "base_token_amount", 0)))
+            self.lp_position_state.quote_amount = Decimal(str(getattr(chosen, "quote_token_amount", 0)))
+            self.lp_position_state.base_fee = Decimal(str(getattr(chosen, "base_fee_amount", 0)))
+            self.lp_position_state.quote_fee = Decimal(str(getattr(chosen, "quote_fee_amount", 0)))
+            self.lp_position_state.lower_price = Decimal(str(getattr(chosen, "lower_price", 0)))
+            self.lp_position_state.upper_price = Decimal(str(getattr(chosen, "upper_price", 0)))
+        except Exception:
+            # Best-effort; at minimum we need the position_address to allow closes and live polling.
+            pass
+
+        if self.lp_position_state.base_amount is not None and self.lp_position_state.quote_amount is not None:
+            self._set_pnl_baseline(
+                self.lp_position_state.base_amount,
+                self.lp_position_state.quote_amount,
+            )
+
+        self.lp_position_state.active_open_order = None
+        self._open_submit_ts = None
+        self._positions_owned_before_open = None
+        self._current_retries = 0
+        self._next_retry_ts = None
+
+        # Recompute high-level state immediately so controllers see IN_RANGE/OUT_OF_RANGE in the same tick.
+        self.lp_position_state.update_state(current_price, now)
+        self.logger().info(
+            "Recovered LP position from owned positions | position=%s state=%s",
+            addr,
+            self.lp_position_state.state.value,
+        )
+        return True
