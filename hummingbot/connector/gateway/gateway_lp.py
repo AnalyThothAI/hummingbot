@@ -744,11 +744,19 @@ class GatewayLp(GatewaySwap):
         }
 
         try:
+            extra_params = None
+            # Gateway Solana close-position can optionally return early with a signature and rely on
+            # the connector's existing tx polling to confirm. This avoids long blocking HTTP calls
+            # under chain congestion.
+            if getattr(self, "chain", None) == "solana":
+                extra_params = {"awaitConfirmation": False}
+
             transaction_result = await self._get_gateway_instance().clmm_close_position(
                 connector=self.connector_name,
                 network=self.network,
                 wallet_address=self.address,
                 position_address=position_address,
+                extra_params=extra_params,
                 fail_silently=fail_silently
             )
             transaction_hash: Optional[str] = transaction_result.get("signature")

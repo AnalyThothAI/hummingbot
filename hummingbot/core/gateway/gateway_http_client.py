@@ -1021,6 +1021,7 @@ class GatewayHttpClient:
         network: str,
         wallet_address: str,
         position_address: str,
+        extra_params: Optional[Dict[str, Any]] = None,
         fail_silently: bool = False
     ) -> Dict[str, Any]:
         """
@@ -1031,6 +1032,9 @@ class GatewayHttpClient:
             "walletAddress": wallet_address,
             "positionAddress": position_address,
         }
+        # Add connector-specific parameters (e.g. {"awaitConfirmation": False} for Solana connectors)
+        if extra_params:
+            request_payload.update(extra_params)
 
         # Parse connector to get name and type
         connector_name, connector_type = connector.split("/", 1)
