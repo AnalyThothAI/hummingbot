@@ -1,6 +1,9 @@
 # Set the base image
 FROM continuumio/miniconda3:latest AS builder
 
+# build_ext can be memory-hungry; keep parallelism configurable for Docker Desktop.
+ARG BUILD_EXT_JOBS=2
+
 # Install system dependencies
 RUN apt-get update && \
     apt-get install -y sudo libusb-1.0 gcc g++ python3-dev && \
@@ -33,7 +36,7 @@ RUN python3 -m pip install --no-deps -r /tmp/pip_packages.txt && \
     rm /tmp/pip_packages.txt
 
 
-RUN python3 setup.py build_ext --inplace -j 8 && \
+RUN python3 setup.py build_ext --inplace -j ${BUILD_EXT_JOBS} && \
     rm -rf build/ && \
     find . -type f -name "*.cpp" -delete
 

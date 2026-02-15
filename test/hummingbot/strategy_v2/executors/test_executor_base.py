@@ -156,6 +156,31 @@ class TestExecutorBase(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         price = self.component.get_price("connector1", "EHT-USDT", PriceType.MidPrice)
         self.assertEqual(price, Decimal("1000.0"))
 
+    def test_get_price_gateway_connector_without_method_uses_market_data_provider(self):
+        gateway_connector = MagicMock()
+        # Simulate a Gateway connector that does not implement the CEX-style sync `get_price_by_type`.
+        gateway_connector.get_price_by_type = None
+
+        strategy = MagicMock()
+        strategy.connectors = {"uniswap/clmm": gateway_connector}
+        strategy.market_data_provider = MagicMock()
+        strategy.market_data_provider.get_price_by_type.return_value = Decimal("123.45")
+
+        component = ExecutorBase(
+            strategy=strategy,
+            connectors=["uniswap/clmm"],
+            config=self.config,
+            update_interval=0.5,
+        )
+
+        price = component.get_price("uniswap/clmm", "BTC-USDT", PriceType.MidPrice)
+        self.assertEqual(price, Decimal("123.45"))
+        strategy.market_data_provider.get_price_by_type.assert_called_once_with(
+            "uniswap/clmm",
+            "BTC-USDT",
+            PriceType.MidPrice,
+        )
+
     def test_get_order_book(self):
         order_book = self.component.get_order_book("connector1", "ETH-USDT")
         self.assertEqual(order_book.last_diff_uid, 0)

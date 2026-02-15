@@ -242,6 +242,24 @@ class GatewayLpTest(unittest.TestCase):
         self.assertEqual(position_info.address, "0xpos123")
 
     @patch('hummingbot.connector.gateway.gateway_lp.get_connector_type')
+    async def test_get_position_info_clmm_position_closed_does_not_log_network_error(self, mock_connector_type):
+        """A burned/closed CLMM position should return None without spamming network warnings."""
+        mock_connector_type.return_value = ConnectorType.CLMM
+
+        self.connector._get_gateway_instance().clmm_position_info = AsyncMock(return_value={
+            "statusCode": 404,
+            "error": "Not Found",
+            "message": "Position closed",
+        })
+
+        mock_logger = MagicMock()
+        with patch.object(self.connector, "logger", return_value=mock_logger):
+            position_info = await self.connector.get_position_info("ETH-USDC", "0xpos123")
+
+        self.assertIsNone(position_info)
+        mock_logger.network.assert_not_called()
+
+    @patch('hummingbot.connector.gateway.gateway_lp.get_connector_type')
     async def test_clmm_open_position_execution(self, mock_connector_type):
         """Test CLMM open position execution with explicit price range"""
         mock_connector_type.return_value = ConnectorType.CLMM

@@ -35,6 +35,21 @@ class TestControllerBase(IsolatedAsyncioWrapperTestCase):
             actions_queue=self.mock_actions_queue
         )
 
+    def test_controller_config_id_is_auto_generated_when_missing(self):
+        config = ControllerConfigBase(
+            controller_name="test_controller",
+        )
+        self.assertIsNotNone(config.id)
+        self.assertNotEqual(config.id, "")
+
+    def test_controller_config_id_is_auto_generated_when_blank(self):
+        config = ControllerConfigBase(
+            id="",
+            controller_name="test_controller",
+        )
+        self.assertIsNotNone(config.id)
+        self.assertNotEqual(config.id, "")
+
     def test_initialize_candles(self):
         # Test whether candles are initialized correctly
         self.controller.initialize_candles()

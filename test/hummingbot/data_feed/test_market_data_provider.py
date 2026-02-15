@@ -64,6 +64,17 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
         price = self.provider.get_price_by_type("mock_connector", "BTC-USDT", PriceType.MidPrice)
         self.assertEqual(price, 10000)
 
+    def test_get_price_by_type_gateway_connector_without_method_uses_rate_oracle(self):
+        gateway_connector = MagicMock()
+        # Ensure the attribute exists but is not callable so MarketDataProvider uses the fallback path.
+        gateway_connector.get_price_by_type = None
+        provider = MarketDataProvider({"uniswap/clmm": gateway_connector})
+
+        with patch("hummingbot.data_feed.market_data_provider.RateOracle.get_instance") as mock_get_instance:
+            mock_get_instance.return_value.get_pair_rate.return_value = Decimal("123.45")
+            price = provider.get_price_by_type("uniswap/clmm", "BTC-USDT", PriceType.MidPrice)
+            self.assertEqual(price, Decimal("123.45"))
+
     @patch.object(CandlesBase, "start", MagicMock())
     def test_get_candles_df(self):
         self.provider.initialize_candles_feed(
