@@ -112,6 +112,35 @@ class GatewayCommandUtils:
         return result
 
     @staticmethod
+    def handle_transaction_result(
+        app: Any,
+        result: Dict[str, Any],
+        success_msg: str = "Transaction completed successfully!",
+        failure_msg: str = "Transaction failed. Please try again.",
+        timeout_msg: str = "Transaction timed out. Check your wallet for status."
+    ) -> bool:
+        """
+        Handle transaction result and show appropriate message.
+
+        :param app: HummingbotApplication instance (for notify method)
+        :param result: Result dict from monitor_transaction_with_timeout
+        :param success_msg: Message to show on success
+        :param failure_msg: Message to show on failure
+        :param timeout_msg: Message to show on timeout
+        :return: True if successful, False otherwise
+        """
+        if result.get("completed") and result.get("success"):
+            app.notify(f"\n✓ {success_msg}")
+            return True
+        elif result.get("failed") or (result.get("completed") and not result.get("success")):
+            app.notify(f"\n✗ {failure_msg}")
+            return False
+        elif result.get("timeout"):
+            app.notify(f"\n⚠️  {timeout_msg}")
+            return False
+        return False
+
+    @staticmethod
     def format_address_display(address: str) -> str:
         """
         Format wallet/token address for display.

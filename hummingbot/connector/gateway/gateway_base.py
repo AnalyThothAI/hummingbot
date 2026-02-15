@@ -35,6 +35,7 @@ class GatewayBase(ConnectorBase):
     """
 
     POLL_INTERVAL = 1.0
+    BALANCE_POLL_INTERVAL = 60.0  # Update balances every 60 seconds
     APPROVAL_ORDER_ID_PATTERN = re.compile(r"approve-(\w+)-(\w+)")
 
     _connector_name: str
@@ -47,6 +48,7 @@ class GatewayBase(ConnectorBase):
     _trading_required: bool
     _last_poll_timestamp: float
     _last_balance_poll_timestamp: float
+    _balance_polling_task: Optional[asyncio.Task]
     _last_est_gas_cost_reported: float
     _poll_notifier: Optional[asyncio.Event]
     _status_polling_task: Optional[asyncio.Task]
@@ -92,9 +94,11 @@ class GatewayBase(ConnectorBase):
         [self._tokens.update(set(trading_pair.split("_")[0].split("-"))) for trading_pair in trading_pairs]
         self._trading_required = trading_required
         self._last_poll_timestamp = 0.0
+        self._last_balance_poll_timestamp = 0.0
         self._last_est_gas_cost_reported = 0
         self._chain_info = {}
         self._status_polling_task = None
+        self._balance_polling_task = None
         self._get_chain_info_task = None
         self._get_gas_estimate_task = None
         self._network_transaction_fee = None
@@ -241,6 +245,7 @@ class GatewayBase(ConnectorBase):
 
         if self._trading_required:
             self._status_polling_task = safe_ensure_future(self._status_polling_loop())
+            self._balance_polling_task = safe_ensure_future(self._balance_polling_loop())
             self._get_gas_estimate_task = safe_ensure_future(self.get_gas_estimate())
         self._get_chain_info_task = safe_ensure_future(self.get_chain_info())
         # Load token data to populate amount quantum dict
@@ -253,6 +258,9 @@ class GatewayBase(ConnectorBase):
         if self._status_polling_task is not None:
             self._status_polling_task.cancel()
             self._status_polling_task = None
+        if self._balance_polling_task is not None:
+            self._balance_polling_task.cancel()
+            self._balance_polling_task = None
         if self._get_chain_info_task is not None:
             self._get_chain_info_task.cancel()
             self._get_chain_info_task = None
@@ -271,6 +279,18 @@ class GatewayBase(ConnectorBase):
                 raise
             except Exception as e:
                 self.logger().error(str(e), exc_info=True)
+
+    async def _balance_polling_loop(self):
+        """Periodically update wallet balances."""
+        while True:
+            try:
+                await asyncio.sleep(self.BALANCE_POLL_INTERVAL)
+                await self.update_balances()
+                self._last_balance_poll_timestamp = self.current_timestamp
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().error(f"Error updating balances: {str(e)}", exc_info=True)
 
     async def load_token_data(self):
         tokens = await GatewayHttpClient.get_instance().get_tokens(self.chain, self.network)
@@ -467,6 +487,41 @@ class GatewayBase(ConnectorBase):
         This is called by UserBalances.
         """
         await self.update_balances()
+
+    async def _initialize_trading_pair_symbol_map(self):
+        """
+        Initialize chain/network info for gateway connectors.
+        This ensures chain is detected before _update_balances is called.
+        """
+        # Auto-detect chain and network if not provided
+        if not self._chain or not self._network:
+            chain, network, error = await self._get_gateway_instance().get_connector_chain_network(
+                self._connector_name
+            )
+            if error:
+                raise ValueError(f"Failed to get chain/network info: {error}")
+            if not self._chain:
+                self._chain = chain
+            if not self._network:
+                self._network = network
+            # Update name now that we have chain/network
+            self._name = f"{self._connector_name}_{self._chain}_{self._network}"
+
+        # Auto-detect wallet if not provided
+        if not self._wallet_address:
+            wallet_address, error = await self._get_gateway_instance().get_default_wallet(
+                self._chain
+            )
+            if error:
+                raise ValueError(f"Failed to get default wallet: {error}")
+            self._wallet_address = wallet_address
+
+    async def _update_trading_rules(self):
+        """
+        No-op for gateway connectors.
+        Gateway connectors don't have trading rules in the same way as exchange connectors.
+        """
+        pass
 
     async def cancel_all(self, timeout_seconds: float) -> List[CancellationResult]:
         """

@@ -27,8 +27,6 @@ from hummingbot.core.event.events import (
     OrderExpiredEvent,
     OrderFilledEvent,
     PositionAction,
-    RangePositionClosedEvent,
-    RangePositionFeeCollectedEvent,
     RangePositionLiquidityAddedEvent,
     RangePositionLiquidityRemovedEvent,
     SellOrderCompletedEvent,
@@ -43,7 +41,6 @@ from hummingbot.model.market_state import MarketState
 from hummingbot.model.order import Order
 from hummingbot.model.order_status import OrderStatus
 from hummingbot.model.position import Position
-from hummingbot.model.range_position_collected_fees import RangePositionCollectedFees
 from hummingbot.model.range_position_update import RangePositionUpdate
 from hummingbot.model.sql_connection_manager import SQLConnectionManager
 from hummingbot.model.trade_fill import TradeFill
@@ -105,7 +102,6 @@ class MarketsRecorder:
         self._expire_order_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_expire_order)
         self._funding_payment_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_complete_funding_payment)
         self._update_range_position_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_update_range_position)
-        self._close_range_position_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_close_position)
 
         self._event_pairs: List[Tuple[MarketEvent, SourceInfoEventForwarder]] = [
             (MarketEvent.BuyOrderCreated, self._create_order_forwarder),
@@ -119,8 +115,6 @@ class MarketsRecorder:
             (MarketEvent.FundingPaymentCompleted, self._funding_payment_forwarder),
             (MarketEvent.RangePositionLiquidityAdded, self._update_range_position_forwarder),
             (MarketEvent.RangePositionLiquidityRemoved, self._update_range_position_forwarder),
-            (MarketEvent.RangePositionFeeCollected, self._update_range_position_forwarder),
-            (MarketEvent.RangePositionClosed, self._close_range_position_forwarder),
         ]
         MarketsRecorder._shared_instance = self
 
@@ -575,7 +569,7 @@ class MarketsRecorder:
     def _did_update_range_position(self,
                                    event_tag: int,
                                    connector: ConnectorBase,
-                                   evt: Union[RangePositionLiquidityAddedEvent, RangePositionLiquidityRemovedEvent, RangePositionFeeCollectedEvent]):
+                                   evt: Union[RangePositionLiquidityAddedEvent, RangePositionLiquidityRemovedEvent]):
         if threading.current_thread() != threading.main_thread():
             self._ev_loop.call_soon_threadsafe(self._did_update_range_position, event_tag, connector, evt)
             return
@@ -589,8 +583,6 @@ class MarketsRecorder:
             order_action = "ADD"
         elif event_type == MarketEvent.RangePositionLiquidityRemoved:
             order_action = "REMOVE"
-        elif event_type == MarketEvent.RangePositionFeeCollected:
-            order_action = "COLLECT"
 
         with self._sql_manager.get_new_session() as session:
             with session.begin():
@@ -618,26 +610,6 @@ class MarketsRecorder:
                     position_rent_refunded=float(getattr(evt, 'position_rent_refunded', 0) or 0),
                 )
                 session.add(rp_update)
-                self.save_market_states(self._config_file_path, connector, session=session)
-
-    def _did_close_position(self,
-                            event_tag: int,
-                            connector: ConnectorBase,
-                            evt: RangePositionClosedEvent):
-        if threading.current_thread() != threading.main_thread():
-            self._ev_loop.call_soon_threadsafe(self._did_close_position, event_tag, connector, evt)
-            return
-
-        with self._sql_manager.get_new_session() as session:
-            with session.begin():
-                rp_fees: RangePositionCollectedFees = RangePositionCollectedFees(config_file_path=self._config_file_path,
-                                                                                 strategy=self._strategy_name,
-                                                                                 token_id=evt.token_id,
-                                                                                 token_0=evt.token_0,
-                                                                                 token_1=evt.token_1,
-                                                                                 claimed_fee_0=Decimal(evt.claimed_fee_0),
-                                                                                 claimed_fee_1=Decimal(evt.claimed_fee_1))
-                session.add(rp_fees)
                 self.save_market_states(self._config_file_path, connector, session=session)
 
     @staticmethod

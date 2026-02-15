@@ -14,7 +14,7 @@ from hummingbot.core.data_type.common import TradeType
 class ExecutorConfigBase(BaseModel):
     id: str = None  # Make ID optional
     type: Literal["position_executor", "dca_executor", "grid_executor", "order_executor",
-                  "xemm_executor", "arbitrage_executor", "twap_executor", "lp_position_executor",
+                  "xemm_executor", "arbitrage_executor", "twap_executor", "lp_executor",
                   "gateway_swap_executor"]
     timestamp: Optional[float] = None
     controller_id: str = "main"
@@ -73,41 +73,3 @@ class PositionSummary(BaseModel):
     @property
     def global_pnl_quote(self) -> Decimal:
         return self.unrealized_pnl_quote + self.realized_pnl_quote - self.cum_fees_quote
-
-
-class LPPositionSummary(BaseModel):
-    """Summary of an LP position for display in status."""
-    connector_name: str
-    trading_pair: str
-    position_address: str
-    side: str  # BUY, SELL, BOTH
-    state: str  # IN_RANGE, OUT_OF_RANGE, OPENING, CLOSING, etc.
-    # Price info
-    current_price: Decimal
-    lower_price: Decimal
-    upper_price: Decimal
-    # Token amounts
-    base_amount: Decimal
-    quote_amount: Decimal
-    base_token: str
-    quote_token: str
-    # Fees collected
-    base_fee: Decimal
-    quote_fee: Decimal
-    # P&L
-    total_value_quote: Decimal
-    unrealized_pnl_quote: Decimal
-    # Timing
-    out_of_range_since: Optional[float] = None
-
-    @property
-    def fees_quote(self) -> Decimal:
-        """Total fees value in quote token."""
-        if self.current_price > 0:
-            return self.base_fee * self.current_price + self.quote_fee
-        return self.quote_fee
-
-    @property
-    def is_in_range(self) -> bool:
-        """Check if current price is within position bounds."""
-        return self.lower_price <= self.current_price <= self.upper_price

@@ -18,7 +18,7 @@ from hummingbot.strategy_v2.executors.data_types import PositionSummary
 from hummingbot.strategy_v2.executors.dca_executor.dca_executor import DCAExecutor
 from hummingbot.strategy_v2.executors.gateway_swap_executor.gateway_swap_executor import GatewaySwapExecutor
 from hummingbot.strategy_v2.executors.grid_executor.grid_executor import GridExecutor
-from hummingbot.strategy_v2.executors.lp_position_executor.lp_position_executor import LPPositionExecutor
+from hummingbot.strategy_v2.executors.lp_executor.lp_executor import LPExecutor
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
 from hummingbot.strategy_v2.executors.twap_executor.twap_executor import TWAPExecutor
@@ -147,7 +147,7 @@ class ExecutorOrchestrator:
         "twap_executor": TWAPExecutor,
         "xemm_executor": XEMMExecutor,
         "order_executor": OrderExecutor,
-        "lp_position_executor": LPPositionExecutor,
+        "lp_executor": LPExecutor,
         "gateway_swap_executor": GatewaySwapExecutor,
     }
 
@@ -552,24 +552,6 @@ class ExecutorOrchestrator:
             report[controller_id] = positions_summary
         return report
 
-    def get_lp_positions_report(self) -> Dict[str, List]:
-        """
-        Generate LP positions report from active LP executors.
-        Returns a dictionary with controller_id as key and list of LPPositionSummary as value.
-        """
-        report = {}
-        for controller_id, executors in self.active_executors.items():
-            lp_positions = []
-            for executor in executors:
-                # Check if it's an LP executor with a position
-                if (hasattr(executor, 'get_lp_position_summary') and
-                        hasattr(executor, 'lp_position_state') and
-                        executor.lp_position_state.position_address):
-                    lp_positions.append(executor.get_lp_position_summary())
-            if lp_positions:
-                report[controller_id] = lp_positions
-        return report
-
     def get_all_reports(self) -> Dict[str, Dict]:
         """
         Generate a unified report containing executors, positions, and performance for all controllers.
@@ -581,7 +563,6 @@ class ExecutorOrchestrator:
         # Generate all reports
         executors_report = self.get_executors_report()
         positions_report = self.get_positions_report()
-        lp_positions_report = self.get_lp_positions_report()
 
         # Get all controller IDs
         all_controller_ids = set(list(self.active_executors.keys()) +
@@ -593,7 +574,6 @@ class ExecutorOrchestrator:
             controller_id: {
                 "executors": executors_report.get(controller_id, []),
                 "positions": positions_report.get(controller_id, []),
-                "lp_positions": lp_positions_report.get(controller_id, []),
                 "performance": self.generate_performance_report(controller_id)
             }
             for controller_id in all_controller_ids
@@ -612,44 +592,17 @@ class ExecutorOrchestrator:
         # Add data from active executors
         active_executors = self.active_executors.get(controller_id, [])
         positions = self.positions_held.get(controller_id, [])
-        controller = self.strategy.controllers.get(controller_id)
-        trading_pair = getattr(getattr(controller, "config", None), "trading_pair", None)
-        pool_trading_pair = getattr(getattr(controller, "config", None), "pool_trading_pair", None)
-        invert_lp_quote = False
-        if isinstance(trading_pair, str) and isinstance(pool_trading_pair, str) and trading_pair != pool_trading_pair:
-            tp_parts = trading_pair.split("-")
-            pool_parts = pool_trading_pair.split("-")
-            if len(tp_parts) == 2 and len(pool_parts) == 2:
-                invert_lp_quote = pool_parts[0] == tp_parts[1] and pool_parts[1] == tp_parts[0]
 
         for executor in active_executors:
             executor_info = executor.executor_info
-            net_pnl_quote = executor_info.net_pnl_quote
-            filled_amount_quote = executor_info.filled_amount_quote
-            invested_quote = None
-            if executor_info.type == "lp_position_executor" and invert_lp_quote:
-                price = executor_info.custom_info.get("current_price")
-                price = Decimal(str(price)) if price is not None else None
-                if price is not None and price > 0:
-                    # Convert LP metrics to the controller's trading pair quote
-                    net_pnl_quote = net_pnl_quote / price
-                    filled_amount_quote = filled_amount_quote / price
-                mid_price = (executor_info.config.lower_price + executor_info.config.upper_price) / Decimal("2")
-                if mid_price > 0:
-                    invested_quote = (
-                        executor_info.config.base_amount * mid_price + executor_info.config.quote_amount
-                    ) / mid_price
-            elif executor_info.type == "lp_position_executor":
-                mid_price = (executor_info.config.lower_price + executor_info.config.upper_price) / Decimal("2")
-                invested_quote = executor_info.config.base_amount * mid_price + executor_info.config.quote_amount
             if not executor_info.is_done:
-                report.unrealized_pnl_quote += net_pnl_quote
+                report.unrealized_pnl_quote += executor_info.net_pnl_quote
             else:
-                report.realized_pnl_quote += net_pnl_quote
+                report.realized_pnl_quote += executor_info.net_pnl_quote
                 if executor_info.close_type:
                     report.close_type_counts[executor_info.close_type] = report.close_type_counts.get(executor_info.close_type, 0) + 1
 
-            report.volume_traded += invested_quote if invested_quote is not None else filled_amount_quote
+            report.volume_traded += executor_info.filled_amount_quote
 
         # Add data from positions held and collect position summaries
         positions_summary = []

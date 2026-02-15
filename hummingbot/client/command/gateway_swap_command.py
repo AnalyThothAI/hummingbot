@@ -314,13 +314,19 @@ class GatewaySwapCommand:
                 self.notify("Monitoring transaction status...")
 
                 # Use the common transaction monitoring helper
-                await GatewayCommandUtils.monitor_transaction_with_timeout(
+                result = await GatewayCommandUtils.monitor_transaction_with_timeout(
                     app=self,
                     connector=swap_connector,
                     order_id=order_id,
                     timeout=60.0,
                     check_interval=1.0,
                     pending_msg_delay=3.0
+                )
+
+                GatewayCommandUtils.handle_transaction_result(
+                    self, result,
+                    success_msg="Swap completed successfully!",
+                    failure_msg="Swap failed. Please try again."
                 )
 
                 # Clean up - remove temporary connector and stop network

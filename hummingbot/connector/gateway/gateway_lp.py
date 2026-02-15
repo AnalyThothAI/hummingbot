@@ -173,8 +173,9 @@ class GatewayLp(GatewaySwap):
                 f"LP {operation_type} liquidity transaction cancelled for order {order_id} (tx: {transaction_hash})"
             )
 
-        # Clean up metadata (prevents double-triggering)
+        # Clean up metadata (prevents double-triggering) and stop tracking
         del self._lp_orders_metadata[order_id]
+        self.stop_tracking_order(order_id)
 
     async def update_order_status(self, tracked_orders: List[GatewayInFlightOrder]):
         """
@@ -599,6 +600,7 @@ class GatewayLp(GatewaySwap):
             raise
         except Exception as e:
             self._handle_operation_failure(order_id, trading_pair, "opening CLMM position", e)
+            raise  # Re-raise so executor can catch and retry if needed
 
     async def _amm_add_liquidity(
         self,
@@ -774,6 +776,7 @@ class GatewayLp(GatewaySwap):
             raise
         except Exception as e:
             self._handle_operation_failure(order_id, trading_pair, "closing CLMM position", e)
+            raise  # Re-raise so executor can catch and retry if needed
 
     async def _clmm_remove_liquidity(
         self,

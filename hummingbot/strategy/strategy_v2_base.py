@@ -2,7 +2,6 @@ import asyncio
 import importlib
 import inspect
 import os
-import time
 from decimal import Decimal
 from typing import Callable, Dict, List, Optional, Set
 
@@ -389,10 +388,6 @@ class StrategyV2Base(ScriptStrategyBase):
         """Get positions for a specific controller from the unified reports."""
         return self.controller_reports.get(controller_id, {}).get("positions", [])
 
-    def get_lp_positions_by_controller(self, controller_id: str) -> List:
-        """Get LP positions for a specific controller from the unified reports."""
-        return self.controller_reports.get(controller_id, {}).get("lp_positions", [])
-
     def get_performance_report(self, controller_id: str):
         """Get performance report for a specific controller."""
         return self.controller_reports.get(controller_id, {}).get("performance")
@@ -469,48 +464,10 @@ class StrategyV2Base(ScriptStrategyBase):
             else:
                 lines.append("  No executors found.")
 
-            # LP Positions table
-            lp_positions = self.get_lp_positions_by_controller(controller_id)
-            if lp_positions:
-                lines.append("\n  LP Positions:")
-                lp_positions_data = []
-                current_time = time.time()
-                for pos in lp_positions:
-                    # Use emojis matching lp_manage_position.py
-                    if pos.state == "IN_RANGE":
-                        state_display = "✅ In Range"
-                    elif pos.state == "OUT_OF_RANGE":
-                        if pos.current_price < pos.lower_price:
-                            state_display = "⬇️  Below Range "
-                        else:
-                            state_display = "⬆️  Above Range "
-                        # Add elapsed time if out_of_range_since is set
-                        if pos.out_of_range_since is not None:
-                            elapsed = int(current_time - pos.out_of_range_since)
-                            state_display += f"({elapsed}s)"
-                    elif pos.state == "OPENING":
-                        state_display = "⏳ Opening"
-                    elif pos.state == "CLOSING":
-                        state_display = "⏳ Closing"
-                    else:
-                        state_display = pos.state
-                    lp_positions_data.append({
-                        "Side": pos.side,
-                        "State": state_display,
-                        "Range": f"{float(pos.lower_price):.4f}-{float(pos.upper_price):.4f}",
-                        "Price": f"{float(pos.current_price):.4f}",
-                        "Tokens": f"{float(pos.base_amount):.4f} {pos.base_token} / {float(pos.quote_amount):.4f} {pos.quote_token}",
-                        "Fees": f"{float(pos.fees_quote):.6f}",
-                        "Value": f"{float(pos.total_value_quote):.4f}",
-                        "PnL": f"{float(pos.unrealized_pnl_quote):+.4f}",
-                    })
-                lp_positions_df = pd.DataFrame(lp_positions_data)
-                lines.append(format_df_for_printout(lp_positions_df, table_format="psql", index=False))
-
-            # Trading Positions table (for non-LP executors)
+            # Positions table
             positions = self.get_positions_by_controller(controller_id)
             if positions:
-                lines.append("\n  Trading Positions:")
+                lines.append("\n  Positions Held:")
                 positions_data = []
                 for pos in positions:
                     positions_data.append({
@@ -526,9 +483,7 @@ class StrategyV2Base(ScriptStrategyBase):
                     })
                 positions_df = pd.DataFrame(positions_data)
                 lines.append(format_df_for_printout(positions_df, table_format="psql", index=False))
-
-            # Show "No positions held" only if neither LP nor trading positions exist
-            if not lp_positions and not positions:
+            else:
                 lines.append("  No positions held.")
 
             # Collect performance data for summary table
